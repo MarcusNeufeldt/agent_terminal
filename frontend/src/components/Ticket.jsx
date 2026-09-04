@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { fmt } from "../api";
+import { formatContractSize } from "../size-precision";
 import useStore from "../store";
 
 export default function Ticket() {
@@ -10,6 +11,7 @@ export default function Ticket() {
   const lev = useStore(s => s.lev);
   const setLev = useStore(s => s.setLev);
   const tickers = useStore(s => s.tickers);
+  const ticketBusy = useStore(s => s.ticketBusy);
   const submitOrder = useStore(s => s.submitOrder);
   const sizeFromPct = useStore(s => s.sizeFromPct);
   const t = tickers[symbol] || {};
@@ -36,7 +38,7 @@ export default function Ticket() {
       const isInverse = inst.type === "futures_inverse";
       return isInverse ? Number(inst.contractSize || 1) : Number(inst.contractSize || 1) * price();
     };
-    const prec = () => Math.max(0, Math.min(8, Number((useStore.getState().instruments.find(i => i.symbol === symbol) || {}).contractValueTradePrecision ?? 2)));
+    const prec = () => Number((useStore.getState().instruments.find(i => i.symbol === symbol) || {}).contractValueTradePrecision ?? 2);
     const syncEquiv = () => {
       const n = Number(sizeEl.value || 0);
       const m = mult();
@@ -46,7 +48,7 @@ export default function Ticket() {
     const syncSize = () => {
       const usd = Number(usdEl.value || 0);
       const m = mult();
-      if (usd > 0 && m > 0) sizeEl.value = String(Number((usd / m).toFixed(prec())));
+      if (usd > 0 && m > 0) sizeEl.value = formatContractSize(usd / m, prec());
       syncEquiv();
     };
     usdEl.addEventListener("input", syncSize);
@@ -64,7 +66,7 @@ export default function Ticket() {
       <div className="ticket-body">
         <div className="ord-tabs">
           {[["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["stp", "Stop"], ["take_profit", "Take profit"], ["chase", "Chase"]].map(([v, label]) => (
-            <button key={v} className={"ord-tab" + (otype === v ? " active" : "")} data-otype={v} onClick={() => setOtype(v)} title={v === "chase" ? "Post-only order that re-pegs to best bid/ask until filled — maker fees" : ""}>{label}</button>
+            <button key={v} className={"ord-tab" + (otype === v ? " active" : "")} data-otype={v} onClick={() => setOtype(v)}>{label}</button>
           ))}
         </div>
         {isLimit && (
@@ -103,12 +105,12 @@ export default function Ticket() {
           <label htmlFor="in-reduce">Reduce-only</label>
         </div>
         <div className="side-btns">
-          <button id="btn-buy" onClick={() => submitOrder("buy")}>{otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
-          <button id="btn-sell" onClick={() => submitOrder("sell")}>{otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
+          <button id="btn-buy" disabled={ticketBusy} onClick={() => submitOrder("buy")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
+          <button id="btn-sell" disabled={ticketBusy} onClick={() => submitOrder("sell")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
         </div>
         <div className="ticket-note" style={{ color: isChase ? (armed ? "var(--accent)" : "var(--muted)") : (armed ? "var(--red)" : "var(--muted)") }}>
           {isChase
-            ? (armed ? "CHASE: rests post-only at best bid/ask and re-pegs until filled (max 300s). Maker fees." : "CHASE requires an armed terminal.")
+            ? (armed ? "CHASE: reconciled post-only orders at best bid/ask, re-pegged only after confirmed cancellation." : "CHASE requires an armed terminal.")
             : (armed ? `LIVE: orders go straight to Kraken (${window.__env || "live"}).` : "SIMULATION: arm the terminal to send real orders.")}
         </div>
       </div>

@@ -43,6 +43,9 @@ export default function ChartPanel({ source }) {
     localStorage.setItem("kt.riskEnabled", enabled ? "1" : "0");
     setRiskEnabled(enabled);
   };
+  const fitRisk = () => {
+    if (!ctrlRef.current?.fitRisk()) setNote("No visible TP risk levels to fit");
+  };
   const side = signal && signal.side ? signal.side : "";
 
   return (
@@ -59,6 +62,11 @@ export default function ChartPanel({ source }) {
         >
           RISK {riskEnabled ? "ON" : "OFF"}
         </button>
+        {riskEnabled && (
+          <button className="risk-toggle" title="Fit the price scale to the current mirrored risk levels" onClick={fitRisk}>
+            FIT RISK
+          </button>
+        )}
         <span
           className={"ema-badge" + (side ? " " + side : "")}
           title={signal && signal.price !== undefined ? `price ${fmt(signal.price)} · ema${signal.fast} ${fmt(signal.emaFast)} · ema${signal.slow} ${fmt(signal.emaSlow)}` : "EMA trend signal on closed 1m mark candles"}

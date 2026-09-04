@@ -20,7 +20,7 @@ _lock = threading.Lock()
 
 
 def _get(client, path: str, params: str = "") -> dict:
-    url = f"https://futures.kraken.com{path}" + (f"?{params}" if params else "")
+    url = f"{client.base_url.rstrip('/')}{path}" + (f"?{params}" if params else "")
     headers = {"Accept": "application/json", "User-Agent": "kraken-terminal/1.0"}
     headers.update(client._auth_headers_for_path(path, params))
     req = request.Request(url, headers=headers, method="GET")

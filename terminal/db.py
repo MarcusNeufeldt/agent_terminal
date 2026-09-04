@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT NOT NULL DEFAULT 'Trading',
     symbol TEXT,
     summary TEXT NOT NULL DEFAULT '',
+    memory TEXT NOT NULL DEFAULT '',
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    billed_tokens INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -48,6 +52,16 @@ CREATE TABLE IF NOT EXISTS actions_log (
     actions_json TEXT NOT NULL,
     results_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS write_requests (
+    request_id TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    response_status INTEGER,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts INTEGER PRIMARY KEY,
     balance REAL,
@@ -59,6 +73,14 @@ CREATE TABLE IF NOT EXISTS events (
     ts TEXT NOT NULL,
     kind TEXT NOT NULL,
     payload TEXT
+);
+CREATE TABLE IF NOT EXISTS protection_alerts (
+    symbol TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, kind)
 );
 """
 
@@ -82,6 +104,14 @@ class Database:
             self._conn.execute("ALTER TABLE sessions ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # column already exists
+        try:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN billed_tokens INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         self._conn.commit()
 
     # ---- sessions ----
@@ -138,6 +168,33 @@ class Database:
             ).fetchone()
         return int(row["context_tokens"] if row else 0)
 
+    def record_model_usage(self, session_id: int, prompt_tokens: int, billed_tokens: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET prompt_tokens = ?, context_tokens = ?, "
+                "billed_tokens = billed_tokens + ? WHERE id = ?",
+                (max(0, prompt_tokens), max(0, prompt_tokens), max(0, billed_tokens), session_id),
+            )
+            self._conn.commit()
+
+    def add_billed_tokens(self, session_id: int, billed_tokens: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET billed_tokens = billed_tokens + ? WHERE id = ?",
+                (max(0, billed_tokens), session_id),
+            )
+            self._conn.commit()
+
+    def get_token_usage(self, session_id: int) -> dict[str, int]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT prompt_tokens, billed_tokens FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return {
+            "prompt_tokens": int(row["prompt_tokens"] if row else 0),
+            "billed_tokens": int(row["billed_tokens"] if row else 0),
+        }
+
     def get_session_summary(self, session_id: int) -> str:
         with self._lock:
             row = self._conn.execute(
@@ -173,7 +230,7 @@ class Database:
                 "UPDATE messages SET in_context = 0 WHERE session_id = ?", (session_id,)
             )
             self._conn.execute(
-                "UPDATE sessions SET summary = '', context_tokens = 0, updated_at = ? WHERE id = ?",
+                "UPDATE sessions SET summary = '', context_tokens = 0, prompt_tokens = 0, billed_tokens = 0, updated_at = ? WHERE id = ?",
                 (_now(), session_id),
             )
             self._conn.commit()
@@ -209,27 +266,56 @@ class Database:
             ).fetchone()
         return row["n"]
 
-    def compact(self, session_id: int, keep_last: int = 20) -> list[dict[str, Any]] | None:
-        """Mark all but the newest `keep_last` messages out of context.
-
-        Returns the messages selected for summarization (the caller generates
-        the summary and stores it via set_session_summary), or None if nothing
-        needs compacting.
-        """
+    def compaction_candidates(self, session_id: int, keep_last: int = 20) -> tuple[list[dict[str, Any]], str]:
+        """Select old messages without changing their context state."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM messages WHERE session_id = ? AND in_context = 1 ORDER BY id",
                 (session_id,),
             ).fetchall()
-            if len(rows) <= keep_last:
-                return None
-            to_compact = rows[:-keep_last]
-            ids = [r["id"] for r in to_compact]
-            self._conn.executemany(
-                "UPDATE messages SET in_context = 0 WHERE id = ?", [(i,) for i in ids]
-            )
-            self._conn.commit()
-        return [self._row_to_message(r) for r in to_compact]
+            session = self._conn.execute(
+                "SELECT summary FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        candidates = rows[:-max(1, keep_last)] if len(rows) > max(1, keep_last) else []
+        return [self._row_to_message(row) for row in candidates], (session["summary"] if session else "") or ""
+
+    def commit_compaction(
+        self,
+        session_id: int,
+        message_ids: list[int],
+        expected_summary: str,
+        summary: str,
+    ) -> bool:
+        """Atomically store a summary and hide exactly the selected messages."""
+        if not message_ids:
+            return False
+        placeholders = ",".join("?" for _ in message_ids)
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                session = self._conn.execute(
+                    "SELECT summary FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                count = self._conn.execute(
+                    f"SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND in_context = 1 AND id IN ({placeholders})",
+                    (session_id, *message_ids),
+                ).fetchone()["n"]
+                if not session or (session["summary"] or "") != expected_summary or count != len(message_ids):
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    f"UPDATE messages SET in_context = 0 WHERE session_id = ? AND id IN ({placeholders})",
+                    (session_id, *message_ids),
+                )
+                self._conn.execute(
+                    "UPDATE sessions SET summary = ?, updated_at = ? WHERE id = ?",
+                    (summary, _now(), session_id),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
@@ -240,6 +326,43 @@ class Database:
             except json.JSONDecodeError:
                 meta = None
         return {"role": row["role"], "content": row["content"], "meta": meta, "id": row["id"]}
+
+    # ---- write request idempotency ----
+
+    def claim_write_request(self, request_id: str, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT endpoint, payload_json, state, response_status, result_json FROM write_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row:
+                if row["endpoint"] != endpoint or row["payload_json"] != payload_json:
+                    return {"state": "conflict"}
+                if row["state"] == "completed" and row["result_json"]:
+                    try:
+                        result = json.loads(row["result_json"])
+                    except json.JSONDecodeError:
+                        return {"state": "pending"}
+                    return {"state": "replay", "status": int(row["response_status"] or 200), "result": result}
+                return {"state": "pending"}
+            now = _now()
+            self._conn.execute(
+                "INSERT INTO write_requests (request_id, endpoint, payload_json, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'pending', ?, ?)",
+                (request_id, endpoint, payload_json, now, now),
+            )
+            self._conn.commit()
+            return {"state": "new"}
+
+    def complete_write_request(self, request_id: str, status: int, result: Any) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE write_requests SET state = 'completed', response_status = ?, result_json = ?, updated_at = ? "
+                "WHERE request_id = ? AND state = 'pending'",
+                (status, json.dumps(result, default=str), _now(), request_id),
+            )
+            self._conn.commit()
 
     # ---- actions log ----
 
@@ -297,6 +420,39 @@ class Database:
                     latest[(str(action.get("symbol") or ""), kind)] = str(order_id)
         return set(latest.values())
 
+    # ---- persistent protection alerts ----
+
+    def set_protection_alert(self, symbol: str, kind: str, payload: Any) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO protection_alerts (symbol, kind, status, payload, updated_at) VALUES (?, ?, 'UNPROTECTED', ?, ?) "
+                "ON CONFLICT(symbol, kind) DO UPDATE SET status = excluded.status, payload = excluded.payload, updated_at = excluded.updated_at",
+                (symbol, kind, json.dumps(payload, default=str), _now()),
+            )
+            self._conn.commit()
+
+    def clear_protection_alert(self, symbol: str, kind: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM protection_alerts WHERE symbol = ? AND kind = ?", (symbol, kind))
+            self._conn.commit()
+
+    def protection_alerts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT symbol, kind, status, payload, updated_at FROM protection_alerts ORDER BY updated_at DESC"
+            ).fetchall()
+        alerts = []
+        for row in rows:
+            try:
+                details = json.loads(row["payload"] or "{}")
+            except json.JSONDecodeError:
+                details = {"message": str(row["payload"] or "")}
+            alerts.append({
+                "symbol": row["symbol"], "kind": row["kind"], "status": row["status"],
+                "details": details, "updatedAt": row["updated_at"],
+            })
+        return alerts
+
     # ---- events ----
 
     def log_event(self, kind: str, payload: Any) -> None:
@@ -306,3 +462,20 @@ class Database:
                 (_now(), kind, json.dumps(payload, default=str)),
             )
             self._conn.commit()
+
+    def latest_chase_snapshots(self, limit: int = 1000) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload FROM events WHERE kind = 'chase' ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            chase_id = str(payload.get("id") or "") if isinstance(payload, dict) else ""
+            if chase_id and chase_id not in latest:
+                latest[chase_id] = payload
+        return list(latest.values())

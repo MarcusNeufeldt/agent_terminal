@@ -460,12 +460,13 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_tp",
-            "description": "Replace take-profit order(s) with one managed full-position TP. It auto-resizes after later position changes. IMMEDIATE.",
+            "description": "Edit an exact take-profit by orderId, or edit/create the only unambiguous managed full-position TP. IMMEDIATE.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string"},
                     "stopPrice": {"type": "number", "description": "New TP trigger price"},
+                    "orderId": {"type": "string", "description": "Exact exchange order ID from the live snapshot"},
                 },
                 "required": ["symbol", "stopPrice"],
             },
@@ -475,12 +476,13 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_sl",
-            "description": "Replace stop-loss order(s) with one managed full-position SL. It auto-resizes after later position changes. IMMEDIATE.",
+            "description": "Edit an exact stop-loss by orderId, or edit/create the only unambiguous managed full-position SL. IMMEDIATE.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string"},
                     "stopPrice": {"type": "number", "description": "New stop-loss trigger price"},
+                    "orderId": {"type": "string", "description": "Exact exchange order ID from the live snapshot"},
                 },
                 "required": ["symbol", "stopPrice"],
             },
@@ -527,7 +529,13 @@ def _compaction_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     ]
 
 
-def summarize_for_compaction(messages: list[dict[str, Any]], existing_summary: str, *, model: str | None = None) -> str:
+def summarize_for_compaction(
+    messages: list[dict[str, Any]],
+    existing_summary: str,
+    *,
+    model: str | None = None,
+    usage_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> str:
     """Roll older messages into non-authoritative conversational context."""
     key = _load_openrouter_key()
     model = model or os.getenv("AI_CHAT_MODEL", DEFAULT_MODEL)
@@ -541,20 +549,32 @@ def summarize_for_compaction(messages: list[dict[str, Any]], existing_summary: s
         "that execution occurred; live snapshots and tool results are authoritative.\n\n"
         f"EXISTING SUMMARY:\n{existing_summary or '(none)'}\n\nOLDER MESSAGES:\n{transcript}"
     )
-    resp = requests.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:8787",
-            "X-Title": "Kraken Futures Terminal",
-        },
-        json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500},
-        timeout=60,
-    )
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8787",
+                "X-Title": "Kraken Futures Terminal",
+            },
+            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500},
+            timeout=60,
+        )
+    except requests.RequestException as exc:
+        raise ChatError(f"compaction LLM request failed: {exc}") from exc
     if resp.status_code != 200:
         raise ChatError(f"compaction LLM call failed: HTTP {resp.status_code}")
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    try:
+        data = resp.json()
+        summary = data["choices"][0]["message"]["content"].strip()
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise ChatError("compaction LLM returned an invalid response") from exc
+    if not summary:
+        raise ChatError("compaction LLM returned an empty summary")
+    if usage_sink:
+        usage_sink(data.get("usage") or {})
+    return summary
 
 
 def _openrouter_completion(key: str, model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -606,6 +626,33 @@ def _openrouter_completion(key: str, model: str, messages: list[dict[str, Any]])
     raise ChatError("OpenRouter transient gateway failure after retry")
 
 
+def _payload_messages(
+    messages: list[dict[str, Any]],
+    context_snapshot: str,
+    session_summary: str = "",
+    session_memory: str = "",
+) -> list[dict[str, Any]]:
+    system = SYSTEM_PROMPT
+    if session_memory:
+        system += "\n\nDURABLE MEMORY (never authoritative for live state):\n" + session_memory
+    if session_summary:
+        system += "\n\nCONVERSATION SUMMARY (non-authoritative older context):\n" + session_summary
+    system += "\n\nLIVE SNAPSHOT (AUTHORITATIVE — overrides memory and summary):\n" + context_snapshot
+    return [{"role": "system", "content": system}, *messages[-200:]]
+
+
+def estimate_prompt_tokens(
+    messages: list[dict[str, Any]],
+    context_snapshot: str,
+    *,
+    session_summary: str = "",
+    session_memory: str = "",
+) -> int:
+    """Conservative model-independent estimate for a pending OpenRouter request."""
+    payload = {"messages": _payload_messages(messages, context_snapshot, session_summary, session_memory), "tools": TOOLS}
+    return (len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 2) // 3
+
+
 def respond(
     messages: list[dict[str, str]],
     context_snapshot: str,
@@ -619,28 +666,27 @@ def respond(
 ) -> dict[str, Any]:
     key = _load_openrouter_key()
     model = model or os.getenv("AI_CHAT_MODEL", DEFAULT_MODEL)
-    system = SYSTEM_PROMPT
-    if session_memory:
-        system += "\n\nDURABLE MEMORY (never authoritative for live state):\n" + session_memory
-    if session_summary:
-        system += "\n\nCONVERSATION SUMMARY (non-authoritative older context):\n" + session_summary
-    system += "\n\nLIVE SNAPSHOT (AUTHORITATIVE — overrides memory and summary):\n" + context_snapshot
-    payload_messages = [{"role": "system", "content": system}]
-    payload_messages.extend(messages[-200:])
+    payload_messages = _payload_messages(messages, context_snapshot, session_summary, session_memory)
 
     action_blocks: list[list[dict[str, Any]]] = []
     memory_update: str | None = None
     final_text = ""
-    usage: dict[str, Any] = {}
+    usage: dict[str, Any] = {
+        "prompt_tokens": 0,
+        "billed_prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
 
     for _round in range(max_rounds):
         data = _openrouter_completion(key, model, payload_messages)
         u = data.get("usage") or {}
-        usage = {
-            "prompt_tokens": (usage.get("prompt_tokens") or 0) + (u.get("prompt_tokens") or 0),
-            "completion_tokens": (usage.get("completion_tokens") or 0) + (u.get("completion_tokens") or 0),
-            "total_tokens": (usage.get("total_tokens") or 0) + (u.get("total_tokens") or 0),
-        }
+        prompt_tokens = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
+        completion_tokens = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
+        usage["prompt_tokens"] = prompt_tokens
+        usage["billed_prompt_tokens"] += prompt_tokens
+        usage["completion_tokens"] += completion_tokens
+        usage["total_tokens"] += int(u.get("total_tokens") or (prompt_tokens + completion_tokens))
         try:
             message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:

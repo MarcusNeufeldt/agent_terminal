@@ -64,6 +64,7 @@ def _import_upstream():
         except Exception:
             pass
     from ws_vendored import (  # noqa: PLC0415
+        WebSocketConnection,
         open_websocket,
         websocket_endpoint_from_base_url,
     )

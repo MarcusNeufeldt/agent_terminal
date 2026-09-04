@@ -2,7 +2,9 @@
    the chart controller registers itself here so live data can drive it imperatively. */
 
 import { create } from "zustand";
-import { api, RES_SECONDS } from "./api";
+import { api, newRequestId, RES_SECONDS } from "./api";
+import { formatContractSize, normalizeContractSize } from "./size-precision";
+import { buildProtectionAction } from "./protection-action";
 
 let chart = null; // chart controller (set by ChartPanel on mount)
 let audioCtx = null;
@@ -11,7 +13,7 @@ const chartCancelPending = new Set();
 
 const useStore = create((set, get) => ({
   // ---- state ----
-  symbol: localStorage.getItem("kt.symbol") || "PI_XBTUSD",
+  symbol: localStorage.getItem("kt.symbol") || "PF_XBTUSD",
   res: localStorage.getItem("kt.res") || "1m",
   instruments: [],
   tickers: {},
@@ -30,6 +32,8 @@ const useStore = create((set, get) => ({
   account: {},
   positions: [],
   orders: [],
+  dataStatus: {},
+  ticketBusy: false,
   fills: [],
   scannerRows: [],
   scannerMeta: "",
@@ -44,6 +48,7 @@ const useStore = create((set, get) => ({
   sortBy: localStorage.getItem("kt.sortby") || "vol24",
   volLoading: false,
   chases: {},
+  protectionAlerts: {},
   toasts: [],
   lastExecution: null,
   chartSource: "",
@@ -53,7 +58,7 @@ const useStore = create((set, get) => ({
     chart = controller;
     window.__chart = controller; // debug handle
     if (controller) {
-      controller.onTpDrop = (symbol, price) => get().adjustProtection(symbol, "tp", price).then(() => get().applyOverlayLines());
+      controller.onTpDrop = ({ symbol, price, order }) => get().adjustProtection(symbol, "tp", price, null, order).then(() => get().applyOverlayLines());
       controller.onProtectionDrop = ({ symbol, kind, price, pnl }) => get().adjustProtection(symbol, kind, price, pnl).then(() => get().applyOverlayLines());
       controller.onOrderCancel = order => get().cancelChartOrder(order);
     }
@@ -137,7 +142,7 @@ const useStore = create((set, get) => ({
     get().refreshSignal();
   },
 
-  async adjustProtection(symbol, kind, stopPrice, previewPnl = null) {
+  async adjustProtection(symbol, kind, stopPrice, previewPnl = null, order = null) {
     const label = kind === "sl" ? "Stop loss" : "Take profit";
     let pnl = Number(previewPnl);
     if (!Number.isFinite(pnl)) {
@@ -152,8 +157,8 @@ const useStore = create((set, get) => ({
     const pnlText = Number.isFinite(pnl) ? ` (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })})` : "";
     if (get().armed && !confirm(`${label} ${symbol} at ${fmt(stopPrice)}${pnlText}?\n\nThis will change a LIVE reduce-only protection order.`)) return false;
     try {
-      const actionType = kind === "sl" ? "replace_sl" : "replace_tp";
-      const r = await api("/api/action", { method: "POST", body: { actions: [{ type: actionType, symbol, stopPrice }] } });
+      const action = buildProtectionAction(kind, symbol, stopPrice, order);
+      const r = await api("/api/action", { method: "POST", body: { actions: [action], requestId: newRequestId() } });
       const res = (r.results || [])[0] || {};
       if (res.error) { get().toast(`${label} failed: ${res.error}`, "err"); return false; }
       if (res.simulated) { get().toast(`${label} simulated — terminal is disarmed, nothing sent.`, "warn"); return false; }
@@ -280,7 +285,7 @@ const useStore = create((set, get) => ({
           overlays.push({
             price: o.stopPrice, color: isTp ? "#26a69a" : "#ef5350", dashed: true,
             title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) · ${coverage}%`,
-            ...(isTp ? { tp: { symbol, entry: Number(pos.price), size: positionSize, mult, dir, tick, fullPosition: orderSize === positionSize } } : {}),
+            ...(isTp ? { tp: { symbol, entry: Number(pos.price), size: coveredSize, mult, dir, tick, fullPosition: orderSize === positionSize, order } } : {}),
             ...(order ? { order } : {}),
           });
         } else {
@@ -301,9 +306,14 @@ const useStore = create((set, get) => ({
   async refreshAccount() {
     try {
       const a = await api("/api/account");
-      if (a.error) { set({ account: {} }); return; }
-      set({ account: a });
-    } catch (e) {}
+      const { state, error, ageSeconds, ...account } = a;
+      set(s => ({
+        account: Object.keys(account).length ? account : s.account,
+        dataStatus: { ...s.dataStatus, account: { state, error, ageSeconds } },
+      }));
+    } catch (e) {
+      set(s => ({ dataStatus: { ...s.dataStatus, account: { state: "unavailable", error: e.message } } }));
+    }
   },
 
   computeUpnl(p) {
@@ -331,7 +341,15 @@ const useStore = create((set, get) => ({
       const [pos, ord] = await Promise.all([api("/api/positions"), api("/api/orders")]);
       const positions = pos.positions || [];
       const orders = ord.orders || [];
-      set({ positions, orders });
+      set(s => ({
+        positions,
+        orders,
+        dataStatus: {
+          ...s.dataStatus,
+          positions: { state: pos.state, error: pos.error, ageSeconds: pos.ageSeconds },
+          orders: { state: ord.state, error: ord.error, ageSeconds: ord.ageSeconds },
+        },
+      }));
       const posSymbols = positions.filter(p => p.symbol && !p.error).map(p => p.symbol);
       if (posSymbols.length) api(`/api/tickers?symbols=${encodeURIComponent(posSymbols.join(","))}`).catch(() => {});
       get().updatePositionCells();
@@ -367,30 +385,36 @@ const useStore = create((set, get) => ({
   // ---- orders ----
   async submitOrder(side) {
     const s = get();
-    if (s.otype === "chase") return get().submitChase(side);
-    const body = get().ticketPayload(side);
-    if (!body) return;
+    if (s.ticketBusy) return;
+    set({ ticketBusy: true });
     try {
-      const r = await api("/api/order", { method: "POST", body });
+      if (s.otype === "chase") return await get().submitChase(side);
+      const body = get().ticketPayload(side);
+      if (!body) return;
+      const r = await api("/api/order", { method: "POST", body: { ...body, requestId: newRequestId() } });
       if (r.simulated) {
         get().toast(`<b>Simulated order</b> — ${body.side} ${fmt(body.size)} ${body.symbol}. Terminal is disarmed.`, "warn", 9000);
-      } else if (r.error) {
-        get().toast(`<b>Order rejected by Kraken:</b> ${r.error}`, "err", 10000);
+      } else if (r.outcome !== "confirmed") {
+        get().toast(`<b>Order ${r.outcome || "failed"}:</b> ${r.error || "Kraken did not confirm the write."}`, "err", 10000);
       } else {
-        const st = r.response && r.response.sendStatus;
-        get().toast(`Order sent: ${body.side} ${fmt(body.size)} ${body.symbol}. Status: ${String((st && st.orderEvents && st.orderEvents[0] && st.orderEvents[0].orderEvent) || "accepted")}`, "ok");
+        get().toast(`Order confirmed: ${body.side} ${fmt(body.size)} ${body.symbol}.`, "ok");
       }
       get().refreshTables(); get().refreshAccount();
     } catch (e) {
       get().toast(`Order failed: ${e.message}`, "err", 8000);
+    } finally {
+      set({ ticketBusy: false });
     }
   },
 
   ticketPayload(side) {
     const s = get();
     const sizeEl = document.getElementById("in-size");
-    const size = Number(sizeEl ? sizeEl.value : NaN);
-    if (!Number.isFinite(size) || size <= 0) { get().toast("Enter a size.", "err"); return null; }
+    const rawSize = Number(sizeEl ? sizeEl.value : NaN);
+    const inst = s.instruments.find(i => i.symbol === s.symbol) || {};
+    const size = normalizeContractSize(rawSize, inst.contractValueTradePrecision ?? 0);
+    if (!Number.isFinite(size) || size <= 0) { get().toast("Enter a size that meets the contract lot size.", "err"); return null; }
+    if (sizeEl) sizeEl.value = formatContractSize(size, inst.contractValueTradePrecision ?? 0);
     const body = { symbol: s.symbol, side, orderType: s.otype, size };
     if (["lmt", "post", "ioc"].includes(s.otype)) {
       const lp = Number(document.getElementById("in-limit") ? document.getElementById("in-limit").value : NaN);
@@ -409,17 +433,19 @@ const useStore = create((set, get) => ({
   },
 
   async submitChase(side) {
-    const s = get();
-    const sizeEl = document.getElementById("in-size");
-    const size = Number(sizeEl ? sizeEl.value : NaN);
-    if (!Number.isFinite(size) || size <= 0) { get().toast("Enter a size.", "err"); return; }
-    if (!s.armed) { s.toast("CHASE requires an armed terminal — arm it first.", "warn"); return; }
+    const body = get().ticketPayload(side);
+    if (!body) return;
+    if (!get().armed) { get().toast("CHASE requires an armed terminal — arm it first.", "warn"); return; }
     try {
-      const r = await api("/api/chase", { method: "POST", body: { symbol: s.symbol, side, size } });
-      const c = r.chase;
-      s.toast(`Chase ${c.id} running: ${side} ${fmt(size)} ${s.symbol} — pegging best ${side === "buy" ? "bid" : "ask"} (max 300s). Fills will ping.`, "ok", 9000);
+      const r = await api("/api/chase", {
+        method: "POST",
+        body: { symbol: body.symbol, side: body.side, size: body.size, requestId: newRequestId() },
+      });
+      const chase = r.chase;
+      get().onChaseEvent(chase);
+      get().toast(`Chase ${chase.id} running: ${side} ${fmt(body.size)} ${body.symbol}.`, "ok", 9000);
     } catch (e) {
-      s.toast(`Chase failed: ${e.message}`, "err");
+      get().toast(`Chase failed: ${e.message}`, "err");
     }
   },
 
@@ -431,10 +457,10 @@ const useStore = create((set, get) => ({
     try {
       const r = await api("/api/order", {
         method: "POST",
-        body: { symbol, orderType: "mkt", size: Number(p.size), side: p.side === "long" ? "sell" : "buy", reduceOnly: true },
+        body: { symbol, orderType: "mkt", size: Number(p.size), side: p.side === "long" ? "sell" : "buy", reduceOnly: true, requestId: newRequestId() },
       });
       if (r.simulated) s.toast("Close simulated — terminal is disarmed.", "warn");
-      else s.toast("Close order sent.", r.response && r.response.result === "success" ? "ok" : "err");
+      else s.toast(r.outcome === "confirmed" ? "Close order confirmed." : `Close ${r.outcome || "failed"}: ${r.error || "not confirmed"}`, r.outcome === "confirmed" ? "ok" : "err");
       s.refreshTables(); s.refreshAccount();
     } catch (e) { s.toast(`Close failed: ${e.message}`, "err"); }
   },
@@ -455,14 +481,14 @@ const useStore = create((set, get) => ({
   async cancelOrder(payload) {
     const s = get();
     try {
-      const body = payload.cliOrdId ? { cliOrdId: payload.cliOrdId } : { orderId: payload.orderId };
+      const body = { ...(payload.cliOrdId ? { cliOrdId: payload.cliOrdId } : { orderId: payload.orderId }), requestId: newRequestId() };
       const r = await api("/api/cancel", { method: "POST", body });
       let ok = false;
       if (r.simulated) s.toast("Cancel simulated — terminal is disarmed.", "warn");
-      else if (r.error) s.toast(`Cancel failed: ${r.error}`, "err");
+      else if (r.outcome !== "confirmed") s.toast(`Cancel ${r.outcome || "failed"}: ${r.error || "not confirmed"}`, "err");
       else {
-        ok = r.response && r.response.result === "success";
-        s.toast(ok ? "Order canceled." : `Cancel rejected: ${JSON.stringify((r.response && (r.response.cancelStatus || r.response)) || "").slice(0, 140)}`, ok ? "ok" : "err");
+        ok = true;
+        s.toast("Order cancellation confirmed.", "ok");
       }
       await s.refreshTables();
       return ok;
@@ -477,12 +503,18 @@ const useStore = create((set, get) => ({
     const mine = s.orders.filter(o => o.symbol === s.symbol);
     if (!mine.length) { s.toast(`No open orders on ${s.symbol}.`); return; }
     if (!confirm(`Cancel ${mine.length} open order(s) on ${s.symbol}?`)) return;
+    const results = [];
     for (const o of mine) {
       try {
-        await api("/api/cancel", { method: "POST", body: { cliOrdId: o.cliOrdId || undefined, orderId: o.order_id || undefined } });
-      } catch (e) { s.toast(`Cancel failed: ${e.message}`, "err"); }
+        results.push(await api("/api/cancel", { method: "POST", body: { cliOrdId: o.cliOrdId || undefined, orderId: o.order_id || undefined, requestId: newRequestId() } }));
+      } catch (e) {
+        results.push({ outcome: "unknown", error: e.message });
+      }
     }
-    s.toast(`Cancel-all done for ${s.symbol}.`, "ok");
+    const confirmed = results.filter(result => result.outcome === "confirmed").length;
+    if (!s.armed) s.toast(`Cancel-all simulated for ${s.symbol}.`, "warn");
+    else if (confirmed === mine.length) s.toast(`Canceled ${confirmed} order(s) on ${s.symbol}.`, "ok");
+    else s.toast(`Cancel-all incomplete: ${confirmed}/${mine.length} confirmed. Check live orders before retrying.`, "err", 10000);
     s.refreshTables();
   },
 
@@ -497,7 +529,7 @@ const useStore = create((set, get) => ({
     try {
       r = await api("/api/action", {
         method: "POST",
-        body: { actions: acts, messageId: s.chat[msgIdx]?.id, blockIndex: blockIdx },
+        body: { actions: acts, messageId: s.chat[msgIdx]?.id, blockIndex: blockIdx, requestId: newRequestId() },
       });
     } catch (e) {
       s.toast(`Execute failed: ${e.message}`, "err");
@@ -507,17 +539,19 @@ const useStore = create((set, get) => ({
     const sim = !r.armed;
     const executed = Array.isArray(r.actions) ? r.actions : acts;
     const results = r.results || [];
-    const allFailed = results.length > 0 && results.every(res => res.error || res.ok === false);
-    const lines = results.map(res => res.error ? `${res.type || "??"}: ${res.error}` : `${res.type || "??"} ok`);
-    const toastLead = sim ? "<b>Simulated</b> (disarmed)" : allFailed ? "<b>Failed</b>" : "<b>Sent</b>";
+    const allFailed = results.length > 0 && results.every(res => ["rejected", "unknown"].includes(res.outcome) || (res.ok === false && res.outcome !== "partial"));
+    const hasPartial = results.some(res => res.outcome === "partial");
+    const lines = results.map(res => `${res.type || "??"}: ${res.outcome || (res.ok ? "confirmed" : "failed")}${res.error ? ` (${res.error})` : ""}`);
+    const toastLead = sim ? "<b>Simulated</b> (disarmed)" : allFailed ? "<b>Failed</b>" : hasPartial ? "<b>Partial</b>" : "<b>Confirmed</b>";
     s.toast(`${toastLead} — ${lines.join(" · ")}`, sim ? "warn" : allFailed ? "err" : "ok", 9000);
 
     await new Promise(res => setTimeout(res, 900));
-    await s.refreshTables();
-    const afterIds = new Set(s.orders.map(o => o.cliOrdId || o.order_id || o.orderId).filter(Boolean));
+    await get().refreshTables();
+    const freshOrders = get().orders;
+    const afterIds = new Set(freshOrders.map(o => o.cliOrdId || o.order_id || o.orderId).filter(Boolean));
     const orderType = value => String(value || "").toLowerCase() === "stop" ? "stp" : String(value || "").toLowerCase();
     const sigOf = o => JSON.stringify([o.symbol, o.side, orderType(o.orderType), o.limitPrice ?? null, o.stopPrice ?? null]);
-    const afterSigs = new Set(s.orders.filter(o => !o.error).map(sigOf));
+    const afterSigs = new Set(freshOrders.filter(o => !o.error).map(sigOf));
     const rows = [];
     const needsFills = !sim && results.some((res, i) => {
       const a = res.order ? { ...res.order, type: res.type } : (executed[i] || {});
@@ -529,7 +563,7 @@ const useStore = create((set, get) => ({
     }
     results.forEach((res, i) => {
       const a = res.order ? { ...res.order, type: res.type } : (executed[i] || {});
-      if (res.error) { rows.push({ status: "error", primary: describeAction(a), secondary: String(res.error).slice(0, 80) }); return; }
+      if (res.error && res.outcome !== "partial") { rows.push({ status: "error", primary: describeAction(a), secondary: String(res.error).slice(0, 80) }); return; }
       if (res.simulated) { rows.push({ status: "sim", primary: describeAction(a), secondary: "simulated only (disarmed)" }); return; }
       if (a.type === "order") {
         if (a.orderType === "mkt") { rows.push({ status: "ok", primary: describeAction(a), secondary: "market order sent" }); return; }
@@ -582,7 +616,7 @@ const useStore = create((set, get) => ({
       if (m && Array.isArray(m.actionBlocks)) m.actionBlocks = m.actionBlocks.filter((_, bi) => bi !== blockIdx);
       chat[msgIdx] = m;
       chat.push({ role: "assistant", kind: "trace", trace });
-      return { chat, actionBusy: false, lastExecution: { mode: sim ? "SIMULATED (terminal was disarmed — nothing was sent to Kraken)" : allFailed ? "LIVE ATTEMPT FAILED (nothing accepted)" : "LIVE (sent to Kraken)", results: lines, verification: rows, when: new Date().toISOString() } };
+      return { chat, actionBusy: false, lastExecution: { mode: sim ? "SIMULATED (terminal was disarmed — nothing was sent to Kraken)" : allFailed ? "LIVE ATTEMPT FAILED (nothing confirmed)" : hasPartial ? "LIVE PARTIAL (some writes confirmed)" : "LIVE (confirmed by Kraken)", results: lines, verification: rows, when: new Date().toISOString() } };
     });
     api("/api/chat/note", { method: "POST", body: { role: "assistant", content: doneLabel, meta: { trace } } }).catch(() => {});
     s.refreshTables(); s.refreshAccount();
@@ -612,7 +646,7 @@ const useStore = create((set, get) => ({
     try {
       const r = await api("/api/chat", {
         method: "POST",
-        body: { message: text, symbol: s.symbol, lastExecution: s.lastExecution || null },
+        body: { message: text, symbol: s.symbol, lastExecution: s.lastExecution || null, requestId: newRequestId() },
       });
       set({ lastExecution: null });
       s.chat.push({ id: r.messageId, role: "assistant", content: r.text || "(empty response)", proposals: r.orderProposals, actionBlocks: r.actionProposals });
@@ -673,6 +707,17 @@ const useStore = create((set, get) => ({
   onChaseEvent(c) {
     if (!c || !c.id) return;
     set(s => ({ chases: { ...s.chases, [c.id]: { ...c, updated: Date.now() } } }));
+  },
+
+  onProtectionAlert(alert) {
+    if (!alert?.symbol || !alert?.kind) return;
+    const key = `${alert.symbol}:${alert.kind}`;
+    set(s => {
+      const protectionAlerts = { ...s.protectionAlerts };
+      if (alert.status === "RESTORED") delete protectionAlerts[key];
+      else protectionAlerts[key] = alert;
+      return { protectionAlerts };
+    });
   },
 
   async resetChat() {
@@ -740,7 +785,8 @@ const useStore = create((set, get) => ({
       if (answer !== "ARM") { s.toast("Arm cancelled.", ""); return; }
     }
     try {
-      const r = await api("/api/arm", { method: "POST", body: { armed: true, confirm: "yes" } });
+      const { challenge } = await api("/api/arm/challenge");
+      const r = await api("/api/arm", { method: "POST", body: { armed: true, challenge } });
       set({ armed: !!r.armed });
       if (r.armed) s.toast("Order entry ARMED. Orders are now live.", "warn");
     } catch (e) { s.toast(`Arm failed: ${e.message}`, "err"); }
@@ -776,9 +822,8 @@ const useStore = create((set, get) => ({
     const isInverse = inst.type === "futures_inverse";
     const notional = avail * (pct / 100) * s.lev;
     const size = isInverse ? notional / mult : notional / (mult * Number(t.last));
-    const prec = Math.max(0, Math.min(8, Number(inst.contractValueTradePrecision ?? 2)));
     const el = document.getElementById("in-size");
-    if (el) el.value = size.toFixed(prec);
+    if (el) el.value = formatContractSize(size, inst.contractValueTradePrecision ?? 2);
   },
 
   updatePositionCells() { /* positions render live from the store in React */ },

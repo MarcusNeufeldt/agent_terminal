@@ -1,18 +1,31 @@
+import base64
 import json
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import account_log
 import ai_chat
+import chat_compaction
+import market_hub
 import scanner
 from actions import (
-    MANAGED_TP_PREFIX, ActionError, _replace_protection_plan,
-    execute_actions, managed_protection_sync_actions, normalize_actions,
+    MANAGED_TP_PREFIX, ActionContext, ActionError, _replace_protection_plan, cancel_one,
+    execute_actions, managed_protection_sync_actions, normalize_actions, submit_one,
 )
+from chase import ChaseManager, ChaseRejected, ChaseTransient, ChaseUnknown, ChaseWorker
 from db import Database
+from exchange_ops import ensure_client_id, parse_operation
+from kraken_client import KrakenFuturesClient, load_env_file
+from local_security import LocalSecurity, safe_static_path
+from read_state import account_payload, rows_payload
 
 
 class FakeResponse:
@@ -34,8 +47,10 @@ class ProtectionContext:
 
     def get_orders(self):
         return [
-            {"symbol": "PF_EGLDUSD", "orderType": "take_profit", "reduceOnly": True, "order_id": "tp-1"},
-            {"symbol": "PF_EGLDUSD", "orderType": "stop", "reduceOnly": True, "order_id": "sl-1"},
+            {"symbol": "PF_EGLDUSD", "side": "buy", "orderType": "take_profit", "reduceOnly": True,
+             "order_id": "tp-1", "size": 644.41, "unfilledSize": 644.41, "stopPrice": 4.622, "triggerSignal": "mark"},
+            {"symbol": "PF_EGLDUSD", "side": "buy", "orderType": "stop", "reduceOnly": True,
+             "order_id": "sl-1", "size": 644.41, "unfilledSize": 644.41, "stopPrice": 4.715, "triggerSignal": "mark"},
         ]
 
     def instrument(self, _symbol):
@@ -63,7 +78,9 @@ class LongProtectionContext(ProtectionContext):
 
 
 class FakeTradingClient:
-    def post(self, _path, **_kwargs):
+    def post(self, path, **_kwargs):
+        if path == "/sendorder":
+            return {"result": "success", "sendStatus": {"status": "placed", "order_id": "fake-order"}}
         return {"result": "success"}
 
 
@@ -79,6 +96,43 @@ class SequentialProtectionContext(LongProtectionContext):
     def _after_action(self, action, result, _armed):
         if action["type"] == "close" and result.get("ok"):
             self.size = result["remainingSize"]
+
+
+class ProtectionScriptClient:
+    def __init__(self, responses):
+        self.responses = {path: list(values) for path, values in responses.items()}
+        self.calls = []
+
+    def post(self, path, params=None, **_kwargs):
+        self.calls.append((path, params))
+        value = self.responses[path].pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class ProtectionExecutionContext:
+    def __init__(self, client, orders):
+        self.client = client
+        self.orders = orders
+        self.alerts = []
+        self.cleared = []
+        self.after_action = None
+        self.refresh_orders = lambda: None
+        self.set_protection_alert = lambda symbol, kind, details: self.alerts.append((symbol, kind, details))
+        self.clear_protection_alert = lambda symbol, kind: self.cleared.append((symbol, kind))
+
+    def get_positions(self):
+        return [{"symbol": "PF_TESTUSD", "side": "long", "size": 10, "price": 90}]
+
+    def get_orders(self):
+        return self.orders
+
+    def instrument(self, _symbol):
+        return {"tickSize": 0.1, "contractValueTradePrecision": 0}
+
+    def mark_price(self, _symbol):
+        return Decimal("100")
 
 
 class ScannerClient:
@@ -99,6 +153,530 @@ class ScannerClient:
 
 
 class RobustnessTests(unittest.TestCase):
+    @staticmethod
+    def _chase_worker(client):
+        context = SimpleNamespace(
+            client=client,
+            get_instruments=lambda: {"instruments": [{"symbol": "PF_TESTUSD", "tickSize": 0.1, "contractValueTradePrecision": 0}]},
+            get_ticker_rest=lambda _symbol: {"bid": 10, "ask": 11},
+            hub=SimpleNamespace(ticker=lambda _symbol: {"bid": 10, "ask": 11}),
+        )
+        spec = {"symbol": "PF_TESTUSD", "side": "buy", "size": 10, "settlePollSec": 0, "visibilityGraceSec": 0}
+        return ChaseWorker(spec, context, lambda *_args: None)
+
+    def test_chase_rejects_nested_placement_failure(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {"result": "success", "sendStatus": {"status": "postWouldExecute"}})
+        worker = self._chase_worker(client)
+        worker.pegs = 1
+        with self.assertRaises(ChaseRejected):
+            worker._place(Decimal("10"), Decimal("10"))
+        self.assertIsNone(worker._active)
+
+    def test_chase_placed_without_exchange_id_is_unknown_and_not_retried(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {"result": "success", "sendStatus": {"status": "placed"}})
+        worker = self._chase_worker(client)
+        worker.pegs = 1
+        with self.assertRaises(ChaseUnknown):
+            worker._place(Decimal("10"), Decimal("10"))
+        self.assertIsNotNone(worker._active)
+        self.assertIsNone(worker._active["orderId"])
+
+    def test_chase_missing_order_without_full_fill_is_unknown(self):
+        def get(path, **_kwargs):
+            return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": []}
+
+        worker = self._chase_worker(SimpleNamespace(get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseUnknown):
+            worker._reconcile_resting()
+        self.assertEqual(worker.filled, 0)
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_open_order_read_failure_leaves_order_untouched(self):
+        def get(*_args, **_kwargs):
+            raise RuntimeError("temporary read failure")
+
+        worker = self._chase_worker(SimpleNamespace(get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseTransient):
+            worker._reconcile_resting()
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_cancel_failure_never_clears_active_order(self):
+        def post(*_args, **_kwargs):
+            raise RuntimeError("cancel timed out")
+
+        worker = self._chase_worker(SimpleNamespace(post=post))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseUnknown):
+            worker._cancel_active()
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_nested_cancel_failure_never_clears_active_order(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {
+            "result": "success", "cancelStatus": {"status": "notFound"},
+        })
+        worker = self._chase_worker(client)
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseUnknown):
+            worker._cancel_active()
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_reconciles_late_fill_after_confirmed_cancel(self):
+        def post(path, **_kwargs):
+            if path == "/orders/status":
+                return {"result": "success", "orders": [{
+                    "status": "CANCELLED", "order": {"orderId": "order-1", "filled": 3},
+                }]}
+            return {"result": "success", "cancelStatus": {"status": "cancelled", "order_id": "order-1"}}
+
+        def get(path, **_kwargs):
+            if path == "/openorders":
+                return {"result": "success", "openOrders": []}
+            return {"result": "success", "fills": [{"order_id": "order-1", "size": 3}]}
+
+        worker = self._chase_worker(SimpleNamespace(post=post, get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 1, "placedAt": 0}
+        worker._cancel_active()
+        self.assertEqual(worker.filled, 3)
+        self.assertEqual(worker._base_filled, 3)
+        self.assertIsNone(worker._active)
+        self.assertEqual(worker.state, "RECONCILED")
+
+    def test_chase_timeout_after_partial_fill_reports_partial(self):
+        def post(path, **_kwargs):
+            if path == "/orders/status":
+                return {"result": "success", "orders": [{
+                    "status": "CANCELLED", "order": {"orderId": "order-1", "filled": 3},
+                }]}
+            return {"result": "success", "cancelStatus": {"status": "cancelled"}}
+
+        def get(path, **_kwargs):
+            return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": [{"order_id": "order-1", "size": 3}]}
+
+        worker = self._chase_worker(SimpleNamespace(post=post, get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 1, "placedAt": 0}
+        worker._stop_after_cancel("timeout")
+        self.assertEqual(worker.status, "partial")
+        self.assertEqual(worker.stop_reason, "timeout")
+        self.assertEqual(worker.filled, 3)
+
+    def test_chase_full_execution_requires_authoritative_order_status(self):
+        def post(path, **_kwargs):
+            self.assertEqual(path, "/orders/status")
+            return {"result": "success", "orders": [{
+                "status": "FULLY_EXECUTED", "order": {"orderId": "order-1", "filled": 10},
+            }]}
+
+        def get(path, **_kwargs):
+            return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": [{"order_id": "order-1", "size": 10}]}
+
+        worker = self._chase_worker(SimpleNamespace(post=post, get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        self.assertTrue(worker._reconcile_resting())
+        self.assertEqual(worker.filled, 10)
+        self.assertIsNone(worker._active)
+
+    def test_chase_rejects_size_below_contract_lot_without_placing(self):
+        client = Mock()
+        worker = self._chase_worker(client)
+        worker.ctx.get_instruments = lambda: {"instruments": [{
+            "symbol": "PF_TESTUSD", "tickSize": 0.1, "contractValueTradePrecision": -2,
+        }]}
+        worker.spec["size"] = 10
+        worker.run()
+        self.assertEqual(worker.status, "rejected")
+        client.post.assert_not_called()
+
+    def test_chase_replaces_only_after_cancel_and_uses_reconciled_remaining_size(self):
+        class Client:
+            def __init__(self):
+                self.send_count = 0
+                self.open_count = 0
+                self.write_calls = []
+
+            def post(self, path, params=None, **_kwargs):
+                if path == "/sendorder":
+                    self.send_count += 1
+                    self.write_calls.append(("send", params["size"]))
+                    return {"result": "success", "sendStatus": {"status": "placed", "order_id": f"order-{self.send_count}"}}
+                if path == "/cancelorder":
+                    self.write_calls.append(("cancel", params["cliOrdId"]))
+                    return {"result": "success", "cancelStatus": {"status": "cancelled"}}
+                order_id = f"order-{self.send_count}"
+                filled = 3 if order_id == "order-1" else 7
+                status = "CANCELLED" if order_id == "order-1" else "FULLY_EXECUTED"
+                return {"result": "success", "orders": [{"status": status, "order": {"orderId": order_id, "filled": filled}}]}
+
+            def get(self, path, **_kwargs):
+                if path == "/openorders":
+                    self.open_count += 1
+                    if self.open_count == 1:
+                        return {"result": "success", "openOrders": [{"order_id": "order-1", "filledSize": 2, "unfilledSize": 8}]}
+                    return {"result": "success", "openOrders": []}
+                order_id = f"order-{self.send_count}"
+                size = 3 if order_id == "order-1" else 7
+                return {"result": "success", "fills": [{"order_id": order_id, "size": size}]}
+
+        client = Client()
+        worker = self._chase_worker(client)
+        bids = iter((10, 9))
+        worker.ctx.hub.ticker = lambda _symbol: {"bid": next(bids, 9), "ask": 11}
+        worker.spec.update({"repegSec": 0.01, "timeoutSec": 2})
+        worker.run()
+        self.assertEqual(worker.status, "filled")
+        self.assertEqual(client.write_calls[0], ("send", 10.0))
+        self.assertEqual(client.write_calls[1][0], "cancel")
+        self.assertEqual(client.write_calls[2], ("send", 7.0))
+
+    def test_disarm_aborts_cancels_and_reconciles_running_worker(self):
+        placed = threading.Event()
+
+        class Client:
+            def post(self, path, params=None, **_kwargs):
+                if path == "/sendorder":
+                    placed.set()
+                    return {"result": "success", "sendStatus": {"status": "placed", "order_id": "order-1"}}
+                if path == "/cancelorder":
+                    return {"result": "success", "cancelStatus": {"status": "cancelled"}}
+                return {"result": "success", "orders": [{"status": "CANCELLED", "order": {"orderId": "order-1", "filled": 0}}]}
+
+            def get(self, path, **_kwargs):
+                return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": []}
+
+        manager = ChaseManager(lambda *_args: None)
+        worker = self._chase_worker(Client())
+        worker.spec.update({"repegSec": 1, "timeoutSec": 10})
+        manager._chases[worker.id] = worker
+        worker.start()
+        self.assertTrue(placed.wait(1))
+        report = manager.abort_all(wait_timeout=2)
+        self.assertEqual(report["requested"], [worker.id])
+        self.assertEqual(report["pending"], [])
+        self.assertEqual(report["completed"][0]["status"], "aborted")
+
+    def test_disarm_reports_a_worker_that_did_not_finish(self):
+        manager = ChaseManager(lambda *_args: None)
+        worker = Mock(status="running", id="active")
+        worker.is_alive.return_value = True
+        manager._chases["active"] = worker
+        report = manager.abort_all(wait_timeout=0)
+        self.assertEqual(report["requested"], ["active"])
+        self.assertEqual(len(report["pending"]), 1)
+        worker.abort.assert_called_once_with()
+
+    def test_startup_orphan_detection_is_read_only_and_visible(self):
+        published = []
+        manager = ChaseManager(lambda kind, payload: published.append((kind, payload)))
+        found = manager.detect_orphans([{
+            "cliOrdId": "ch-old-1", "order_id": "order-1", "symbol": "PF_TESTUSD",
+            "side": "buy", "filledSize": 2, "unfilledSize": 8,
+        }])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["status"], "orphaned")
+        self.assertEqual(manager.list()[0]["activeOrderId"], "order-1")
+        self.assertEqual(published[0][0], "chase")
+
+    def test_startup_recovers_unfinished_sqlite_chase_without_exchange_mutation(self):
+        manager = ChaseManager(lambda *_args: None)
+        recovered = manager.recover([{
+            "id": "old-worker", "symbol": "PF_TESTUSD", "side": "buy", "size": 10,
+            "status": "running", "activeCliOrdId": "ch-old-2", "activeOrderId": "order-2",
+        }], [])
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["status"], "unknown")
+        self.assertIn("SQLite", recovered[0]["events"][0])
+
+    def test_latest_chase_snapshot_is_persisted_by_chase_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.log_event("chase", {"id": "c1", "status": "running"})
+            db.log_event("chase", {"id": "c1", "status": "filled"})
+            db.log_event("chase", {"id": "c2", "status": "unknown"})
+            latest = {item["id"]: item for item in db.latest_chase_snapshots()}
+            db._conn.close()
+        self.assertEqual(latest["c1"]["status"], "filled")
+        self.assertEqual(latest["c2"]["status"], "unknown")
+
+    def test_websocket_fallback_imports_connection_type(self):
+        with patch.object(market_hub.Path, "exists", return_value=False):
+            open_socket, connection_type, endpoint = market_hub._import_upstream()
+        self.assertTrue(callable(open_socket))
+        self.assertTrue(callable(connection_type))
+        self.assertTrue(callable(endpoint))
+
+    def test_demo_account_log_uses_client_base_url(self):
+        requested = []
+
+        class Client:
+            base_url = "https://demo-futures.kraken.com"
+
+            @staticmethod
+            def _auth_headers_for_path(_path, _params):
+                return {}
+
+        class Response:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            @staticmethod
+            def read():
+                return b'{"logs": []}'
+
+        def open_url(req, timeout):
+            requested.append((req.full_url, timeout))
+            return Response()
+
+        with patch.object(account_log.request, "urlopen", side_effect=open_url):
+            account_log._get(Client(), "/api/history/v2/account-log", "count=1")
+        self.assertEqual(requested, [("https://demo-futures.kraken.com/api/history/v2/account-log?count=1", 30)])
+
+    def test_private_request_nonces_are_unique_under_concurrency(self):
+        secret = base64.b64encode(b"nonce-test-secret").decode()
+        client = KrakenFuturesClient(api_key="key", api_secret=secret)
+        with patch("kraken_client.time.time", return_value=1000.0):
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                nonces = list(pool.map(lambda _: client._auth_headers_for_path("/api/v3/openorders", "")["Nonce"], range(200)))
+        values = [int(nonce) for nonce in nonces]
+        self.assertEqual(len(set(values)), 200)
+        self.assertEqual(min(values), 1_000_000)
+        self.assertEqual(max(values), 1_000_199)
+
+    def test_shared_operation_parser_requires_nested_success(self):
+        confirmed = parse_operation(
+            {"result": "success", "sendStatus": {"status": "placed", "order_id": "o1"}},
+            "sendStatus", "placed",
+        )
+        rejected = parse_operation(
+            {"result": "success", "sendStatus": {"status": "postWouldExecute"}},
+            "sendStatus", "placed",
+        )
+        unknown = parse_operation({"result": "success"}, "sendStatus", "placed")
+        self.assertEqual((confirmed["outcome"], confirmed["exchangeId"]), ("confirmed", "o1"))
+        self.assertEqual(rejected["outcome"], "rejected")
+        self.assertEqual(unknown["outcome"], "unknown")
+
+    def test_submitted_order_gets_fresh_client_id_and_explicit_outcome(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {
+            "result": "success", "sendStatus": {"status": "placed", "order_id": "o1"},
+        })
+        ctx = SimpleNamespace(
+            client=client,
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1},
+            require_new_exposure=lambda _symbol: None,
+            after_action=None,
+        )
+        result = execute_actions([{
+            "type": "order", "symbol": "PF_TESTUSD", "side": "buy", "orderType": "lmt",
+            "size": 10, "limitPrice": 9, "cliOrdId": "caller-reused-id",
+        }], ctx, True)[0]
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertTrue(result["order"]["cliOrdId"].startswith("kt-order-PF_TESTUSD-"))
+        self.assertNotEqual(result["order"]["cliOrdId"], "caller-reused-id")
+
+    def test_partially_accepted_ladder_reports_partial(self):
+        class Client:
+            def __init__(self):
+                self.index = 0
+
+            def post(self, _path, **_kwargs):
+                self.index += 1
+                status = "placed" if self.index <= 2 else "postWouldExecute"
+                return {"result": "success", "sendStatus": {"status": status, "order_id": f"o{self.index}"}}
+
+        ctx = SimpleNamespace(
+            client=Client(), current_price=lambda _symbol: Decimal("10"),
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1, "contractSize": 1},
+            require_new_exposure=lambda _symbol: None,
+            after_action=None,
+        )
+        result = execute_actions([{
+            "type": "ladder", "symbol": "PF_TESTUSD", "side": "buy", "notional": 300,
+            "orders": 3, "depthPercent": 3, "orderType": "post",
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual([row["outcome"] for row in result["responses"]], ["confirmed", "confirmed", "rejected"])
+        self.assertEqual(len({row["params"]["cliOrdId"] for row in result["responses"]}), 3)
+
+    def test_ladder_stops_after_unknown_rung(self):
+        class Client:
+            def __init__(self):
+                self.send_calls = 0
+
+            def post(self, path, **_kwargs):
+                if path == "/orders/status":
+                    return {"result": "success", "orders": []}
+                self.send_calls += 1
+                if self.send_calls == 2:
+                    raise TimeoutError("timed out")
+                return {"result": "success", "sendStatus": {"status": "placed", "order_id": "o1"}}
+
+        client = Client()
+        ctx = SimpleNamespace(
+            client=client, current_price=lambda _symbol: Decimal("10"),
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1, "contractSize": 1},
+            require_new_exposure=lambda _symbol: None,
+            after_action=None,
+        )
+        result = execute_actions([{
+            "type": "ladder", "symbol": "PF_TESTUSD", "side": "buy", "notional": 400,
+            "orders": 4, "depthPercent": 4, "orderType": "post",
+        }], ctx, True)[0]
+        self.assertEqual(client.send_calls, 2)
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual(
+            [row["outcome"] for row in result["responses"]],
+            ["confirmed", "unknown", "rejected", "rejected"],
+        )
+
+    def test_cancel_all_reports_partial_nested_failures(self):
+        orders = [
+            {"symbol": "PF_TESTUSD", "cliOrdId": "c1"},
+            {"symbol": "PF_TESTUSD", "cliOrdId": "c2"},
+        ]
+        responses = iter((
+            {"result": "success", "cancelStatus": {"status": "cancelled", "order_id": "o1"}},
+            {"result": "success", "cancelStatus": {"status": "notFound"}},
+        ))
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: next(responses))
+        ctx = SimpleNamespace(client=client, get_orders=lambda: orders, refresh_orders=None, after_action=None)
+        result = execute_actions([{"type": "cancel_all", "symbol": "PF_TESTUSD"}], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual([row["outcome"] for row in result["results"]], ["confirmed", "unknown"])
+
+    def test_unavailable_reads_preserve_last_known_state_and_age(self):
+        positions = rows_payload("positions", [{
+            "error": "API unavailable", "lastKnown": [{"symbol": "PF_TESTUSD"}], "ageSeconds": 4.2,
+        }])
+        account = account_payload({
+            "error": "API unavailable", "lastKnown": {"availableMargin": 123}, "ageSeconds": 3.1,
+        })
+        self.assertEqual(positions, {
+            "positions": [{"symbol": "PF_TESTUSD"}], "state": "unavailable",
+            "error": "API unavailable", "ageSeconds": 4.2,
+        })
+        self.assertEqual(account["availableMargin"], 123)
+        self.assertEqual((account["state"], account["ageSeconds"]), ("unavailable", 3.1))
+        self.assertEqual(rows_payload("orders", []), {"orders": [], "state": "current", "ageSeconds": 0})
+
+    def test_ambiguous_cancel_with_unavailable_orders_stays_unknown(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {
+            "result": "success", "cancelStatus": {"status": "notFound"},
+        })
+        ctx = SimpleNamespace(
+            client=client,
+            refresh_orders=None,
+            get_orders=lambda: [{"error": "open orders API unavailable"}],
+        )
+        result = cancel_one(ctx, {"order_id": "order-1"})
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(result["verification"], {"source": "openorders", "state": "unavailable"})
+
+    def test_action_context_rejects_stale_market_or_account_state(self):
+        stale = {"last": 10, "markPrice": 9.9, "time": time.time() - 30}
+        ctx = ActionContext(
+            client=SimpleNamespace(), hub=SimpleNamespace(ticker=lambda _symbol: stale),
+            get_account=lambda: {"availableMargin": 100}, get_positions=lambda: [], get_orders=lambda: [],
+            get_instruments=lambda: {"instruments": []}, get_ticker_rest=lambda _symbol: None,
+        )
+        with self.assertRaisesRegex(ActionError, "unavailable or stale"):
+            ctx.current_price("PF_TESTUSD")
+        ctx.get_ticker_rest = lambda _symbol: {"last": 10, "markPrice": 9.9, "_receivedAt": time.time()}
+        self.assertEqual(ctx.current_price("PF_TESTUSD"), Decimal("10"))
+        ctx.get_account = lambda: {"error": "accounts API unavailable"}
+        with self.assertRaisesRegex(ActionError, "new exposure rejected"):
+            ctx.require_new_exposure("PF_TESTUSD")
+
+    def test_write_request_replay_returns_stored_result_without_reclaiming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                payload = {"symbol": "PF_TESTUSD", "side": "buy"}
+                self.assertEqual(db.claim_write_request("request-123", "/api/order", payload)["state"], "new")
+                self.assertEqual(db.claim_write_request("request-123", "/api/order", payload)["state"], "pending")
+                db.complete_write_request("request-123", 200, {"outcome": "confirmed", "exchangeId": "o1"})
+                replay = db.claim_write_request("request-123", "/api/order", payload)
+                self.assertEqual((replay["state"], replay["status"], replay["result"]["exchangeId"]), ("replay", 200, "o1"))
+                self.assertEqual(
+                    db.claim_write_request("request-123", "/api/order", {**payload, "side": "sell"})["state"],
+                    "conflict",
+                )
+            finally:
+                db._conn.close()
+
+    def test_failed_write_stops_remaining_live_batch(self):
+        calls = []
+
+        def post(path, **_kwargs):
+            calls.append(path)
+            return {"result": "success", "sendStatus": {"status": "postWouldExecute"}}
+
+        ctx = SimpleNamespace(
+            client=SimpleNamespace(post=post),
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1},
+            require_new_exposure=lambda _symbol: None,
+            after_action=None,
+        )
+        action = {"type": "order", "symbol": "PF_TESTUSD", "side": "buy", "orderType": "post", "size": 1, "limitPrice": 9}
+        results = execute_actions([action, action], ctx, True)
+        self.assertEqual(calls, ["/sendorder"])
+        self.assertEqual([result["outcome"] for result in results], ["rejected", "rejected"])
+        self.assertIn("not executed", results[1]["error"])
+
+    def test_write_timeout_is_unknown_and_never_blindly_retried(self):
+        calls = []
+
+        def post(path, **_kwargs):
+            calls.append(path)
+            if path == "/sendorder":
+                raise TimeoutError("timed out")
+            return {"result": "success", "orders": []}
+
+        result = submit_one(SimpleNamespace(client=SimpleNamespace(post=post)), {"symbol": "PF_TESTUSD", "size": 1}, "kt-test")
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(calls, ["/sendorder", "/orders/status"])
+        self.assertTrue(result["params"]["cliOrdId"].startswith("kt-test-"))
+
+    def test_client_ids_are_unique(self):
+        ids = {ensure_client_id({}, "kt-test")["cliOrdId"] for _ in range(200)}
+        self.assertEqual(len(ids), 200)
+
+    def test_server_loads_env_before_reading_port(self):
+        source = (Path(__file__).parent / "server.py").read_text(encoding="utf-8")
+        self.assertLess(source.index('load_env_file(HERE / ".env")'), source.index('PORT = int(os.getenv("PORT"'))
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text("PORT=9123\n", encoding="utf-8")
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertTrue(load_env_file(env_file))
+                import os
+                self.assertEqual(int(os.getenv("PORT", "8787")), 9123)
+
+    def test_chase_simulates_disarmed_and_starts_reconciled_worker_armed(self):
+        manager = Mock()
+        manager.start.return_value = {"id": "chase-1", "status": "running"}
+        ctx = SimpleNamespace(
+            chase=manager,
+            start_chase=None,
+            hub=SimpleNamespace(ticker=lambda _symbol: {"bid": 1.0, "ask": 1.1}),
+            get_ticker_rest=lambda _symbol: None,
+            after_action=None,
+        )
+        action = {"type": "chase", "symbol": "PF_TESTUSD", "side": "buy", "size": 10}
+        simulated = execute_actions([action], ctx, False)[0]
+        live = execute_actions([action], ctx, True)[0]
+        self.assertTrue(simulated["simulated"])
+        self.assertTrue(live["ok"])
+        self.assertEqual(live["chase"]["id"], "chase-1")
+        manager.start.assert_called_once()
+
     def test_missing_action_type_is_repaired_for_order_payload(self):
         raw = [{"symbol": "PF_ETHUSD", "side": "buy", "orderType": "post", "size": 1, "limitPrice": 2000}]
         normalized = normalize_actions(raw)
@@ -112,28 +690,165 @@ class RobustnessTests(unittest.TestCase):
                 {"type": ""},
             ])
 
+    @staticmethod
+    def _open_tp(**changes):
+        order = {
+            "symbol": "PF_TESTUSD", "side": "sell", "orderType": "take_profit",
+            "reduceOnly": True, "order_id": "tp-1", "cliOrdId": f"{MANAGED_TP_PREFIX}PF_TESTUSD-old",
+            "size": 10, "unfilledSize": 10, "stopPrice": 120, "triggerSignal": "mark",
+        }
+        order.update(changes)
+        return order
+
+    def test_protection_edit_uses_exact_id_and_preserves_exchange_id(self):
+        client = ProtectionScriptClient({
+            "/editorder": [{"result": "success", "editStatus": {"status": "edited", "orderId": "tp-1"}}],
+        })
+        ctx = ProtectionExecutionContext(client, [self._open_tp()])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "orderId": "tp-1",
+        }], ctx, True)[0]
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["edited"])
+        self.assertEqual(result["orderId"], "tp-1")
+        self.assertEqual(client.calls, [("/editorder", {"orderId": "tp-1", "size": 10.0, "stopPrice": 125.0})])
+
+    def test_protection_edit_rejection_leaves_original_order_working(self):
+        client = ProtectionScriptClient({
+            "/editorder": [{"result": "success", "editStatus": {"status": "invalidSize"}}],
+        })
+        ctx = ProtectionExecutionContext(client, [self._open_tp()])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "orderId": "tp-1",
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["originalWorking"])
+        self.assertEqual([path for path, _params in client.calls], ["/editorder"])
+        self.assertEqual(ctx.alerts, [])
+
+    def test_edit_not_found_without_original_order_sets_unprotected_alert(self):
+        client = ProtectionScriptClient({
+            "/editorder": [{"result": "success", "editStatus": {"status": "orderForEditNotFound"}}],
+        })
+        ctx = ProtectionExecutionContext(client, [self._open_tp()])
+        reads = iter(([self._open_tp()], []))
+        ctx.get_orders = lambda: next(reads)
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "orderId": "tp-1",
+        }], ctx, True)[0]
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(ctx.alerts[0][0:2], ("PF_TESTUSD", "TP"))
+
+    def test_exact_partial_tp_drag_preserves_size_and_other_ladder_orders(self):
+        partial = self._open_tp(unfilledSize=4, size=4)
+        other = self._open_tp(order_id="tp-2", cliOrdId="manual-tp-2", unfilledSize=6, size=6, stopPrice=130)
+        ctx = ProtectionExecutionContext(Mock(), [partial, other])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 126,
+            "orderId": "tp-1", "preserveSize": True,
+        }], ctx, False)[0]
+        self.assertTrue(result["simulated"])
+        self.assertEqual(result["editParams"], {"orderId": "tp-1", "size": 4.0, "stopPrice": 126.0})
+        ambiguous = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 126,
+        }], ctx, False)[0]
+        self.assertFalse(ambiguous["ok"])
+        self.assertIn("ladder", ambiguous["error"])
+
+    def test_cancel_recreate_rolls_back_previous_protection_on_known_rejection(self):
+        target = self._open_tp(order_id=None)
+        client = ProtectionScriptClient({
+            "/cancelorder": [{"result": "success", "cancelStatus": {"status": "cancelled"}}],
+            "/sendorder": [
+                {"result": "success", "sendStatus": {"status": "insufficientAvailableFunds"}},
+                {"result": "success", "sendStatus": {"status": "placed", "order_id": "rollback-1"}},
+            ],
+        })
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rolledBack"])
+        self.assertEqual([path for path, _params in client.calls], ["/cancelorder", "/sendorder", "/sendorder"])
+        self.assertEqual(ctx.alerts, [])
+
+    def test_cancel_timeout_with_original_still_open_never_sends_replacement(self):
+        target = self._open_tp(order_id=None)
+        client = ProtectionScriptClient({"/cancelorder": [TimeoutError("timed out")]})
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["originalWorking"])
+        self.assertEqual([path for path, _params in client.calls], ["/cancelorder"])
+
+    def test_unknown_replacement_is_reconciled_before_any_rollback(self):
+        target = self._open_tp(order_id=None)
+        client = ProtectionScriptClient({
+            "/cancelorder": [{"result": "success", "cancelStatus": {"status": "cancelled"}}],
+            "/sendorder": [TimeoutError("timed out")],
+            "/orders/status": [{"result": "success", "orders": []}],
+        })
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual([path for path, _params in client.calls], ["/cancelorder", "/sendorder", "/orders/status"])
+        self.assertEqual(ctx.alerts[0][0:2], ("PF_TESTUSD", "TP"))
+
+    def test_rollback_failure_persists_unprotected_alert(self):
+        target = self._open_tp(order_id=None)
+        rejected = {"result": "success", "sendStatus": {"status": "insufficientAvailableFunds"}}
+        client = ProtectionScriptClient({
+            "/cancelorder": [{"result": "success", "cancelStatus": {"status": "cancelled"}}],
+            "/sendorder": [rejected, rejected],
+        })
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["unprotected"])
+        self.assertEqual(ctx.alerts[0][0:2], ("PF_TESTUSD", "TP"))
+
+    def test_unprotected_alert_is_persistent_until_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.set_protection_alert("PF_TESTUSD", "TP", {"message": "rollback failed"})
+            alerts = db.protection_alerts()
+            db.clear_protection_alert("PF_TESTUSD", "TP")
+            cleared = db.protection_alerts()
+            db._conn.close()
+        self.assertEqual(alerts[0]["status"], "UNPROTECTED")
+        self.assertEqual(alerts[0]["details"]["message"], "rollback failed")
+        self.assertEqual(cleared, [])
+
     def test_tp_and_sl_replace_only_the_same_protection_type(self):
         ctx = ProtectionContext()
         tp = _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.622}, ctx, "take_profit")
         sl = _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.715}, ctx, "stp")
-        self.assertEqual(tp["cancelOrderIds"], [{"order_id": "tp-1"}])
-        self.assertEqual(sl["cancelOrderIds"], [{"order_id": "sl-1"}])
+        self.assertEqual(tp["orderId"], "tp-1")
+        self.assertEqual(sl["orderId"], "sl-1")
+        self.assertEqual(tp["editParams"], {"orderId": "tp-1", "size": 644.41, "stopPrice": 4.622})
+        self.assertEqual(sl["editParams"], {"orderId": "sl-1", "size": 644.41, "stopPrice": 4.715})
         self.assertEqual(tp["order"]["orderType"], "take_profit")
         self.assertEqual(sl["order"]["orderType"], "stp")
-        self.assertTrue(tp["order"]["cliOrdId"].startswith(MANAGED_TP_PREFIX))
 
     def test_managed_full_tp_resizes_after_position_growth(self):
         positions = [{"symbol": "PF_ENAUSD", "side": "long", "size": 20626}]
         managed = {
             "symbol": "PF_ENAUSD", "orderType": "take_profit", "reduceOnly": True,
-            "cliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1", "unfilledSize": 10313,
-            "stopPrice": 0.17296,
+            "cliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1", "order_id": "managed-tp",
+            "unfilledSize": 10313, "stopPrice": 0.17296,
         }
         actions = managed_protection_sync_actions(positions, [managed])
         self.assertEqual(actions, [{
             "type": "replace_tp", "symbol": "PF_ENAUSD", "stopPrice": 0.17296,
             "managed": True, "syncFromSize": 10313.0, "syncToSize": 20626.0,
-            "sourceCliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1",
+            "orderId": "managed-tp", "sourceCliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1",
         }])
         self.assertEqual(managed_protection_sync_actions(positions, [{**managed, "unfilledSize": 20626}]), [])
         legacy = {**managed, "cliOrdId": "", "order_id": "legacy-tp"}
@@ -231,6 +946,100 @@ class RobustnessTests(unittest.TestCase):
             {"role": "assistant", "content": "failed", "meta": {"trace": {"working": False}}},
         ]
         self.assertEqual(ai_chat._compaction_messages(messages), [messages[0]])
+
+    def test_failed_compaction_summary_keeps_source_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                for index in range(5):
+                    db.add_message(session_id, "user", f"message {index} " + "x" * 1000)
+                with self.assertRaisesRegex(ai_chat.ChatError, "summary failed"):
+                    chat_compaction.prepare_chat_context(
+                        db, session_id, "snapshot", 1, keep_last=2,
+                        summarizer=lambda *_args, **_kwargs: (_ for _ in ()).throw(ai_chat.ChatError("summary failed")),
+                    )
+                self.assertEqual(db.count_in_context(session_id), 5)
+                self.assertEqual(db.get_session_summary(session_id), "")
+            finally:
+                db._conn.close()
+
+    def test_compaction_commit_is_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                for index in range(5):
+                    db.add_message(session_id, "user", f"message {index}")
+                candidates, old_summary = db.compaction_candidates(session_id, keep_last=2)
+                self.assertEqual((len(candidates), db.count_in_context(session_id)), (3, 5))
+                db._conn.execute(
+                    "CREATE TRIGGER fail_compaction BEFORE UPDATE OF summary ON sessions "
+                    "BEGIN SELECT RAISE(ABORT, 'forced'); END"
+                )
+                db._conn.commit()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    db.commit_compaction(session_id, [row["id"] for row in candidates], old_summary, "summary")
+                self.assertEqual(db.count_in_context(session_id), 5)
+                self.assertEqual(db.get_session_summary(session_id), "")
+            finally:
+                db._conn.close()
+
+    def test_compaction_runs_before_pending_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                for index in range(5):
+                    db.add_message(session_id, "user", f"message {index} " + "x" * 9000)
+                history = [{"role": row["role"], "content": row["content"]} for row in db.get_messages(session_id, 400)]
+                before = ai_chat.estimate_prompt_tokens(history, "snapshot")
+                projected = ai_chat.estimate_prompt_tokens(history[-2:], "snapshot", session_summary="short summary")
+                events = []
+
+                def summarize(_messages, _summary, usage_sink):
+                    events.append("summarize")
+                    usage_sink({"total_tokens": 7})
+                    return "short summary"
+
+                prepared = chat_compaction.prepare_chat_context(
+                    db, session_id, "snapshot", (before + projected) // 2,
+                    keep_last=2, summarizer=summarize,
+                )
+                events.append("request")
+                self.assertEqual(events, ["summarize", "request"])
+                self.assertEqual((prepared[4], db.count_in_context(session_id)), (3, 2))
+                self.assertEqual(db.get_token_usage(session_id)["billed_tokens"], 7)
+            finally:
+                db._conn.close()
+
+    def test_tool_round_usage_keeps_latest_prompt_separate_from_billing(self):
+        responses = [
+            {"usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}, "choices": [{"message": {"content": "", "tool_calls": [{"id": "one", "function": {"name": "get_positions", "arguments": "{}"}}]}}]},
+            {"usage": {"prompt_tokens": 140, "completion_tokens": 20, "total_tokens": 160}, "choices": [{"message": {"content": "done"}}]},
+        ]
+        with patch("ai_chat._load_openrouter_key", return_value="key"), patch("ai_chat._openrouter_completion", side_effect=responses):
+            result = ai_chat.respond(
+                [{"role": "user", "content": "status"}], "snapshot",
+                tool_executor=lambda *_args: {"positions": []},
+            )
+        self.assertEqual(result["usage"], {
+            "prompt_tokens": 140,
+            "billed_prompt_tokens": 240,
+            "completion_tokens": 30,
+            "total_tokens": 270,
+        })
+
+    def test_model_usage_persists_latest_prompt_and_cumulative_billing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                db.record_model_usage(session_id, 140, 270)
+                db.record_model_usage(session_id, 90, 120)
+                self.assertEqual(db.get_token_usage(session_id), {"prompt_tokens": 90, "billed_tokens": 390})
+            finally:
+                db._conn.close()
 
     def test_tool_audit_and_volatile_memory_rejection(self):
         calls = [{
@@ -332,6 +1141,45 @@ class RobustnessTests(unittest.TestCase):
                 self.assertFalse(db.claim_action_proposal(session_id, message_id, 0, block))
             finally:
                 db._conn.close()
+
+    def test_local_write_security_rejects_bad_headers(self):
+        security = LocalSecurity(8787)
+        valid = {
+            "Host": "127.0.0.1:8787",
+            "Origin": "http://127.0.0.1:8787",
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Terminal-Token": security.token,
+        }
+        self.assertIsNone(security.validate_write(valid))
+        for key, value, status in (
+            ("Host", "evil.test", 403),
+            ("Origin", "https://evil.test", 403),
+            ("Content-Type", "text/plain", 415),
+            ("X-Terminal-Token", "wrong", 403),
+        ):
+            headers = {**valid, key: value}
+            self.assertEqual(security.validate_write(headers)[0], status)
+
+    def test_arm_challenge_is_tied_to_process_token_and_one_time(self):
+        security = LocalSecurity(8787)
+        challenge = security.issue_arm_challenge()
+        self.assertTrue(security.consume_arm_challenge(challenge))
+        self.assertFalse(security.consume_arm_challenge(challenge))
+        other_process = LocalSecurity(8787)
+        self.assertFalse(other_process.consume_arm_challenge(challenge))
+        expired = security.issue_arm_challenge(ttl_seconds=-1)
+        self.assertFalse(security.consume_arm_challenge(expired))
+
+    def test_static_path_must_remain_inside_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "static"
+            root.mkdir()
+            allowed = root / "index.html"
+            allowed.write_text("ok")
+            (parent / "secret.txt").write_text("no")
+            self.assertEqual(safe_static_path(root, "/index.html"), allowed.resolve())
+            self.assertIsNone(safe_static_path(root, "/../secret.txt"))
 
     @patch("ai_chat.time.sleep", return_value=None)
     @patch("ai_chat.requests.post")

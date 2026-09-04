@@ -9,9 +9,9 @@ A self-hosted Kraken Futures trading terminal with live market data, chart-based
 
 - Kraken Futures positions, orders, fills, margin, and account history
 - Binance USDT-M candles for charting, with Kraken as the trading authority
-- Market, limit, post-only, stop, take-profit, ladder, and chase orders
+- PF-only market, limit, post-only, stop, take-profit, ladder, and Chase orders with unique client IDs and explicit write outcomes
 - Draggable TP/SL controls with confirmation, actual protection coverage, and persistent 1:1/1:2/1:3 mirrored loss lines
-- Managed full-position TP/SL resizing after confirmed position-size changes
+- Exact-ID TP/SL edits with rollback and persistent `UNPROTECTED` alerts; managed full-position resizing after confirmed size changes
 - React 19 workspace with lightweight-charts, Zustand, and Markdown chat
 - OpenRouter assistant with audited read and ARM-gated write tools
 - SQLite chat, execution, tool-call, equity, and account-history persistence
@@ -22,6 +22,8 @@ A self-hosted Kraken Futures trading terminal with live market data, chart-based
 - DISARMED writes return an exact simulation and do not call Kraken's trading endpoints.
 - Arming requires the sidebar control and an `ARM` confirmation.
 - Managed protection changes run only while ARMED.
+- Persisted request IDs prevent identical HTTP retries from submitting duplicate trades.
+- Failed private reads show last-known data and block new exposure instead of appearing empty.
 - Partial TP/SL ladders are not automatically resized.
 - Kraken credentials stay in `terminal/.env`, which Git ignores.
 - Runtime databases, logs, screenshots, and local auth files are not committed.

@@ -6,9 +6,9 @@ Stdlib-only HTTP server (ThreadingHTTPServer) serving:
   - SSE stream /api/stream fanning out live tickers, trades, and hub status
   - AI chat POST /api/chat (OpenRouter, live account/market context)
 
-Order safety: POST /api/order is SIMULATED until the terminal is armed via
-POST /api/arm {"armed": true}. Armed state lives in memory only; restarting
-the server always disarms.
+Order safety: every POST needs the per-process browser token and an exact local
+Origin. POST /api/order is SIMULATED until /api/arm consumes a one-time signed
+challenge. Armed state lives in memory only; restarting always disarms.
 """
 
 from __future__ import annotations
@@ -43,43 +43,57 @@ import db as db_mod  # noqa: E402
 import account_log  # noqa: E402
 import binance_candles  # noqa: E402
 import binance_ws as binance_ws_mod  # noqa: E402
+import chat_compaction  # noqa: E402
 from actions import ActionContext  # noqa: E402
+from local_security import LocalSecurity, safe_static_path  # noqa: E402
+from read_state import account_payload as _account_payload, rows_payload as _rows_payload  # noqa: E402
 
 STATIC_DIR = HERE / "static"
-PORT = int(os.getenv("PORT", "8787"))
 
-# Load credentials: local .env first, then the kraken-futures-cli .env.
+# Load configuration before reading PORT or constructing clients.
 load_env_file(HERE / ".env")
 load_env_file(Path(r"F:\explore\kraken-futures-cli") / ".env")
+PORT = int(os.getenv("PORT", "8787"))
+VITE_ORIGINS = tuple(filter(None, (value.strip().lower() for value in os.getenv("VITE_DEV_ORIGINS", "").split(","))))
+security = LocalSecurity(PORT, VITE_ORIGINS)
+DEBUG_ENDPOINTS = os.getenv("TERMINAL_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+IDEMPOTENT_WRITE_PATHS = {"/api/order", "/api/cancel", "/api/action", "/api/chase", "/api/chase/abort", "/api/chat"}
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,100}$")
 
 client = KrakenFuturesClient.from_env()
 hub = MarketHub(client.base_url)
 
 armed = False
-arm_lock = threading.Lock()
+arm_lock = threading.RLock()
 
 
 class TTLCache:
     def __init__(self) -> None:
         self._data: dict[str, tuple[float, Any]] = {}
+        self._invalidated: set[str] = set()
         self._lock = threading.Lock()
 
     def get(self, key: str, ttl: float) -> Any | None:
         now = time.monotonic()
         with self._lock:
             hit = self._data.get(key)
-            if hit and now - hit[0] < ttl:
+            if key not in self._invalidated and hit and now - hit[0] < ttl:
                 return hit[1]
         return None
+
+    def peek(self, key: str) -> tuple[Any, float] | None:
+        with self._lock:
+            hit = self._data.get(key)
+        return (hit[1], max(0.0, time.monotonic() - hit[0])) if hit else None
 
     def put(self, key: str, value: Any) -> None:
         with self._lock:
             self._data[key] = (time.monotonic(), value)
+            self._invalidated.discard(key)
 
     def drop(self, *prefixes: str) -> None:
         with self._lock:
-            for key in [k for k in self._data if k.startswith(prefixes)]:
-                del self._data[key]
+            self._invalidated.update(key for key in self._data if key.startswith(prefixes))
 
 
 cache = TTLCache()
@@ -158,6 +172,16 @@ def extract_account(accounts_payload: Any) -> dict[str, Any]:
     }
 
 
+def _unavailable(key: str, error: Exception | str) -> dict[str, Any]:
+    previous = cache.peek(key)
+    return {
+        "error": str(error),
+        "state": "unavailable",
+        "lastKnown": previous[0] if previous else None,
+        "ageSeconds": round(previous[1], 1) if previous else None,
+    }
+
+
 def get_account() -> dict[str, Any]:
     cached = cache.get("account", 3)
     if cached is not None:
@@ -165,10 +189,12 @@ def get_account() -> dict[str, Any]:
     try:
         payload = client.get("/accounts", private=True)
         account = extract_account(payload)
+        if not account:
+            raise KrakenFuturesError("invalid accounts response")
         cache.put("account", account)
         return account
     except KrakenFuturesError as exc:
-        return {"error": str(exc)}
+        return _unavailable("account", exc)
 
 
 def get_positions() -> list[dict[str, Any]]:
@@ -177,13 +203,14 @@ def get_positions() -> list[dict[str, Any]]:
         return cached
     try:
         payload = client.get("/openpositions", private=True)
-        positions = payload.get("openPositions", []) if isinstance(payload, dict) else []
-        result = positions if isinstance(positions, list) else []
-        result = enrich_positions(result)
+        positions = payload.get("openPositions") if isinstance(payload, dict) else None
+        if not isinstance(positions, list):
+            raise KrakenFuturesError("invalid open positions response")
+        result = enrich_positions(positions)
         cache.put("positions", result)
         return result
     except KrakenFuturesError as exc:
-        return [{"error": str(exc)}]
+        return [_unavailable("positions", exc)]
 
 
 def enrich_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -251,12 +278,13 @@ def get_orders() -> list[dict[str, Any]]:
         return cached
     try:
         payload = client.get("/openorders", private=True)
-        orders = payload.get("openOrders", []) if isinstance(payload, dict) else []
-        result = orders if isinstance(orders, list) else []
-        cache.put("orders", result)
-        return result
+        orders = payload.get("openOrders") if isinstance(payload, dict) else None
+        if not isinstance(orders, list):
+            raise KrakenFuturesError("invalid open orders response")
+        cache.put("orders", orders)
+        return orders
     except KrakenFuturesError as exc:
-        return [{"error": str(exc)}]
+        return [_unavailable("orders", exc)]
 
 
 def get_fills() -> list[dict[str, Any]]:
@@ -293,10 +321,11 @@ def get_ticker_rest(symbol: str) -> dict[str, Any] | None:
             (t for t in payload.get("tickers", []) if t.get("symbol") == symbol),
             None,
         ) if isinstance(payload, dict) else None
-        cache.put(f"ticker:{symbol}", match or {})
+        if match:
+            match = {**match, "_receivedAt": time.time()}
+            cache.put(f"ticker:{symbol}", match)
         return match
     except KrakenFuturesError:
-        cache.put(f"ticker:{symbol}", {})
         return None
 
 
@@ -330,14 +359,56 @@ def _refresh_after_action(action: dict[str, Any], result: dict[str, Any], is_arm
 action_ctx = ActionContext(
     client=client,
     hub=hub,
+    get_account=get_account,
     get_positions=get_positions,
     get_orders=get_orders,
     get_instruments=get_instruments,
     get_ticker_rest=get_ticker_rest,
 )
-chase_manager = chase_mod.ChaseManager(sse.publish)
+db = db_mod.Database()
+
+
+def _ticker_payload(symbol: str) -> dict[str, Any]:
+    try:
+        ticker = action_ctx.fresh_ticker(symbol)
+        return {**ticker, "state": "current", "ageSeconds": round(action_ctx._ticker_age(ticker) or 0, 1)}
+    except trading_actions.ActionError as exc:
+        ticker = hub.ticker(symbol)
+        if not ticker:
+            previous = cache.peek(f"ticker:{symbol}")
+            ticker = previous[0] if previous and isinstance(previous[0], dict) else {}
+        age = action_ctx._ticker_age(ticker) if ticker else None
+        return {
+            **ticker,
+            "state": "unavailable",
+            "error": str(exc),
+            "ageSeconds": round(age, 1) if age is not None else None,
+        }
+
+
+def _publish_chase(kind: str, payload: dict[str, Any]) -> None:
+    db.log_event("chase", payload)
+    sse.publish(kind, payload)
+
+
+def _set_protection_alert(symbol: str, kind: str, details: dict[str, Any]) -> None:
+    payload = {"symbol": symbol, "kind": kind, "status": "UNPROTECTED", "details": details}
+    db.set_protection_alert(symbol, kind, details)
+    db.log_event("protection_alert", payload)
+    sse.publish("protection_alert", payload)
+
+
+def _clear_protection_alert(symbol: str, kind: str) -> None:
+    db.clear_protection_alert(symbol, kind)
+    payload = {"symbol": symbol, "kind": kind, "status": "RESTORED"}
+    db.log_event("protection_alert", payload)
+    sse.publish("protection_alert", payload)
+
+
+chase_manager = chase_mod.ChaseManager(_publish_chase)
 binance_klines = binance_ws_mod.BinanceKlineStream(hub, sse.publish)
 binance_klines.start()
+
 
 def _equity_snapshot_loop() -> None:
     # Record portfolio value every 30s so the equity curve includes open PnL.
@@ -353,12 +424,62 @@ def _equity_snapshot_loop() -> None:
             pass
         time.sleep(30)
 
+
+def _detect_orphan_chases() -> None:
+    try:
+        orders = get_orders()
+        failed = next((order.get("error") for order in orders if order.get("error")), None)
+        if failed:
+            db.log_event("chase_orphan_scan", {"ok": False, "error": str(failed)[:300]})
+            return
+        found = chase_manager.recover(db.latest_chase_snapshots(), orders)
+        db.log_event("chase_orphan_scan", {"ok": True, "count": len(found)})
+    except Exception as exc:
+        db.log_event("chase_orphan_scan", {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]})
+
+
 threading.Thread(target=_equity_snapshot_loop, name="equity-snapshots", daemon=True).start()
+threading.Thread(target=_detect_orphan_chases, name="chase-orphan-scan", daemon=True).start()
 action_ctx.chase = chase_manager
+
+
+def _start_chase_if_armed(spec: dict[str, Any]) -> dict[str, Any]:
+    with arm_lock:
+        if not armed:
+            raise trading_actions.ActionError("chase requires an ARMED terminal")
+        action_ctx.require_new_exposure(str(spec["symbol"]))
+        return chase_manager.start(spec, action_ctx)
+
+
+action_ctx.start_chase = _start_chase_if_armed
+action_ctx.refresh_orders = lambda: cache.drop("orders")
+action_ctx.set_protection_alert = _set_protection_alert
+action_ctx.clear_protection_alert = _clear_protection_alert
 action_ctx.after_action = _refresh_after_action
-db = db_mod.Database()
 _legacy_managed_protection_ids = db.inferred_managed_protection_ids()
 _protection_sync_due: dict[tuple[Any, ...], float] = {}
+
+
+def _reconcile_protection_alerts(positions: list[dict[str, Any]], orders: list[dict[str, Any]]) -> None:
+    if any(row.get("error") for row in positions + orders if isinstance(row, dict)):
+        return
+    by_symbol = {str(position.get("symbol")): position for position in positions if position.get("symbol")}
+    for alert in db.protection_alerts():
+        symbol, kind = alert["symbol"], alert["kind"]
+        position = by_symbol.get(symbol)
+        if not position or not (_as_float(position.get("size")) or 0) > 0:
+            _clear_protection_alert(symbol, kind)
+            continue
+        accepted_types = {"take_profit"} if kind == "TP" else {"stp", "stop"}
+        coverage = sum(
+            _as_float(order.get("unfilledSize") if order.get("unfilledSize") is not None else order.get("size")) or 0
+            for order in orders
+            if str(order.get("symbol") or "") == symbol
+            and str(order.get("orderType") or "").lower() in accepted_types
+            and str(order.get("reduceOnly")).lower() == "true"
+        )
+        if coverage >= (_as_float(position.get("size")) or 0):
+            _clear_protection_alert(symbol, kind)
 
 
 def _managed_protection_loop() -> None:
@@ -367,12 +488,14 @@ def _managed_protection_loop() -> None:
         time.sleep(2.5)
         with arm_lock:
             is_armed = armed
-        if not is_armed:
-            _protection_sync_due.clear()
-            continue
         try:
+            positions, orders = get_positions(), get_orders()
+            _reconcile_protection_alerts(positions, orders)
+            if not is_armed:
+                _protection_sync_due.clear()
+                continue
             candidates = trading_actions.managed_protection_sync_actions(
-                get_positions(), get_orders(), _legacy_managed_protection_ids,
+                positions, orders, _legacy_managed_protection_ids,
             )
             now = time.monotonic()
             active_keys = {
@@ -393,7 +516,7 @@ def _managed_protection_loop() -> None:
                 with arm_lock:
                     if not armed:
                         break
-                results = trading_actions.execute_actions([action], action_ctx, True)
+                    results = trading_actions.execute_actions([action], action_ctx, True)
                 db.log_action("protection_sync", True, [action], results)
                 result = results[0] if results else {"ok": False, "error": "no result"}
                 payload = {
@@ -488,8 +611,8 @@ def validate_order_params(body: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     order_type = str(body.get("orderType") or "").strip().lower()
     size = _as_float(body.get("size"))
 
-    if not symbol:
-        return None, "symbol is required"
+    if not symbol.startswith("PF_"):
+        return None, "PF_ symbol is required"
     if side not in {"buy", "sell"}:
         return None, "side must be buy or sell"
     if order_type not in ALLOWED_ORDER_TYPES:
@@ -524,47 +647,38 @@ def validate_order_params(body: dict[str, Any]) -> tuple[dict[str, Any] | None, 
 
 def place_order(params: dict[str, Any]) -> dict[str, Any]:
     with arm_lock:
-        is_armed = armed
-    if not is_armed:
-        return {
-            "simulated": True,
-            "message": "Terminal is DISARMED — order was not sent. Arm the terminal to trade live.",
-            "params": params,
-            "order": params,
-        }
-    response = client.post("/sendorder", params=params, private=True)
-    cache.drop("positions", "orders", "account", "fills")
-    sys.stderr.write("[order] " + json.dumps({"params": params, "sendStatus": response.get("sendStatus") or response}, default=str)[:400] + "\n")
-    if isinstance(response, dict):
-        send = response.get("sendStatus") or {}
-        status = str(send.get("status") or "")
-        events = send.get("orderEvents") or []
-        reject_reason = next((str(e.get("reason")) for e in events if str(e.get("type")) == "REJECT" and e.get("reason")), None)
-        if str(response.get("result")) != "success" or (status and status != "placed") or reject_reason:
+        if not armed:
             return {
-                "error": f"Kraken rejected the order: {reject_reason or status or response.get('result')}",
-                "response": response,
-                "params": params,
-                "order": params,
+                "outcome": "simulated", "simulated": True,
+                "message": "Terminal is DISARMED — order was not sent. Arm the terminal to trade live.",
+                "params": params, "order": params,
             }
-    return {"simulated": False, "response": response, "params": params, "order": params}
+        if not params.get("reduceOnly"):
+            action_ctx.require_new_exposure(params["symbol"])
+        submitted = trading_actions.submit_one(action_ctx, params, f"kt-ticket-{params['symbol']}")
+    cache.drop("positions", "orders", "account", "fills")
+    result = {"simulated": False, "order": submitted["params"], **submitted}
+    if submitted["outcome"] != "confirmed":
+        result["error"] = submitted.get("error") or f"order outcome {submitted['outcome']}"
+    return result
 
 
 def cancel_order(body: dict[str, Any]) -> dict[str, Any]:
     cli_ord_id = body.get("cliOrdId")
     order_id = body.get("orderId") or body.get("order_id")
     with arm_lock:
-        is_armed = armed
-    if not is_armed:
-        return {"simulated": True, "message": "DISARMED — cancel not sent.", "target": cli_ord_id or order_id}
-    if cli_ord_id:
-        response = client.post("/cancelorder", params={"cliOrdId": str(cli_ord_id)}, private=True)
-    elif order_id:
-        response = client.post("/cancelorder", params={"order_id": str(order_id)}, private=True)
-    else:
-        return {"error": "cliOrdId or orderId required"}
+        if not armed:
+            return {"outcome": "simulated", "simulated": True, "message": "DISARMED — cancel not sent.", "target": cli_ord_id or order_id}
+        if cli_ord_id:
+            target = {"cliOrdId": str(cli_ord_id)}
+        elif order_id:
+            target = {"order_id": str(order_id)}
+        else:
+            return {"outcome": "rejected", "error": "cliOrdId or orderId required"}
+        result = trading_actions.cancel_one(action_ctx, target)
     cache.drop("positions", "orders", "account")
-    return {"simulated": False, "response": response}
+    return {"simulated": False, **result, **({"error": result.get("error") or f"cancel outcome {result['outcome']}"}
+                                                    if result["outcome"] != "confirmed" else {})}
 
 
 # ---- HTTP handler ----------------------------------------------------------
@@ -579,6 +693,10 @@ class TerminalHandler(BaseHTTPRequestHandler):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
     def _send_json(self, obj: Any, status: int = 200) -> None:
+        request_id = getattr(self, "_write_request_id", None)
+        if request_id:
+            db.complete_write_request(request_id, status, obj)
+            self._write_request_id = None
         body = json.dumps(obj, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -587,25 +705,27 @@ class TerminalHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(min(length, 1_000_000))
+    def _read_body(self) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > 1_000_000:
+            return None
+        raw = self.rfile.read(length)
         try:
             data = json.loads(raw.decode("utf-8"))
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
+            return data if isinstance(data, dict) else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
 
     def _serve_static(self, path: str) -> None:
         if path == "/":
             path = "/index.html"
         elif path == "/volatility":
             path = "/volatility.html"
-        rel = path.lstrip("/")
-        target = (STATIC_DIR / rel).resolve()
-        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
+        target = safe_static_path(STATIC_DIR, path)
+        if target is None:
             self._send_json({"error": "not found"}, 404)
             return
         content_types = {
@@ -617,6 +737,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
             ".json": "application/json",
         }
         body = target.read_bytes()
+        if target.suffix == ".html":
+            body = body.replace(b"__TERMINAL_TOKEN__", security.token.encode("ascii"))
         self.send_response(200)
         self.send_header("Content-Type", content_types.get(target.suffix, "application/octet-stream"))
         self.send_header("Content-Length", str(len(body)))
@@ -636,7 +758,17 @@ class TerminalHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            if path == "/api/health":
+            if path == "/api/session":
+                if not security.valid_host(self.headers):
+                    self._send_json({"error": "invalid Host"}, 403)
+                    return
+                self._send_json({"token": security.token})
+            elif path == "/api/arm/challenge":
+                if not security.valid_token(self.headers):
+                    self._send_json({"error": "invalid terminal token"}, 403)
+                    return
+                self._send_json({"challenge": security.issue_arm_challenge()})
+            elif path == "/api/health":
                 with arm_lock:
                     is_armed = armed
                 self._send_json({
@@ -673,11 +805,11 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 limit = int(query.get("limit", "50"))
                 self._send_json({"trades": hub.recent_trades(symbol, limit)})
             elif path == "/api/account":
-                self._send_json(get_account())
+                self._send_json(_account_payload(get_account()))
             elif path == "/api/positions":
-                self._send_json({"positions": get_positions()})
+                self._send_json(_rows_payload("positions", get_positions()))
             elif path == "/api/orders":
-                self._send_json({"orders": get_orders()})
+                self._send_json(_rows_payload("orders", get_orders()))
             elif path == "/api/equity":
                 self._send_json({"rows": db.get_equity()})
             elif path == "/api/stats":
@@ -724,7 +856,9 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._send_json({"session": {"id": session["id"], "title": session["title"], "summary": bool(session["summary"])}, "messages": msgs})
             elif path == "/api/chase":
                 self._send_json({"chases": chase_manager.list()})
-            elif path == "/api/debug/threads":
+            elif path == "/api/protection/alerts":
+                self._send_json({"alerts": db.protection_alerts()})
+            elif path == "/api/debug/threads" and DEBUG_ENDPOINTS:
                 import sys as _sys
                 import threading as _threading
                 import traceback as _tb
@@ -782,34 +916,69 @@ class TerminalHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        self._write_request_id = None
+        denied = security.validate_write(self.headers)
+        if denied:
+            status, message = denied
+            self.close_connection = True
+            self._send_json({"error": message}, status)
+            return
         body = self._read_body()
+        if body is None:
+            self.close_connection = True
+            self._send_json({"error": "request body must be a JSON object"}, 400)
+            return
+        if path in IDEMPOTENT_WRITE_PATHS:
+            request_id = str(body.get("requestId") or "")
+            if not REQUEST_ID_RE.fullmatch(request_id):
+                self._send_json({"error": "valid requestId required"}, 400)
+                return
+            payload = {key: value for key, value in body.items() if key != "requestId"}
+            claim = db.claim_write_request(request_id, path, payload)
+            if claim["state"] == "conflict":
+                self._send_json({"error": "requestId was already used for different input"}, 409)
+                return
+            if claim["state"] == "pending":
+                self._send_json({
+                    "outcome": "unknown",
+                    "error": "request is already in progress or ended before its result was stored; not resubmitted",
+                }, 409)
+                return
+            if claim["state"] == "replay":
+                self._send_json(claim["result"], claim["status"])
+                return
+            self._write_request_id = request_id
         try:
             if path == "/api/arm":
                 want = bool(body.get("armed"))
-                confirm = str(body.get("confirm", "")).lower() == "yes"
+                challenge = str(body.get("challenge") or "")
                 with arm_lock:
                     global armed
-                    if want and not confirm:
+                    if want and not security.consume_arm_challenge(challenge):
                         self._send_json({
-                            "armed": False,
+                            "armed": armed,
                             "needsConfirm": True,
-                            "message": "Live order entry. Type ARM in the confirm box to enable real orders on this account.",
-                        })
+                            "message": "A fresh one-time arming challenge is required.",
+                        }, 403)
                         return
                     armed = want
                     state = armed
+                aborting = chase_manager.abort_all() if not state else {"requested": [], "completed": [], "pending": []}
                 sse.publish("armed", {"armed": state})
-                db.log_event("arm", {"armed": state, "env": "demo" if client.is_demo else "live"})
-                self._send_json({"armed": state, "env": "demo" if client.is_demo else "live"})
+                db.log_event("arm", {"armed": state, "env": "demo" if client.is_demo else "live", "abortingChases": aborting})
+                self._send_json({"armed": state, "env": "demo" if client.is_demo else "live", "abortingChases": aborting})
             elif path == "/api/order":
                 params, error = validate_order_params(body)
                 if error:
                     self._send_json({"error": error}, 400)
                     return
                 result = place_order(params)
+                db.log_action("api_order", result.get("outcome") != "simulated", [{"type": "order", **params}], [result])
                 self._send_json(result)
             elif path == "/api/cancel":
-                self._send_json(cancel_order(body))
+                result = cancel_order(body)
+                db.log_action("api_cancel", result.get("outcome") != "simulated", [{"type": "cancel", **body}], [result])
+                self._send_json(result)
             elif path == "/api/action":
                 raw = body.get("actions")
                 try:
@@ -830,33 +999,40 @@ class TerminalHandler(BaseHTTPRequestHandler):
                         return
                 with arm_lock:
                     is_armed = armed
-                results = trading_actions.execute_actions(normalized, action_ctx, is_armed)
+                    results = trading_actions.execute_actions(normalized, action_ctx, is_armed)
                 cache.drop("positions", "orders", "account")
                 db.log_action("api", is_armed, normalized, results)
                 self._send_json({"actions": normalized, "results": results, "armed": is_armed})
             elif path == "/api/chat":
                 self._handle_chat(body)
             elif path == "/api/chase":
-                with arm_lock:
-                    is_armed = armed
-                if not is_armed:
-                    self._send_json({"error": "chase requires an ARMED terminal (it places real orders)"}, 400)
-                    return
                 symbol = str(body.get("symbol", "")).strip().upper()
                 side = str(body.get("side", "")).strip().lower()
                 size = _as_float(body.get("size"))
-                if not symbol or side not in {"buy", "sell"} or not size or size <= 0:
-                    self._send_json({"error": "symbol, side (buy|sell) and positive size required"}, 400)
+                if not symbol.startswith("PF_") or side not in {"buy", "sell"} or not size or size <= 0:
+                    self._send_json({"error": "PF_ symbol, side (buy|sell), and positive size required"}, 400)
                     return
-                spec = {
-                    "symbol": symbol, "side": side, "size": size,
-                    "timeoutSec": float(body.get("timeoutSec") or 300),
-                    "maxRepegs": int(body.get("maxRepegs") or 120),
-                    "repegSec": float(body.get("repegSec") or 5),
-                    "offsetTicks": int(body.get("offsetTicks") or 0),
-                }
+                try:
+                    spec = {
+                        "symbol": symbol, "side": side, "size": size,
+                        "timeoutSec": float(body.get("timeoutSec") or 300),
+                        "maxRepegs": int(body.get("maxRepegs") or 120),
+                        "repegSec": max(1.0, float(body.get("repegSec") or 5)),
+                        "offsetTicks": max(0, int(body.get("offsetTicks") or 0)),
+                    }
+                except (TypeError, ValueError):
+                    self._send_json({"error": "invalid Chase timing parameters"}, 400)
+                    return
+                if spec["timeoutSec"] <= 0 or spec["maxRepegs"] <= 0:
+                    self._send_json({"error": "Chase timeoutSec and maxRepegs must be positive"}, 400)
+                    return
                 hub.watch([symbol])
-                self._send_json({"chase": chase_manager.start(spec, action_ctx)})
+                try:
+                    snapshot = _start_chase_if_armed(spec)
+                except trading_actions.ActionError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                self._send_json({"chase": snapshot})
             elif path == "/api/chase/abort":
                 self._send_json(chase_manager.abort(str(body.get("chaseId", ""))))
             elif path == "/api/chat/note":
@@ -905,10 +1081,13 @@ class TerminalHandler(BaseHTTPRequestHandler):
         extra_syms = [s for s in _mentioned_symbols(message) if s != symbol]
         if extra_syms:
             hub.watch(extra_syms[:6])
-        account = get_account()
-        positions = [p for p in get_positions() if "error" not in p]
-        orders = [o for o in get_orders() if "error" not in o]
-        ticker = hub.ticker(symbol) or get_ticker_rest(symbol)
+        account_state = _account_payload(get_account())
+        positions_state = _rows_payload("positions", get_positions())
+        orders_state = _rows_payload("orders", get_orders())
+        account = {key: value for key, value in account_state.items() if key not in {"state", "error", "ageSeconds"}}
+        positions = positions_state["positions"]
+        orders = orders_state["orders"]
+        ticker = _ticker_payload(symbol)
         candles = hub.candles_1m(symbol)
         if not candles:
             candles = get_candles(symbol, "1m").get("candles", [])
@@ -926,6 +1105,16 @@ class TerminalHandler(BaseHTTPRequestHandler):
             candles=candles,
             signal=signal,
         )
+        unavailable = [
+            f"{name} unavailable; showing last-known data"
+            + (f" from {state['ageSeconds']}s ago" if state.get("ageSeconds") is not None else " only if present")
+            + f"; error: {state.get('error')}"
+            for name, state in (("account", account_state), ("positions", positions_state), ("orders", orders_state), ("market", ticker))
+            if state.get("state") == "unavailable"
+        ]
+        if unavailable:
+            snapshot += "\nDATA AVAILABILITY (AUTHORITATIVE): " + " | ".join(unavailable)
+            snapshot += "\nDo not interpret unavailable data as an empty account, position list, or order list."
         with arm_lock:
             snapshot = f"TERMINAL: {'ARMED — write tools are LIVE' if armed else 'DISARMED — write tools simulate only'}\n" + snapshot
         try:
@@ -938,7 +1127,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
 
         extra_lines = []
         for sym in extra_syms[:6]:
-            t = hub.ticker(sym) or get_ticker_rest(sym)
+            t = _ticker_payload(sym)
             if t:
                 extra_lines.append("MENTIONED " + sym + ": " + json.dumps(
                     {k: t.get(k) for k in ("last", "markPrice", "bid", "ask", "change24h", "fundingRate") if t.get(k) is not None}
@@ -946,7 +1135,17 @@ class TerminalHandler(BaseHTTPRequestHandler):
         if extra_lines:
             snapshot += "\n" + "\n".join(extra_lines)
 
-        history = [{"role": m["role"], "content": m["content"]} for m in db.get_messages(session["id"], limit=400)]
+        limit = int(os.getenv("CHAT_CONTEXT_LIMIT", "200000"))
+        history, session_memory, session_summary, estimated_tokens, compacted = chat_compaction.prepare_chat_context(
+            db, session["id"], snapshot, limit,
+        )
+        if compacted:
+            db.log_event("compaction", {
+                "summarized": compacted,
+                "estimatedPromptTokens": estimated_tokens,
+                "phase": "pre_request",
+            })
+            sys.stderr.write(f"[compaction] summarized {compacted} messages before request\n")
         if history and history[-1]["role"] == "user":
             history[-1]["content"] = message  # guard against content truncation edge cases
 
@@ -962,8 +1161,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
 
         result = ai_chat.respond(
             history, snapshot,
-            session_memory=db.get_session_memory(session["id"]),
-            session_summary=db.get_session_summary(session["id"]),
+            session_memory=session_memory,
+            session_summary=session_summary,
             tool_executor=chat_tool_exec,
             tool_audit=audit_tool,
         )
@@ -972,23 +1171,13 @@ class TerminalHandler(BaseHTTPRequestHandler):
             meta={"actionProposals": result.get("actionProposals", []), "orderProposals": result.get("orderProposals", [])},
         )
 
-        # token tracking + threshold compaction (living memory file is never touched)
-        try:
-            usage = result.get("usage") or {}
-            used = int(usage.get("total_tokens") or 0)
-            if used:
-                db.set_context_tokens(session["id"], used)
-            limit = int(os.getenv("CHAT_CONTEXT_LIMIT", "200000"))
-            if used and used > limit:
-                to_compact = db.compact(session["id"], keep_last=20)
-                if to_compact:
-                    summary = ai_chat.summarize_for_compaction(to_compact, db.get_session_summary(session["id"]))
-                    db.set_session_summary(session["id"], summary)
-                    db.set_context_tokens(session["id"], int(used * 0.55))  # rough post-compaction estimate
-                    db.log_event("compaction", {"summarized": len(to_compact), "tokens_before": used})
-                    sys.stderr.write(f"[compaction] {len(to_compact)} messages summarized at {used} tokens\n")
-        except Exception as exc:
-            sys.stderr.write(f"[compaction] skipped: {exc}\n")
+        # Latest prompt size is distinct from cumulative tokens billed across tool rounds.
+        usage = result.get("usage") or {}
+        db.record_model_usage(
+            session["id"],
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("total_tokens") or 0),
+        )
 
         # the AI maintains its own living memory file via update_memory
         if result.get("memory"):
@@ -1098,19 +1287,21 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if not sym:
             return {"error": "symbol required"}
         hub.watch([sym])
-        t = hub.ticker(sym) or get_ticker_rest(sym)
-        if not t:
-            return {"error": f"no market data for {sym} (unknown symbol?)"}
+        t = _ticker_payload(sym)
         out = {
             "symbol": sym,
+            "state": t.get("state"),
+            "ageSeconds": t.get("ageSeconds"),
             "ticker": {k: t.get(k) for k in ("last", "markPrice", "bid", "ask", "open24h", "high24h", "low24h", "change24h", "fundingRate", "openInterest") if t.get(k) is not None},
+            **({"error": t["error"]} if t.get("error") else {}),
         }
         try:
             ob = client.get("/orderbook", params={"symbol": sym})
             obb = ob.get("orderBook") or {}
             out["bookTop"] = {"bids": obb.get("bids", [])[:5], "asks": obb.get("asks", [])[:5]}
-        except Exception:
-            pass
+        except Exception as exc:
+            out["bookState"] = "unavailable"
+            out["bookError"] = str(exc)
         candles = hub.candles_1m(sym, limit=60)
         if candles:
             out["recent1m"] = {
@@ -1120,12 +1311,11 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         return out
     if name == "get_positions":
-        return {"positions": [p for p in get_positions() if isinstance(p, dict) and "error" not in p]}
+        return _rows_payload("positions", get_positions())
     if name == "get_account":
-        acct = get_account()
-        return acct if acct else {"error": "account unavailable (keys not configured?)"}
+        return _account_payload(get_account())
     if name == "get_orders":
-        return {"orders": [o for o in get_orders() if isinstance(o, dict) and "error" not in o]}
+        return _rows_payload("orders", get_orders())
     if name == "get_fills":
         sym = _normalize_symbol(str(args.get("symbol") or ""))
         fills = get_fills()
@@ -1185,7 +1375,7 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
         a["type"] = kind
         with arm_lock:
             armed_now = armed
-        results = trading_actions.execute_actions([a], action_ctx, armed_now)
+            results = trading_actions.execute_actions([a], action_ctx, armed_now)
         cache.drop("positions", "orders", "account")
         db.log_action("chat", armed_now, [a], results)
         r = results[0] if results else {"error": "no result"}

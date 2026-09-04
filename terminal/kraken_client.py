@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +120,7 @@ class KrakenFuturesClient:
     base_url: str = DEFAULT_LIVE_BASE_URL
     timeout: float = 10.0
     _last_nonce: int = field(default=0, init=False, repr=False)
+    _nonce_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @classmethod
     def from_env(
@@ -244,8 +246,9 @@ class KrakenFuturesClient:
                 "missing KRAKEN_FUTURES_API_KEY or KRAKEN_FUTURES_API_SECRET"
             )
 
-        nonce_value = max(int(time.time() * 1000), self._last_nonce + 1)
-        self._last_nonce = nonce_value
+        with self._nonce_lock:
+            nonce_value = max(int(time.time() * 1000), self._last_nonce + 1)
+            self._last_nonce = nonce_value
         nonce = str(nonce_value)
         authent = sign_authent(self.api_secret, query, nonce, endpoint_path)
         return {

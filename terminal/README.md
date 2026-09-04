@@ -25,20 +25,23 @@ npm run build        # production bundle -> ../terminal/static
 
 The original vanilla JS app is kept in `terminal/legacy/` for reference. `/volatility` remains a standalone page (`frontend/public/volatility.html`). Chart rendering is imperative lightweight-charts (v5) wrapped in one React component; state lives in a zustand store (`src/store.js`); SSE streams into the store.
 
-Kraken credentials load from `terminal/.env` or process environment variables. A local compatibility fallback checks the author's adjacent `kraken-futures-cli/.env` checkout when present. Copy `.env.example` to `.env`; never commit the populated file. Supported variables are `PORT`, `KRAKEN_FUTURES_API_KEY`, `KRAKEN_FUTURES_API_SECRET`, `KRAKEN_FUTURES_ENV=demo`, `AI_CHAT_MODEL` (default `google/gemini-3.8-flash` via OpenRouter), and `CHAT_CONTEXT_LIMIT` (default 200000 tokens).
+Kraken credentials load from `terminal/.env` or process environment variables. A local compatibility fallback checks the author's adjacent `kraken-futures-cli/.env` checkout when present. Copy `.env.example` to `.env`; never commit the populated file. Supported variables include `PORT`, the Kraken credentials and environment, `AI_CHAT_MODEL` (default `google/gemini-3.8-flash`), `CHAT_CONTEXT_LIMIT`, `VITE_DEV_ORIGINS`, and `TERMINAL_DEBUG`.
 
 ## Safety model
 
 - The terminal starts **DISARMED** on every server start. Disarmed, orders/cancels/chases return the exact dry-run plan without touching Kraken.
-- Arming requires clicking the sidebar button and typing `ARM`. Armed state is in-memory only.
+- Arming requires clicking the sidebar button and typing `ARM`. The server then consumes a one-time challenge signed with its per-process token. Armed state is in-memory only.
+- Every POST requires JSON, an exact local Host and Origin, and the per-process token injected into the served app. Restarting the server invalidates open tabs, so reload before the next write. `/api/debug/threads` exists only with `TERMINAL_DEBUG=true`.
 - The AI assistant reads everything itself (market data, positions, account, fills, contract specs, performance) and can also place orders directly through the same tools the Execute button uses - **all write tools are ARM-gated**: disarmed they return the exact plan simulated, armed they hit the live account. `propose_actions` cards (human clicks Execute) remain available for draft/plan requests; the chase engine stays propose-only.
-- Order responses are logged in `actions_log`; bounded AI tool calls/results are logged as `ai_tool` events. Rejections surface with Kraken's actual reason.
+- Every intentional HTTP write carries a persisted request ID. Replays return the stored result instead of submitting again; pending or interrupted requests return `unknown`. Every submitted order also receives a fresh exchange client ID.
+- Account, position, order, and market failures remain `unavailable`, with last-known data and age shown in the UI and passed to the AI. New exposure requires a current account response and market data no more than five seconds old.
+- Ticket, chart, action-card, AI, protection, and Chase writes share the same nested-status parser and report `simulated`, `confirmed`, `partial`, `rejected`, or `unknown` in `actions_log`.
 
 ## Layout
 
 - **Sidebar** — env/armed/feed badges, instrument search, live watchlist, balance + available margin (with **Pro-Mode** toggle: display-only +$5,600 sticker — never feeds sizing), arm toggle.
 - **Header** — last price, 24h stats, mark/index, funding, open interest, **Stats** (performance modal), **Volatility Pairs** button, fill-sound bell, and a pulsing **risk chip** (worst position's distance to liquidation) whenever any position is under 12% from LIQ.
-- **Chart** — lightweight-charts candles (1m–1w), formatted per instrument tick size. Candles: **Binance USDT-M klines** (`PF_X` → `XUSDT`, XBT→BTC) for history via REST and the live edge via `/market/ws` websocket; falls back to Kraken data when Binance lacks a symbol. Trading stays 100% Kraken. Overlays: position entry, liquidation estimate, TP/SL triggers, and open limit orders; each open order has a chart-side × control with confirmation before cancellation. Drag the TP/SL handle beside a position: the profit side previews a take profit, the loss side previews a stop loss, both tick-snapped with live estimated PnL; live drops require confirmation. Drag-created full-position protection is marked as managed and, while ARMED, auto-resizes after a confirmed position-size change; partial TP/SL ladders are never rewritten. The RISK toggle shows all three mirrored loss levels for the current TP at once. For a $100 profit target, the 1:1, 1:2, and 1:3 lines show $100, $200, and $300 of loss. The red lines remain visible while the toggle is on, follow TP drags, and never create or move an SL. Live trades merge into the current candle; quiet minutes carry forward flat (same as Kraken's own charts). EMA 400/800 trend badge.
+- **Chart** — lightweight-charts candles (1m–1w), formatted per instrument tick size. Candles: **Binance USDT-M klines** (`PF_X` → `XUSDT`, XBT→BTC) for history via REST and the live edge via `/market/ws` websocket; falls back to Kraken data when Binance lacks a symbol. Trading stays 100% Kraken. Overlays: position entry, liquidation estimate, TP/SL triggers, and open limit orders; each open order has a chart-side × control with confirmation before cancellation. Drag the TP/SL handle beside a position: the profit side previews a take profit, the loss side previews a stop loss, both tick-snapped with live estimated PnL; live drops require confirmation. Drag-created full-position protection is marked as managed and, while ARMED, auto-resizes by exact-ID `editorder` after a confirmed position-size change; a dragged TP line carries its exact exchange ID, partial ladders are never collapsed, and failed fallback rollback raises a persistent audible `UNPROTECTED` alert. The RISK toggle shows all three mirrored loss levels for the current TP at once. For a $100 profit target, the 1:1, 1:2, and 1:3 lines show $100, $200, and $300 of loss. The red lines remain visible while the toggle is on, follow TP drags, and never create or move an SL. FIT RISK includes those levels in autoscale on demand. Live trades merge into the current candle; quiet minutes carry forward flat (same as Kraken's own charts). EMA 400/800 trend badge.
 - **Order book** — top levels with depth bars, ~2.5s refresh.
 - **Order ticket** — market / limit / post-only / stop / take-profit / **chase**; % of available margin quick-sizing with a **leverage selector** (1x–10x, persisted); reduce-only. Sizes and prices are rounded server-side to the instrument's contract precision / tick.
 - **Bottom tabs** — Positions (live mark + uPnL per tick, per-row close), Orders (per-row cancel, filtered cancel-all), Fills (newest first), **Scanner**.
@@ -59,16 +62,18 @@ Backed by OpenRouter (key from `~/.pi/agent/auth.json`) with **native tool calli
 
 ## Chase engine (`chase.py`)
 
-Post-only limit orders that rest at best bid (buy) / best ask (sell) and re-peg as the market moves until filled, timeout, or max re-pegs. Partial fills are preserved across re-pegs; post-only rejections (would-cross) step a tick more passive. One thread per chase, status broadcast over SSE, fills ping the bell. Requires an armed terminal. Also available from the CLI: `python -m kraken_futures_cli chase SYMBOL buy|sell SIZE [--chase-timeout --repeg --max-repegs --offset --no-wait --json --terminal]`.
+Live Chase uses unique client IDs, strict nested Kraken statuses, exact order-status and fill reconciliation, confirmed cancellation before replacement, disarm aborts, and startup orphan alerts. It places post-only limits at best bid (buy) / best ask (sell) and re-pegs until filled, timeout, or max re-pegs. Also available from the CLI: `python -m kraken_futures_cli chase SYMBOL buy|sell SIZE [--chase-timeout --repeg --max-repegs --offset --no-wait --json --terminal]`.
 
 ## Persistence (`db.py`, SQLite WAL — `terminal.db`)
 
-- `sessions` — one auto-continuing Trading session + `context_tokens` (exact usage from OpenRouter) + the AI's **living memory file**
+- `sessions` — one auto-continuing Trading session, latest prompt tokens, cumulative billed tokens, and the AI's **living memory file**
 - `messages` — full chat history with proposal payloads; survives refreshes and server restarts
 - `actions_log` — every executed action batch with results
-- `events` — arm toggles, executions, managed-protection resizes, chase lifecycles, bounded AI tool calls/results, compactions, rejections
-- **Compaction** — token-tracked from OpenRouter's exact usage; at `CHAT_CONTEXT_LIMIT` the oldest turns beyond the last 20 are summarized as non-authoritative context and dropped from model context. Proposal cards and execution traces are excluded; the living memory file is never compacted.
-- **Contract types matter:** `futures_inverse` (PI_*): 1 contract = contractSize USD notional, whole contracts. `flexible_futures` (PF_*): 1 contract = 1 unit of underlying, notional = size × price. Sizing is handled server-side for ladders/chases/closes and sizes are rounded to the instrument's precision everywhere.
+- `write_requests` — request identity, canonical input, pending/completed state, HTTP status, and replayable result
+- `events` — arm toggles, executions, managed-protection edits, chase lifecycles, bounded AI tool calls/results, compactions, rejections
+- `protection_alerts` — active `UNPROTECTED` states retained until live order coverage is restored
+- **Compaction** — before each model request, a conservative estimate checks the pending prompt against `CHAT_CONTEXT_LIMIT`. Older turns beyond the last 20 are selected without mutation, summarized, then hidden in the same SQLite transaction that stores the summary. A failed summary leaves them visible. Proposal cards and execution traces are excluded; the living memory file is never compacted.
+- **Contract types matter:** the terminal submits only `PF_*` flexible futures, where 1 contract = 1 unit of underlying and notional = size × price. Sizes are rounded to each instrument's precision for tickets, ladders, Chase, protection, and closes.
 
 ## Liquidation price
 
@@ -133,4 +138,5 @@ frontend/           React (Vite) source, `npm run build` outputs to terminal/sta
 - The hub keeps ~25h of 1m candles built from the trade feed as a charts-API fallback.
 - Stop/take-profit triggers use `triggerSignal=mark` by default.
 - Pro-Mode is display-only by design — Kraken rejects orders sized beyond real margin.
-- `PI_*` (inverse) symbols may be trade-forbidden on some accounts (`CONTRACT_ACCESS_FORBIDDEN`); the terminal surfaces that error.
+- Trading endpoints reject `PI_*` inverse symbols; executable symbols must use the `PF_*` family.
+- The reconciled Chase engine is enabled, but a controlled Kraken demo lifecycle has not been run.

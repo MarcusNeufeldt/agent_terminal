@@ -15,6 +15,17 @@ export async function bootTerminal() {
   }
 
   try {
+    const data = await api("/api/chase");
+    for (const chase of data.chases || []) useStore.getState().onChaseEvent(chase);
+  } catch (e) {}
+
+  try {
+    const data = await api("/api/protection/alerts");
+    for (const alert of data.alerts || []) useStore.getState().onProtectionAlert(alert);
+    if (data.alerts?.length) s.toast(`${data.alerts.length} protection order${data.alerts.length === 1 ? "" : "s"} require reconciliation.`, "err", 15000);
+  } catch {}
+
+  try {
     const inst = await api("/api/instruments");
     useStore.setState({ instruments: (inst.instruments || []).filter(i => i.tradeable !== false) });
   } catch (e) {}
@@ -44,6 +55,10 @@ export async function bootTerminal() {
   useStore.getState().pollMarketList();
   setInterval(() => useStore.getState().pollMarketList(), 10000);
   setInterval(() => useStore.getState().refreshSignal(), 60000);
+  setInterval(() => {
+    const current = useStore.getState();
+    if (Object.keys(current.protectionAlerts).length && current.soundOn) current.playChime();
+  }, 30000);
 
   const es = new EventSource("/api/stream");
   es.addEventListener("ticker", e => { try { useStore.getState().onTicker(JSON.parse(e.data)); } catch (err) {} });
@@ -69,6 +84,17 @@ export async function bootTerminal() {
       useStore.getState().refreshTables();
     } catch (err) {}
   });
+  es.addEventListener("protection_alert", e => {
+    try {
+      const alert = JSON.parse(e.data);
+      useStore.getState().onProtectionAlert(alert);
+      if (alert.status === "UNPROTECTED") {
+        const current = useStore.getState();
+        current.toast(`UNPROTECTED: ${alert.symbol} ${alert.kind} could not be confirmed.`, "err", 15000);
+        if (current.soundOn) current.playChime();
+      }
+    } catch {}
+  });
 
   es.addEventListener("chase", e => {
     try {
@@ -77,7 +103,7 @@ export async function bootTerminal() {
       if (c.status && c.status !== "running") {
         useStore.getState().toast(
           `Chase ${c.id} ${c.status}: filled ${fmt(c.filled)}/${fmt(c.size)} ${c.symbol}`,
-          c.status === "filled" ? "ok" : "warn", 9000,
+          c.status === "filled" ? "ok" : ["unknown", "orphaned"].includes(c.status) ? "err" : "warn", 9000,
         );
         if (c.status === "filled" && useStore.getState().soundOn) useStore.getState().playChime();
       }
