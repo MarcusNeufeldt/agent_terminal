@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT NOT NULL DEFAULT 'Trading',
     symbol TEXT,
     summary TEXT NOT NULL DEFAULT '',
+    memory TEXT NOT NULL DEFAULT '',
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    billed_tokens INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -90,6 +94,14 @@ class Database:
             self._conn.execute("ALTER TABLE sessions ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # column already exists
+        try:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN billed_tokens INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         self._conn.commit()
 
     # ---- sessions ----
@@ -146,6 +158,33 @@ class Database:
             ).fetchone()
         return int(row["context_tokens"] if row else 0)
 
+    def record_model_usage(self, session_id: int, prompt_tokens: int, billed_tokens: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET prompt_tokens = ?, context_tokens = ?, "
+                "billed_tokens = billed_tokens + ? WHERE id = ?",
+                (max(0, prompt_tokens), max(0, prompt_tokens), max(0, billed_tokens), session_id),
+            )
+            self._conn.commit()
+
+    def add_billed_tokens(self, session_id: int, billed_tokens: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET billed_tokens = billed_tokens + ? WHERE id = ?",
+                (max(0, billed_tokens), session_id),
+            )
+            self._conn.commit()
+
+    def get_token_usage(self, session_id: int) -> dict[str, int]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT prompt_tokens, billed_tokens FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return {
+            "prompt_tokens": int(row["prompt_tokens"] if row else 0),
+            "billed_tokens": int(row["billed_tokens"] if row else 0),
+        }
+
     def get_session_summary(self, session_id: int) -> str:
         with self._lock:
             row = self._conn.execute(
@@ -181,7 +220,7 @@ class Database:
                 "UPDATE messages SET in_context = 0 WHERE session_id = ?", (session_id,)
             )
             self._conn.execute(
-                "UPDATE sessions SET summary = '', context_tokens = 0, updated_at = ? WHERE id = ?",
+                "UPDATE sessions SET summary = '', context_tokens = 0, prompt_tokens = 0, billed_tokens = 0, updated_at = ? WHERE id = ?",
                 (_now(), session_id),
             )
             self._conn.commit()
@@ -217,27 +256,56 @@ class Database:
             ).fetchone()
         return row["n"]
 
-    def compact(self, session_id: int, keep_last: int = 20) -> list[dict[str, Any]] | None:
-        """Mark all but the newest `keep_last` messages out of context.
-
-        Returns the messages selected for summarization (the caller generates
-        the summary and stores it via set_session_summary), or None if nothing
-        needs compacting.
-        """
+    def compaction_candidates(self, session_id: int, keep_last: int = 20) -> tuple[list[dict[str, Any]], str]:
+        """Select old messages without changing their context state."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM messages WHERE session_id = ? AND in_context = 1 ORDER BY id",
                 (session_id,),
             ).fetchall()
-            if len(rows) <= keep_last:
-                return None
-            to_compact = rows[:-keep_last]
-            ids = [r["id"] for r in to_compact]
-            self._conn.executemany(
-                "UPDATE messages SET in_context = 0 WHERE id = ?", [(i,) for i in ids]
-            )
-            self._conn.commit()
-        return [self._row_to_message(r) for r in to_compact]
+            session = self._conn.execute(
+                "SELECT summary FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        candidates = rows[:-max(1, keep_last)] if len(rows) > max(1, keep_last) else []
+        return [self._row_to_message(row) for row in candidates], (session["summary"] if session else "") or ""
+
+    def commit_compaction(
+        self,
+        session_id: int,
+        message_ids: list[int],
+        expected_summary: str,
+        summary: str,
+    ) -> bool:
+        """Atomically store a summary and hide exactly the selected messages."""
+        if not message_ids:
+            return False
+        placeholders = ",".join("?" for _ in message_ids)
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                session = self._conn.execute(
+                    "SELECT summary FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                count = self._conn.execute(
+                    f"SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND in_context = 1 AND id IN ({placeholders})",
+                    (session_id, *message_ids),
+                ).fetchone()["n"]
+                if not session or (session["summary"] or "") != expected_summary or count != len(message_ids):
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    f"UPDATE messages SET in_context = 0 WHERE session_id = ? AND id IN ({placeholders})",
+                    (session_id, *message_ids),
+                )
+                self._conn.execute(
+                    "UPDATE sessions SET summary = ?, updated_at = ? WHERE id = ?",
+                    (summary, _now(), session_id),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:

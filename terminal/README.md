@@ -64,12 +64,12 @@ Live Chase uses unique client IDs, strict nested Kraken statuses, exact order-st
 
 ## Persistence (`db.py`, SQLite WAL — `terminal.db`)
 
-- `sessions` — one auto-continuing Trading session + `context_tokens` (exact usage from OpenRouter) + the AI's **living memory file**
+- `sessions` — one auto-continuing Trading session, latest prompt tokens, cumulative billed tokens, and the AI's **living memory file**
 - `messages` — full chat history with proposal payloads; survives refreshes and server restarts
 - `actions_log` — every executed action batch with results
 - `events` — arm toggles, executions, managed-protection edits, chase lifecycles, bounded AI tool calls/results, compactions, rejections
 - `protection_alerts` — active `UNPROTECTED` states retained until live order coverage is restored
-- **Compaction** — token-tracked from OpenRouter's exact usage; at `CHAT_CONTEXT_LIMIT` the oldest turns beyond the last 20 are summarized as non-authoritative context and dropped from model context. Proposal cards and execution traces are excluded; the living memory file is never compacted.
+- **Compaction** — before each model request, a conservative estimate checks the pending prompt against `CHAT_CONTEXT_LIMIT`. Older turns beyond the last 20 are selected without mutation, summarized, then hidden in the same SQLite transaction that stores the summary. A failed summary leaves them visible. Proposal cards and execution traces are excluded; the living memory file is never compacted.
 - **Contract types matter:** the terminal submits only `PF_*` flexible futures, where 1 contract = 1 unit of underlying and notional = size × price. Sizes are rounded to each instrument's precision for tickets, ladders, Chase, protection, and closes.
 
 ## Liquidation price

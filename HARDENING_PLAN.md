@@ -232,13 +232,9 @@ Verification passed 63 backend tests, 6 frontend tests, lint, build, a real-brow
 
 ## Priority 5: safe AI context compaction
 
-Current compaction has two confirmed problems:
+**Status: DONE**
 
-- `db.compact()` marks messages out of context before the summary call succeeds.
-- Usage is summed across tool rounds and treated as the next request's context size.
-- Compaction runs after the model call, so it cannot prevent an over-context failure.
-
-Use this flow:
+Compaction now runs before the pending OpenRouter request:
 
 ```text
 select candidates without mutation
@@ -246,14 +242,16 @@ select candidates without mutation
 -> atomically store summary and mark candidates out of context
 ```
 
-Track the latest prompt/input token count separately from cumulative billed tokens. Check whether compaction is needed before the next model request.
+The estimator uses the actual pending system prompt, history, memory, live snapshot, and tool schemas. The database stores the latest prompt size separately from cumulative billed tokens.
 
 Acceptance criteria:
 
-- A failed summarization leaves every source message in context.
-- Summary update and message hiding commit atomically.
-- Tool-heavy rounds do not double-count context size.
-- Compaction occurs before a request that would exceed the configured threshold.
+- [x] A failed summarization leaves every source message in context.
+- [x] Summary update and message hiding commit atomically.
+- [x] Tool-heavy rounds keep the latest prompt count separate from cumulative billing.
+- [x] Compaction occurs before a request that would exceed the configured threshold.
+
+Verification passed 68 backend tests, including forced transaction rollback, failed summarization, pre-request ordering, and multi-round usage accounting. The migrated live database has both token columns. A DISARMED restart preserved exact live positions and orders.
 
 ## Risk controls after execution hardening
 

@@ -43,6 +43,7 @@ import db as db_mod  # noqa: E402
 import account_log  # noqa: E402
 import binance_candles  # noqa: E402
 import binance_ws as binance_ws_mod  # noqa: E402
+import chat_compaction  # noqa: E402
 from actions import ActionContext  # noqa: E402
 from local_security import LocalSecurity, safe_static_path  # noqa: E402
 
@@ -1050,7 +1051,17 @@ class TerminalHandler(BaseHTTPRequestHandler):
         if extra_lines:
             snapshot += "\n" + "\n".join(extra_lines)
 
-        history = [{"role": m["role"], "content": m["content"]} for m in db.get_messages(session["id"], limit=400)]
+        limit = int(os.getenv("CHAT_CONTEXT_LIMIT", "200000"))
+        history, session_memory, session_summary, estimated_tokens, compacted = chat_compaction.prepare_chat_context(
+            db, session["id"], snapshot, limit,
+        )
+        if compacted:
+            db.log_event("compaction", {
+                "summarized": compacted,
+                "estimatedPromptTokens": estimated_tokens,
+                "phase": "pre_request",
+            })
+            sys.stderr.write(f"[compaction] summarized {compacted} messages before request\n")
         if history and history[-1]["role"] == "user":
             history[-1]["content"] = message  # guard against content truncation edge cases
 
@@ -1066,8 +1077,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
 
         result = ai_chat.respond(
             history, snapshot,
-            session_memory=db.get_session_memory(session["id"]),
-            session_summary=db.get_session_summary(session["id"]),
+            session_memory=session_memory,
+            session_summary=session_summary,
             tool_executor=chat_tool_exec,
             tool_audit=audit_tool,
         )
@@ -1076,23 +1087,13 @@ class TerminalHandler(BaseHTTPRequestHandler):
             meta={"actionProposals": result.get("actionProposals", []), "orderProposals": result.get("orderProposals", [])},
         )
 
-        # token tracking + threshold compaction (living memory file is never touched)
-        try:
-            usage = result.get("usage") or {}
-            used = int(usage.get("total_tokens") or 0)
-            if used:
-                db.set_context_tokens(session["id"], used)
-            limit = int(os.getenv("CHAT_CONTEXT_LIMIT", "200000"))
-            if used and used > limit:
-                to_compact = db.compact(session["id"], keep_last=20)
-                if to_compact:
-                    summary = ai_chat.summarize_for_compaction(to_compact, db.get_session_summary(session["id"]))
-                    db.set_session_summary(session["id"], summary)
-                    db.set_context_tokens(session["id"], int(used * 0.55))  # rough post-compaction estimate
-                    db.log_event("compaction", {"summarized": len(to_compact), "tokens_before": used})
-                    sys.stderr.write(f"[compaction] {len(to_compact)} messages summarized at {used} tokens\n")
-        except Exception as exc:
-            sys.stderr.write(f"[compaction] skipped: {exc}\n")
+        # Latest prompt size is distinct from cumulative tokens billed across tool rounds.
+        usage = result.get("usage") or {}
+        db.record_model_usage(
+            session["id"],
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("total_tokens") or 0),
+        )
 
         # the AI maintains its own living memory file via update_memory
         if result.get("memory"):

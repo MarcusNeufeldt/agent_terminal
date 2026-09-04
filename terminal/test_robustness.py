@@ -1,5 +1,6 @@
 import base64
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import account_log
 import ai_chat
+import chat_compaction
 import market_hub
 import scanner
 from actions import (
@@ -841,6 +843,100 @@ class RobustnessTests(unittest.TestCase):
             {"role": "assistant", "content": "failed", "meta": {"trace": {"working": False}}},
         ]
         self.assertEqual(ai_chat._compaction_messages(messages), [messages[0]])
+
+    def test_failed_compaction_summary_keeps_source_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                for index in range(5):
+                    db.add_message(session_id, "user", f"message {index} " + "x" * 1000)
+                with self.assertRaisesRegex(ai_chat.ChatError, "summary failed"):
+                    chat_compaction.prepare_chat_context(
+                        db, session_id, "snapshot", 1, keep_last=2,
+                        summarizer=lambda *_args, **_kwargs: (_ for _ in ()).throw(ai_chat.ChatError("summary failed")),
+                    )
+                self.assertEqual(db.count_in_context(session_id), 5)
+                self.assertEqual(db.get_session_summary(session_id), "")
+            finally:
+                db._conn.close()
+
+    def test_compaction_commit_is_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                for index in range(5):
+                    db.add_message(session_id, "user", f"message {index}")
+                candidates, old_summary = db.compaction_candidates(session_id, keep_last=2)
+                self.assertEqual((len(candidates), db.count_in_context(session_id)), (3, 5))
+                db._conn.execute(
+                    "CREATE TRIGGER fail_compaction BEFORE UPDATE OF summary ON sessions "
+                    "BEGIN SELECT RAISE(ABORT, 'forced'); END"
+                )
+                db._conn.commit()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    db.commit_compaction(session_id, [row["id"] for row in candidates], old_summary, "summary")
+                self.assertEqual(db.count_in_context(session_id), 5)
+                self.assertEqual(db.get_session_summary(session_id), "")
+            finally:
+                db._conn.close()
+
+    def test_compaction_runs_before_pending_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                for index in range(5):
+                    db.add_message(session_id, "user", f"message {index} " + "x" * 9000)
+                history = [{"role": row["role"], "content": row["content"]} for row in db.get_messages(session_id, 400)]
+                before = ai_chat.estimate_prompt_tokens(history, "snapshot")
+                projected = ai_chat.estimate_prompt_tokens(history[-2:], "snapshot", session_summary="short summary")
+                events = []
+
+                def summarize(_messages, _summary, usage_sink):
+                    events.append("summarize")
+                    usage_sink({"total_tokens": 7})
+                    return "short summary"
+
+                prepared = chat_compaction.prepare_chat_context(
+                    db, session_id, "snapshot", (before + projected) // 2,
+                    keep_last=2, summarizer=summarize,
+                )
+                events.append("request")
+                self.assertEqual(events, ["summarize", "request"])
+                self.assertEqual((prepared[4], db.count_in_context(session_id)), (3, 2))
+                self.assertEqual(db.get_token_usage(session_id)["billed_tokens"], 7)
+            finally:
+                db._conn.close()
+
+    def test_tool_round_usage_keeps_latest_prompt_separate_from_billing(self):
+        responses = [
+            {"usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}, "choices": [{"message": {"content": "", "tool_calls": [{"id": "one", "function": {"name": "get_positions", "arguments": "{}"}}]}}]},
+            {"usage": {"prompt_tokens": 140, "completion_tokens": 20, "total_tokens": 160}, "choices": [{"message": {"content": "done"}}]},
+        ]
+        with patch("ai_chat._load_openrouter_key", return_value="key"), patch("ai_chat._openrouter_completion", side_effect=responses):
+            result = ai_chat.respond(
+                [{"role": "user", "content": "status"}], "snapshot",
+                tool_executor=lambda *_args: {"positions": []},
+            )
+        self.assertEqual(result["usage"], {
+            "prompt_tokens": 140,
+            "billed_prompt_tokens": 240,
+            "completion_tokens": 30,
+            "total_tokens": 270,
+        })
+
+    def test_model_usage_persists_latest_prompt_and_cumulative_billing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                session_id = db.ensure_session()["id"]
+                db.record_model_usage(session_id, 140, 270)
+                db.record_model_usage(session_id, 90, 120)
+                self.assertEqual(db.get_token_usage(session_id), {"prompt_tokens": 90, "billed_tokens": 390})
+            finally:
+                db._conn.close()
 
     def test_tool_audit_and_volatile_memory_rejection(self):
         calls = [{
