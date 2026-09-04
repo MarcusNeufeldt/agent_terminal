@@ -1,31 +1,31 @@
 # Kraken Futures Trading Terminal
 
-A web trading terminal for Kraken Futures (multi-collateral / flex accounts) with an embedded AI assistant that can draft, verify, and execute trades — built on the API client from `F:\explore\kraken-futures-cli`. Python stdlib backend (zero web-framework dependencies), vanilla JS frontend, no build step. Chat history, execution audit trail, and the bot's living memory persist in SQLite.
-
-![preview](preview.png)
+A web trading terminal for Kraken Futures multi-collateral accounts. The Python HTTP server, trading engine, SSE hub, and SQLite persistence live here. The React/Vite frontend lives in `../frontend` and builds into `static/`.
 
 ## Run
 
 ```bash
-cd F:\explore\trading_terminal_ui\terminal
+pip install -r requirements.txt
+cp terminal/.env.example terminal/.env
+cd terminal
 python run.py
 # open http://127.0.0.1:8787
 ```
 
 ## Frontend (React)
 
-The UI is a React (Vite) SPA in `frontend/`; the built bundle is served by the Python server from `static/`.
+The UI is a React/Vite SPA in `../frontend`; the Python server serves its production bundle from `static/`.
 
 ```bash
-cd F:\explore	rading_terminal_uirontend
-npm install          # once
-npm run dev          # dev server with /api proxied to :8787 (hot reload)
-npm run build        # production bundle -> ../terminal/static (served by run.py)
+cd frontend
+npm ci               # install locked dependencies
+npm run dev          # dev server with /api proxied to :8787
+npm run build        # production bundle -> ../terminal/static
 ```
 
 The original vanilla JS app is kept in `terminal/legacy/` for reference. `/volatility` remains a standalone page (`frontend/public/volatility.html`). Chart rendering is imperative lightweight-charts (v5) wrapped in one React component; state lives in a zustand store (`src/store.js`); SSE streams into the store.
 
-Credentials load from `F:\explore\kraken-futures-cli\.env` (or a local `.env`). Env vars: `PORT`, `KRAKEN_FUTURES_ENV=demo`, `AI_CHAT_MODEL` (default `google/gemini-3.8-flash` via OpenRouter), `CHAT_CONTEXT_LIMIT` (compaction threshold, default 200000 tokens).
+Kraken credentials load from `terminal/.env` or process environment variables. A local compatibility fallback checks the author's adjacent `kraken-futures-cli/.env` checkout when present. Copy `.env.example` to `.env`; never commit the populated file. Supported variables are `PORT`, `KRAKEN_FUTURES_API_KEY`, `KRAKEN_FUTURES_API_SECRET`, `KRAKEN_FUTURES_ENV=demo`, `AI_CHAT_MODEL` (default `google/gemini-3.8-flash` via OpenRouter), and `CHAT_CONTEXT_LIMIT` (default 200000 tokens).
 
 ## Safety model
 
