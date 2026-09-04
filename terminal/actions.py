@@ -18,11 +18,10 @@ Action schema (JSON):
 
 from __future__ import annotations
 
-import json
-import uuid
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Any, Callable
 
+from exchange_ops import ensure_client_id, parse_operation, unique_client_id
 from kraken_client import KrakenFuturesError
 
 ACTION_TYPES = {"order", "ladder", "close", "replace_tp", "replace_sl", "cancel_all", "cancel", "chase"}
@@ -35,18 +34,6 @@ MANAGED_SL_PREFIX = "kt-full-sl-"
 
 class ActionError(Exception):
     pass
-
-
-def _check_kraken(response: Any) -> Any:
-    """Kraken signals failures two ways: result != success, or result == success
-    with a rejecting sendStatus (e.g. status "postWouldExecute" on post-only)."""
-    if isinstance(response, dict):
-        send = response.get("sendStatus") or {}
-        status = str(send.get("status") or "")
-        if str(response.get("result")) != "success" or (status and status != "placed"):
-            detail = json.dumps(send or response.get("cancelStatus") or response)
-            raise ActionError(f"Kraken error: {detail[:300]}")
-    return response
 
 
 def _dec(value: Any) -> Decimal:
@@ -137,8 +124,8 @@ def _validate_order(a: dict[str, Any], ctx: ActionContext) -> dict[str, Any]:
     side = str(a.get("side") or "").strip().lower()
     order_type = str(a.get("orderType") or "").strip().lower()
     size = a.get("size")
-    if not symbol:
-        raise ActionError("symbol required")
+    if not symbol.startswith("PF_"):
+        raise ActionError("PF_ symbol required")
     if side not in {"buy", "sell"}:
         raise ActionError("side must be buy or sell")
     if order_type not in ORDER_TYPES:
@@ -179,8 +166,8 @@ def _validate_order(a: dict[str, Any], ctx: ActionContext) -> dict[str, Any]:
 def _ladder_plan(a: dict[str, Any], ctx: ActionContext) -> dict[str, Any]:
     symbol = str(a.get("symbol") or "").strip().upper()
     side = str(a.get("side") or "").strip().lower()
-    if not symbol:
-        raise ActionError("symbol required")
+    if not symbol.startswith("PF_"):
+        raise ActionError("PF_ symbol required")
     if side not in {"buy", "sell"}:
         raise ActionError("side must be buy or sell")
     notional = _dec(a.get("notional"))
@@ -257,8 +244,8 @@ def _checked_rows(rows: list[dict[str, Any]], label: str) -> list[dict[str, Any]
 
 def _close_plan(a: dict[str, Any], ctx: ActionContext) -> dict[str, Any]:
     symbol = str(a.get("symbol") or "").strip().upper()
-    if not symbol:
-        raise ActionError("symbol required")
+    if not symbol.startswith("PF_"):
+        raise ActionError("PF_ symbol required")
     positions = _checked_rows(ctx.get_positions(), "positions")
     position = next((p for p in positions if str(p.get("symbol")) == symbol), None)
     if not position:
@@ -299,7 +286,7 @@ def _new_protection_client_id(symbol: str, order_type: str, managed: bool, purpo
         prefix = MANAGED_TP_PREFIX if order_type == "take_profit" else MANAGED_SL_PREFIX
     else:
         prefix = f"kt-{purpose or 'protection'}-"
-    return f"{prefix}{symbol}-{uuid.uuid4().hex[:10]}"
+    return unique_client_id(f"{prefix}{symbol}")
 
 
 def _normalized_trigger_signal(value: Any) -> str:
@@ -323,8 +310,8 @@ def _restore_protection_order(order: dict[str, Any], ctx: ActionContext, order_t
 
 def _replace_protection_plan(a: dict[str, Any], ctx: ActionContext, order_type: str) -> dict[str, Any]:
     symbol = str(a.get("symbol") or "").strip().upper()
-    if not symbol:
-        raise ActionError("symbol required")
+    if not symbol.startswith("PF_"):
+        raise ActionError("PF_ symbol required")
     positions = _checked_rows(ctx.get_positions(), "positions")
     position = next((p for p in positions if str(p.get("symbol")) == symbol), None)
     if not position:
@@ -406,13 +393,11 @@ def _replace_protection_plan(a: dict[str, Any], ctx: ActionContext, order_type: 
 
 
 def _operation_detail(response: Any, key: str, expected: str) -> dict[str, Any]:
-    if not isinstance(response, dict) or str(response.get("result")) != "success":
-        raise ActionError(f"Kraken {key} rejected: {json.dumps(response, default=str)[:300]}")
-    detail = response.get(key)
-    status = str(detail.get("status") or "") if isinstance(detail, dict) else ""
-    if not isinstance(detail, dict) or status != expected:
-        raise ActionError(f"Kraken {key} status is {status or 'missing'}")
-    return detail
+    ambiguous = ("notFound", "orderForEditNotFound") if key in {"cancelStatus", "editStatus"} else ()
+    parsed = parse_operation(response, key, expected, ambiguous_statuses=ambiguous)
+    if parsed["outcome"] != "confirmed":
+        raise ActionError(parsed.get("error") or f"Kraken {key} was not confirmed")
+    return parsed["detail"]
 
 
 def _fresh_orders(ctx: ActionContext) -> list[dict[str, Any]]:
@@ -460,19 +445,101 @@ def _submitted_status(ctx: ActionContext, params: dict[str, Any]) -> dict[str, A
     return None
 
 
-def _submit_protection(ctx: ActionContext, params: dict[str, Any]) -> dict[str, Any]:
+def submit_one(ctx: ActionContext, params: dict[str, Any], prefix: str) -> dict[str, Any]:
+    prepared = ensure_client_id(params, prefix)
     try:
-        response = ctx.client.post("/sendorder", params=params, private=True)
+        response = ctx.client.post("/sendorder", params=prepared, private=True)
     except Exception as exc:
-        reconciled = _submitted_status(ctx, params)
+        reconciled = _submitted_status(ctx, prepared)
         if reconciled:
-            return {"outcome": "confirmed", "reconciled": reconciled, "transportError": str(exc)}
-        return {"outcome": "unknown", "error": f"{type(exc).__name__}: {exc}"}
+            return {
+                "outcome": "confirmed", "params": prepared, "reconciled": reconciled,
+                "exchangeId": reconciled["order"].get("orderId"),
+                "nestedStatus": reconciled["status"], "verification": {"source": "orders/status"},
+                "transportError": f"{type(exc).__name__}: {exc}",
+            }
+        return {
+            "outcome": "unknown", "params": prepared, "nestedStatus": None,
+            "verification": {"source": "orders/status", "confirmed": False},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    parsed = parse_operation(response, "sendStatus", "placed")
+    if parsed["outcome"] != "confirmed":
+        reconciled = _submitted_status(ctx, prepared) if parsed["outcome"] == "unknown" else None
+        if reconciled:
+            return {
+                "outcome": "confirmed", "params": prepared, "response": response,
+                "reconciled": reconciled, "exchangeId": reconciled["order"].get("orderId"),
+                "nestedStatus": reconciled["status"], "verification": {"source": "orders/status"},
+            }
+        return {
+            "outcome": parsed["outcome"], "params": prepared, "response": response,
+            "nestedStatus": parsed.get("nestedStatus"), "exchangeId": parsed.get("exchangeId"),
+            "verification": {"source": "sendStatus"}, "error": parsed.get("error"),
+        }
+    return {
+        "outcome": "confirmed", "params": prepared, "response": response,
+        "nestedStatus": parsed["nestedStatus"], "exchangeId": parsed.get("exchangeId"),
+        "verification": {"source": "sendStatus"},
+    }
+
+
+def _submit_protection(ctx: ActionContext, params: dict[str, Any]) -> dict[str, Any]:
+    return submit_one(ctx, params, "kt-protection")
+
+
+def _find_open_order(ctx: ActionContext, target: dict[str, Any]) -> dict[str, Any] | None:
+    order_id = str(target.get("order_id") or target.get("orderId") or "")
+    cli_id = str(target.get("cliOrdId") or "")
+    return next((
+        order for order in _fresh_orders(ctx)
+        if (order_id and _exchange_order_id(order) == order_id)
+        or (cli_id and str(order.get("cliOrdId") or "") == cli_id)
+    ), None)
+
+
+def cancel_one(ctx: ActionContext, target: dict[str, Any]) -> dict[str, Any]:
     try:
-        detail = _operation_detail(response, "sendStatus", "placed")
-    except ActionError as exc:
-        return {"outcome": "rejected", "response": response, "error": str(exc)}
-    return {"outcome": "confirmed", "response": response, "orderId": detail.get("order_id") or detail.get("orderId")}
+        response = ctx.client.post("/cancelorder", params=target, private=True)
+    except Exception as exc:
+        try:
+            current = _find_open_order(ctx, target)
+        except ActionError:
+            current = None
+        if current is None:
+            return {
+                "outcome": "unknown", "target": target, "nestedStatus": None,
+                "verification": {"source": "openorders", "open": False},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return {
+            "outcome": "unknown", "target": target, "nestedStatus": None,
+            "verification": {"source": "openorders", "open": True},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    parsed = parse_operation(response, "cancelStatus", "cancelled", ambiguous_statuses=("notFound",))
+    if parsed["outcome"] == "confirmed":
+        return {
+            "outcome": "confirmed", "target": target, "response": response,
+            "nestedStatus": parsed["nestedStatus"], "exchangeId": parsed.get("exchangeId"),
+            "verification": {"source": "cancelStatus"},
+        }
+    try:
+        current = _find_open_order(ctx, target)
+    except ActionError:
+        current = None
+    if current is None and parsed["outcome"] == "unknown":
+        return {
+            "outcome": "confirmed", "target": target, "response": response,
+            "nestedStatus": parsed.get("nestedStatus"), "exchangeId": parsed.get("exchangeId"),
+            "verification": {"source": "openorders", "open": False},
+        }
+    return {
+        "outcome": parsed["outcome"], "target": target, "response": response,
+        "nestedStatus": parsed.get("nestedStatus"), "exchangeId": parsed.get("exchangeId"),
+        "verification": {"source": "openorders", "open": current is not None},
+        "error": parsed.get("error"),
+    }
 
 
 def _set_unprotected(ctx: ActionContext, symbol: str, kind: str, details: dict[str, Any]) -> None:
@@ -642,8 +709,8 @@ def managed_protection_sync_actions(
 def _cancel_ids(a: dict[str, Any], ctx: ActionContext, symbol_only: bool) -> list[dict[str, str]]:
     if symbol_only:
         symbol = str(a.get("symbol") or "").strip().upper()
-        if not symbol:
-            raise ActionError("symbol required")
+        if not symbol.startswith("PF_"):
+            raise ActionError("PF_ symbol required")
         orders = [
             o for o in _checked_rows(ctx.get_orders(), "open orders")
             if isinstance(o, dict) and str(o.get("symbol")) == symbol
@@ -674,74 +741,79 @@ def _cancel_ids(a: dict[str, Any], ctx: ActionContext, symbol_only: bool) -> lis
     return ids
 
 
+def _aggregate_outcome(results: list[dict[str, Any]]) -> str:
+    outcomes = [result.get("outcome") for result in results]
+    if outcomes and all(outcome == "confirmed" for outcome in outcomes):
+        return "confirmed"
+    if any(outcome == "confirmed" for outcome in outcomes):
+        return "partial"
+    if any(outcome == "unknown" for outcome in outcomes):
+        return "unknown"
+    return "rejected"
+
+
 def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, Any]:
     kind = str(a.get("type") or "").strip().lower()
 
     if kind == "order":
         params = _validate_order(a, ctx)
+        params.pop("cliOrdId", None)  # every submission gets a fresh server-generated ID
         if not armed:
-            return {"type": kind, "ok": True, "simulated": True, "order": params}
-        return {"type": kind, "ok": True, "order": params,
-                "response": _check_kraken(ctx.client.post("/sendorder", params=params, private=True))}
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, "order": params}
+        submitted = submit_one(ctx, params, f"kt-order-{params['symbol']}")
+        return {"type": kind, "ok": submitted["outcome"] == "confirmed", "order": submitted["params"], **submitted}
 
     if kind == "ladder":
         plan = _ladder_plan(a, ctx)
         if not armed:
-            return {"type": kind, "ok": True, "simulated": True, **plan}
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, **plan}
         responses = []
-        for order in plan["orders"]:
-            try:
-                responses.append({
-                    "order": order,
-                    "response": _check_kraken(ctx.client.post("/sendorder", params=order, private=True)),
-                })
-            except (KrakenFuturesError, ActionError) as exc:
-                responses.append({"order": order, "error": str(exc)})
-        return {"type": kind, "ok": True, **plan, "responses": responses}
+        for index, order in enumerate(plan["orders"], 1):
+            submitted = submit_one(ctx, order, f"kt-ladder-{plan['symbol']}-{index}")
+            responses.append({"order": submitted["params"], **submitted})
+        outcome = _aggregate_outcome(responses)
+        return {
+            "type": kind, "ok": outcome == "confirmed", "outcome": outcome, **plan, "responses": responses,
+            **({"error": f"ladder outcome {outcome}: {sum(r['outcome'] == 'confirmed' for r in responses)}/{len(responses)} confirmed"}
+               if outcome != "confirmed" else {}),
+        }
 
     if kind == "close":
         params = _close_plan(a, ctx)
         if not armed:
-            return {"type": kind, "ok": True, "simulated": True, **params}
-        return {"type": kind, "ok": True, **params,
-                "response": _check_kraken(ctx.client.post("/sendorder", params=params, private=True))}
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, **params}
+        submitted = submit_one(ctx, params, f"kt-close-{params['symbol']}")
+        return {"type": kind, "ok": submitted["outcome"] == "confirmed", **params, "order": submitted["params"], **submitted}
 
     if kind in {"replace_tp", "replace_sl"}:
         order_type = "take_profit" if kind == "replace_tp" else "stp"
         plan = _replace_protection_plan(a, ctx, order_type)
         if not armed:
-            return {"type": kind, "ok": True, "simulated": True, **plan}
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, **plan}
         return _execute_protection_change(kind, plan, ctx)
 
     if kind == "cancel_all":
         ids = _cancel_ids(a, ctx, symbol_only=True)
         if not armed:
-            return {"type": kind, "ok": True, "simulated": True, "cancelOrderIds": ids}
-        results = []
-        for target in ids:
-            try:
-                results.append({
-                    "target": target,
-                    "response": _check_kraken(ctx.client.post("/cancelorder", params=target, private=True)),
-                })
-            except (KrakenFuturesError, ActionError) as exc:
-                results.append({"target": target, "error": str(exc)})
-        return {"type": kind, "ok": True, "results": results}
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, "cancelOrderIds": ids}
+        results = [cancel_one(ctx, target) for target in ids]
+        outcome = _aggregate_outcome(results)
+        return {
+            "type": kind, "ok": outcome == "confirmed", "outcome": outcome, "results": results,
+            **({"error": f"cancel-all outcome {outcome}: {sum(r['outcome'] == 'confirmed' for r in results)}/{len(results)} confirmed"}
+               if outcome != "confirmed" else {}),
+        }
 
     if kind == "cancel":
         ids = _cancel_ids(a, ctx, symbol_only=False)
         if not armed:
-            return {"type": kind, "ok": True, "simulated": True, "cancelOrderIds": ids}
-        results = []
-        for target in ids:
-            try:
-                results.append({
-                    "target": target,
-                    "response": _check_kraken(ctx.client.post("/cancelorder", params=target, private=True)),
-                })
-            except (KrakenFuturesError, ActionError) as exc:
-                results.append({"target": target, "error": str(exc)})
-        return {"type": kind, "ok": True, "results": results}
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, "cancelOrderIds": ids}
+        results = [cancel_one(ctx, target) for target in ids]
+        outcome = _aggregate_outcome(results)
+        return {
+            "type": kind, "ok": outcome == "confirmed", "outcome": outcome, "results": results,
+            **({"error": results[0].get("error") or f"cancel outcome {outcome}"} if outcome != "confirmed" else {}),
+        }
 
     if kind == "chase":
         symbol = str(a.get("symbol") or "").strip().upper()
@@ -762,12 +834,12 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
         }
         if not armed:
             t = ctx.hub.ticker(symbol) or ctx.get_ticker_rest(symbol) or {}
-            return {"type": kind, "ok": True, "simulated": True,
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True,
                     "spec": spec,
                     "note": f"would peg {'best bid' if side == 'buy' else 'best ask'} (now {t.get('bid') if side == 'buy' else t.get('ask')}) and re-peg every {spec['repegSec']}s up to {spec['timeoutSec']}s"}
         starter = getattr(ctx, "start_chase", None)
         snap = starter(spec) if starter else ctx.chase.start(spec, ctx)
-        return {"type": kind, "ok": True, "chase": snap,
+        return {"type": kind, "ok": True, "outcome": "confirmed", "chase": snap,
                 "note": f"chase {snap['id']} running; fills arrive as notifications"}
 
     raise ActionError(f"unknown action type {kind!r}")
@@ -802,11 +874,11 @@ def execute_actions(actions: list[dict[str, Any]], ctx: ActionContext, armed: bo
         try:
             result = _dispatch(a, ctx, armed)
         except ActionError as exc:
-            result = {"type": a["type"], "ok": False, "error": str(exc)}
+            result = {"type": a["type"], "ok": False, "outcome": "rejected", "error": str(exc)}
         except KrakenFuturesError as exc:
-            result = {"type": a["type"], "ok": False, "error": str(exc)}
+            result = {"type": a["type"], "ok": False, "outcome": "unknown", "error": str(exc)}
         except Exception as exc:  # never kill the connection mid-batch
-            result = {"type": a["type"], "ok": False, "error": f"internal: {type(exc).__name__}: {exc}"}
+            result = {"type": a["type"], "ok": False, "outcome": "unknown", "error": f"internal: {type(exc).__name__}: {exc}"}
         results.append(result)
         after_action = getattr(ctx, "after_action", None)
         if after_action:
@@ -816,8 +888,13 @@ def execute_actions(actions: list[dict[str, Any]], ctx: ActionContext, armed: bo
                 reason = str(exc) if isinstance(exc, ActionError) else f"state refresh failed: {type(exc).__name__}: {exc}"
                 result["stateRefreshError"] = reason
                 for pending in normalized[index + 1:]:
-                    results.append({"type": pending["type"], "ok": False, "error": f"not executed: {reason}"})
+                    results.append({"type": pending["type"], "ok": False, "outcome": "rejected", "error": f"not executed: {reason}"})
                 break
+        if armed and result.get("outcome") != "confirmed":
+            reason = f"prior action outcome {result.get('outcome') or 'unknown'}"
+            for pending in normalized[index + 1:]:
+                results.append({"type": pending["type"], "ok": False, "outcome": "rejected", "error": f"not executed: {reason}"})
+            break
     return results
 
 

@@ -56,7 +56,7 @@ client = KrakenFuturesClient.from_env()
 hub = MarketHub(client.base_url)
 
 armed = False
-arm_lock = threading.Lock()
+arm_lock = threading.RLock()
 
 
 class TTLCache:
@@ -467,7 +467,7 @@ def _managed_protection_loop() -> None:
                 with arm_lock:
                     if not armed:
                         break
-                results = trading_actions.execute_actions([action], action_ctx, True)
+                    results = trading_actions.execute_actions([action], action_ctx, True)
                 db.log_action("protection_sync", True, [action], results)
                 result = results[0] if results else {"ok": False, "error": "no result"}
                 payload = {
@@ -562,8 +562,8 @@ def validate_order_params(body: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     order_type = str(body.get("orderType") or "").strip().lower()
     size = _as_float(body.get("size"))
 
-    if not symbol:
-        return None, "symbol is required"
+    if not symbol.startswith("PF_"):
+        return None, "PF_ symbol is required"
     if side not in {"buy", "sell"}:
         return None, "side must be buy or sell"
     if order_type not in ALLOWED_ORDER_TYPES:
@@ -598,47 +598,36 @@ def validate_order_params(body: dict[str, Any]) -> tuple[dict[str, Any] | None, 
 
 def place_order(params: dict[str, Any]) -> dict[str, Any]:
     with arm_lock:
-        is_armed = armed
-    if not is_armed:
-        return {
-            "simulated": True,
-            "message": "Terminal is DISARMED — order was not sent. Arm the terminal to trade live.",
-            "params": params,
-            "order": params,
-        }
-    response = client.post("/sendorder", params=params, private=True)
-    cache.drop("positions", "orders", "account", "fills")
-    sys.stderr.write("[order] " + json.dumps({"params": params, "sendStatus": response.get("sendStatus") or response}, default=str)[:400] + "\n")
-    if isinstance(response, dict):
-        send = response.get("sendStatus") or {}
-        status = str(send.get("status") or "")
-        events = send.get("orderEvents") or []
-        reject_reason = next((str(e.get("reason")) for e in events if str(e.get("type")) == "REJECT" and e.get("reason")), None)
-        if str(response.get("result")) != "success" or (status and status != "placed") or reject_reason:
+        if not armed:
             return {
-                "error": f"Kraken rejected the order: {reject_reason or status or response.get('result')}",
-                "response": response,
-                "params": params,
-                "order": params,
+                "outcome": "simulated", "simulated": True,
+                "message": "Terminal is DISARMED — order was not sent. Arm the terminal to trade live.",
+                "params": params, "order": params,
             }
-    return {"simulated": False, "response": response, "params": params, "order": params}
+        submitted = trading_actions.submit_one(action_ctx, params, f"kt-ticket-{params['symbol']}")
+    cache.drop("positions", "orders", "account", "fills")
+    result = {"simulated": False, "order": submitted["params"], **submitted}
+    if submitted["outcome"] != "confirmed":
+        result["error"] = submitted.get("error") or f"order outcome {submitted['outcome']}"
+    return result
 
 
 def cancel_order(body: dict[str, Any]) -> dict[str, Any]:
     cli_ord_id = body.get("cliOrdId")
     order_id = body.get("orderId") or body.get("order_id")
     with arm_lock:
-        is_armed = armed
-    if not is_armed:
-        return {"simulated": True, "message": "DISARMED — cancel not sent.", "target": cli_ord_id or order_id}
-    if cli_ord_id:
-        response = client.post("/cancelorder", params={"cliOrdId": str(cli_ord_id)}, private=True)
-    elif order_id:
-        response = client.post("/cancelorder", params={"order_id": str(order_id)}, private=True)
-    else:
-        return {"error": "cliOrdId or orderId required"}
+        if not armed:
+            return {"outcome": "simulated", "simulated": True, "message": "DISARMED — cancel not sent.", "target": cli_ord_id or order_id}
+        if cli_ord_id:
+            target = {"cliOrdId": str(cli_ord_id)}
+        elif order_id:
+            target = {"order_id": str(order_id)}
+        else:
+            return {"outcome": "rejected", "error": "cliOrdId or orderId required"}
+        result = trading_actions.cancel_one(action_ctx, target)
     cache.drop("positions", "orders", "account")
-    return {"simulated": False, "response": response}
+    return {"simulated": False, **result, **({"error": result.get("error") or f"cancel outcome {result['outcome']}"}
+                                                    if result["outcome"] != "confirmed" else {})}
 
 
 # ---- HTTP handler ----------------------------------------------------------
@@ -884,9 +873,12 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": error}, 400)
                     return
                 result = place_order(params)
+                db.log_action("api_order", result.get("outcome") != "simulated", [{"type": "order", **params}], [result])
                 self._send_json(result)
             elif path == "/api/cancel":
-                self._send_json(cancel_order(body))
+                result = cancel_order(body)
+                db.log_action("api_cancel", result.get("outcome") != "simulated", [{"type": "cancel", **body}], [result])
+                self._send_json(result)
             elif path == "/api/action":
                 raw = body.get("actions")
                 try:
@@ -907,7 +899,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                         return
                 with arm_lock:
                     is_armed = armed
-                results = trading_actions.execute_actions(normalized, action_ctx, is_armed)
+                    results = trading_actions.execute_actions(normalized, action_ctx, is_armed)
                 cache.drop("positions", "orders", "account")
                 db.log_action("api", is_armed, normalized, results)
                 self._send_json({"actions": normalized, "results": results, "armed": is_armed})
@@ -1269,7 +1261,7 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
         a["type"] = kind
         with arm_lock:
             armed_now = armed
-        results = trading_actions.execute_actions([a], action_ctx, armed_now)
+            results = trading_actions.execute_actions([a], action_ctx, armed_now)
         cache.drop("positions", "orders", "account")
         db.log_action("chat", armed_now, [a], results)
         r = results[0] if results else {"error": "no result"}

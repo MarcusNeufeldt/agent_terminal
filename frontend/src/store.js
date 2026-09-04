@@ -13,7 +13,7 @@ const chartCancelPending = new Set();
 
 const useStore = create((set, get) => ({
   // ---- state ----
-  symbol: localStorage.getItem("kt.symbol") || "PI_XBTUSD",
+  symbol: localStorage.getItem("kt.symbol") || "PF_XBTUSD",
   res: localStorage.getItem("kt.res") || "1m",
   instruments: [],
   tickers: {},
@@ -377,11 +377,10 @@ const useStore = create((set, get) => ({
       const r = await api("/api/order", { method: "POST", body });
       if (r.simulated) {
         get().toast(`<b>Simulated order</b> — ${body.side} ${fmt(body.size)} ${body.symbol}. Terminal is disarmed.`, "warn", 9000);
-      } else if (r.error) {
-        get().toast(`<b>Order rejected by Kraken:</b> ${r.error}`, "err", 10000);
+      } else if (r.outcome !== "confirmed") {
+        get().toast(`<b>Order ${r.outcome || "failed"}:</b> ${r.error || "Kraken did not confirm the write."}`, "err", 10000);
       } else {
-        const st = r.response && r.response.sendStatus;
-        get().toast(`Order sent: ${body.side} ${fmt(body.size)} ${body.symbol}. Status: ${String((st && st.orderEvents && st.orderEvents[0] && st.orderEvents[0].orderEvent) || "accepted")}`, "ok");
+        get().toast(`Order confirmed: ${body.side} ${fmt(body.size)} ${body.symbol}.`, "ok");
       }
       get().refreshTables(); get().refreshAccount();
     } catch (e) {
@@ -442,7 +441,7 @@ const useStore = create((set, get) => ({
         body: { symbol, orderType: "mkt", size: Number(p.size), side: p.side === "long" ? "sell" : "buy", reduceOnly: true },
       });
       if (r.simulated) s.toast("Close simulated — terminal is disarmed.", "warn");
-      else s.toast("Close order sent.", r.response && r.response.result === "success" ? "ok" : "err");
+      else s.toast(r.outcome === "confirmed" ? "Close order confirmed." : `Close ${r.outcome || "failed"}: ${r.error || "not confirmed"}`, r.outcome === "confirmed" ? "ok" : "err");
       s.refreshTables(); s.refreshAccount();
     } catch (e) { s.toast(`Close failed: ${e.message}`, "err"); }
   },
@@ -467,10 +466,10 @@ const useStore = create((set, get) => ({
       const r = await api("/api/cancel", { method: "POST", body });
       let ok = false;
       if (r.simulated) s.toast("Cancel simulated — terminal is disarmed.", "warn");
-      else if (r.error) s.toast(`Cancel failed: ${r.error}`, "err");
+      else if (r.outcome !== "confirmed") s.toast(`Cancel ${r.outcome || "failed"}: ${r.error || "not confirmed"}`, "err");
       else {
-        ok = r.response && r.response.result === "success";
-        s.toast(ok ? "Order canceled." : `Cancel rejected: ${JSON.stringify((r.response && (r.response.cancelStatus || r.response)) || "").slice(0, 140)}`, ok ? "ok" : "err");
+        ok = true;
+        s.toast("Order cancellation confirmed.", "ok");
       }
       await s.refreshTables();
       return ok;
@@ -515,9 +514,10 @@ const useStore = create((set, get) => ({
     const sim = !r.armed;
     const executed = Array.isArray(r.actions) ? r.actions : acts;
     const results = r.results || [];
-    const allFailed = results.length > 0 && results.every(res => res.error || res.ok === false);
-    const lines = results.map(res => res.error ? `${res.type || "??"}: ${res.error}` : `${res.type || "??"} ok`);
-    const toastLead = sim ? "<b>Simulated</b> (disarmed)" : allFailed ? "<b>Failed</b>" : "<b>Sent</b>";
+    const allFailed = results.length > 0 && results.every(res => ["rejected", "unknown"].includes(res.outcome) || (res.ok === false && res.outcome !== "partial"));
+    const hasPartial = results.some(res => res.outcome === "partial");
+    const lines = results.map(res => `${res.type || "??"}: ${res.outcome || (res.ok ? "confirmed" : "failed")}${res.error ? ` (${res.error})` : ""}`);
+    const toastLead = sim ? "<b>Simulated</b> (disarmed)" : allFailed ? "<b>Failed</b>" : hasPartial ? "<b>Partial</b>" : "<b>Confirmed</b>";
     s.toast(`${toastLead} — ${lines.join(" · ")}`, sim ? "warn" : allFailed ? "err" : "ok", 9000);
 
     await new Promise(res => setTimeout(res, 900));
@@ -538,7 +538,7 @@ const useStore = create((set, get) => ({
     }
     results.forEach((res, i) => {
       const a = res.order ? { ...res.order, type: res.type } : (executed[i] || {});
-      if (res.error) { rows.push({ status: "error", primary: describeAction(a), secondary: String(res.error).slice(0, 80) }); return; }
+      if (res.error && res.outcome !== "partial") { rows.push({ status: "error", primary: describeAction(a), secondary: String(res.error).slice(0, 80) }); return; }
       if (res.simulated) { rows.push({ status: "sim", primary: describeAction(a), secondary: "simulated only (disarmed)" }); return; }
       if (a.type === "order") {
         if (a.orderType === "mkt") { rows.push({ status: "ok", primary: describeAction(a), secondary: "market order sent" }); return; }
@@ -591,7 +591,7 @@ const useStore = create((set, get) => ({
       if (m && Array.isArray(m.actionBlocks)) m.actionBlocks = m.actionBlocks.filter((_, bi) => bi !== blockIdx);
       chat[msgIdx] = m;
       chat.push({ role: "assistant", kind: "trace", trace });
-      return { chat, actionBusy: false, lastExecution: { mode: sim ? "SIMULATED (terminal was disarmed — nothing was sent to Kraken)" : allFailed ? "LIVE ATTEMPT FAILED (nothing accepted)" : "LIVE (sent to Kraken)", results: lines, verification: rows, when: new Date().toISOString() } };
+      return { chat, actionBusy: false, lastExecution: { mode: sim ? "SIMULATED (terminal was disarmed — nothing was sent to Kraken)" : allFailed ? "LIVE ATTEMPT FAILED (nothing confirmed)" : hasPartial ? "LIVE PARTIAL (some writes confirmed)" : "LIVE (confirmed by Kraken)", results: lines, verification: rows, when: new Date().toISOString() } };
     });
     api("/api/chat/note", { method: "POST", body: { role: "assistant", content: doneLabel, meta: { trace } } }).catch(() => {});
     s.refreshTables(); s.refreshAccount();

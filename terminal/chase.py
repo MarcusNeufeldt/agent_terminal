@@ -14,6 +14,8 @@ import uuid
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 
+from exchange_ops import parse_operation
+
 
 class ChaseError(Exception):
     pass
@@ -41,12 +43,12 @@ def _round_size(value: Decimal, precision: int) -> Decimal:
 
 
 def _operation_status(response: Any, key: str) -> tuple[str, dict[str, Any]]:
-    if not isinstance(response, dict) or str(response.get("result")) != "success":
-        raise ChaseRejected(f"Kraken {key} rejected: {str(response)[:200]}")
-    detail = response.get(key)
-    if not isinstance(detail, dict):
-        raise ChaseRejected(f"Kraken {key} missing: {str(response)[:200]}")
-    return str(detail.get("status") or ""), detail
+    parsed = parse_operation(response, key, "cancelled", ambiguous_statuses=("notFound",))
+    if parsed["outcome"] == "unknown":
+        raise ChaseUnknown(parsed.get("error") or f"Kraken {key} outcome unknown")
+    if parsed["outcome"] != "confirmed":
+        raise ChaseRejected(parsed.get("error") or f"Kraken {key} rejected")
+    return str(parsed["nestedStatus"]), parsed["detail"]
 
 
 class ChaseWorker(threading.Thread):
@@ -175,17 +177,15 @@ class ChaseWorker(threading.Thread):
             response = self.ctx.client.post("/sendorder", params=params, private=True)
         except Exception as exc:
             raise ChaseUnknown(f"placement outcome unknown for {cli_id}: {exc}") from exc
-        if not isinstance(response, dict) or str(response.get("result")) != "success":
+        parsed = parse_operation(response, "sendStatus", "placed")
+        if parsed["outcome"] == "rejected":
             self._active = None
-            raise ChaseRejected(f"placement rejected: {str(response)[:200]}")
-        detail = response.get("sendStatus")
-        if not isinstance(detail, dict):
-            raise ChaseUnknown(f"placement response for {cli_id} has no sendStatus")
-        status = str(detail.get("status") or "")
-        if status != "placed":
-            self._active = None
-            raise ChaseRejected(f"placement status {status or 'missing'}: {str(detail)[:200]}")
-        order_id = detail.get("order_id") or detail.get("orderId")
+            raise ChaseRejected(parsed.get("error") or "placement rejected")
+        if parsed["outcome"] != "confirmed":
+            raise ChaseUnknown(parsed.get("error") or f"placement outcome unknown for {cli_id}")
+        detail = parsed["detail"]
+        status = str(parsed["nestedStatus"] or "")
+        order_id = parsed.get("exchangeId")
         if not order_id:
             raise ChaseUnknown(f"placement for {cli_id} reported placed without an exchange order ID")
         self._active["orderId"] = str(order_id)

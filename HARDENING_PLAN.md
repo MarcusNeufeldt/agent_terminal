@@ -186,7 +186,11 @@ Dragging one TP currently sends only symbol and price. It must carry the exact o
 
 ## Priority 3: converge write handling
 
-Writes currently follow separate paths:
+**Status: DONE**
+
+All order submissions now receive server-generated client IDs and flow through one timeout-aware executor; all Kraken writes use the shared nested-status parser. Ticket, chart, action-card, AI, protection, and Chase results expose explicit outcomes and persist their evidence. Live batches stop after a non-confirmed result. Verification passed 60 backend tests, 6 frontend tests, lint, build, persisted-outcome checks, and DISARMED ticket/cancel/action probes with unchanged orders. No live order write was used for verification.
+
+Before this section was implemented, writes followed separate paths:
 
 - Ticket and position close use `/api/order`.
 - Chart cancellation uses `/api/cancel`.
@@ -203,11 +207,11 @@ Every submitted order receives a unique `cliOrdId`. Results distinguish:
 simulated | confirmed | partial | rejected | unknown
 ```
 
-- A ladder with only 7 of 10 accepted orders returns `partial`, not top-level success.
-- Cancel-all reports partial cancellation failures.
-- HTTP timeout is `unknown`; do not blindly retry a write. Reconcile by client ID first.
-- Direct ticket, chart, action-card, AI, protection, and Chase paths use the same Kraken response parser.
-- Persist intent, submitted parameters, client ID, exchange ID, nested Kraken status, verification evidence, and final outcome.
+- [x] A ladder with only 7 of 10 accepted orders returns `partial`, not top-level success.
+- [x] Cancel-all reports partial cancellation failures.
+- [x] HTTP timeout is `unknown`; do not blindly retry a write. Reconcile by client ID first.
+- [x] Direct ticket, chart, action-card, AI, protection, and Chase paths use the same Kraken response parser.
+- [x] Persist intent, submitted parameters, client ID, exchange ID, nested Kraken status, verification evidence, and final outcome.
 
 ### Important current nuance
 

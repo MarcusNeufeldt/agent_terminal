@@ -16,10 +16,11 @@ import market_hub
 import scanner
 from actions import (
     MANAGED_TP_PREFIX, ActionError, _replace_protection_plan,
-    execute_actions, managed_protection_sync_actions, normalize_actions,
+    execute_actions, managed_protection_sync_actions, normalize_actions, submit_one,
 )
 from chase import ChaseManager, ChaseRejected, ChaseTransient, ChaseUnknown, ChaseWorker
 from db import Database
+from exchange_ops import ensure_client_id, parse_operation
 from kraken_client import KrakenFuturesClient, load_env_file
 
 
@@ -441,6 +442,105 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(len(set(values)), 200)
         self.assertEqual(min(values), 1_000_000)
         self.assertEqual(max(values), 1_000_199)
+
+    def test_shared_operation_parser_requires_nested_success(self):
+        confirmed = parse_operation(
+            {"result": "success", "sendStatus": {"status": "placed", "order_id": "o1"}},
+            "sendStatus", "placed",
+        )
+        rejected = parse_operation(
+            {"result": "success", "sendStatus": {"status": "postWouldExecute"}},
+            "sendStatus", "placed",
+        )
+        unknown = parse_operation({"result": "success"}, "sendStatus", "placed")
+        self.assertEqual((confirmed["outcome"], confirmed["exchangeId"]), ("confirmed", "o1"))
+        self.assertEqual(rejected["outcome"], "rejected")
+        self.assertEqual(unknown["outcome"], "unknown")
+
+    def test_submitted_order_gets_fresh_client_id_and_explicit_outcome(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {
+            "result": "success", "sendStatus": {"status": "placed", "order_id": "o1"},
+        })
+        ctx = SimpleNamespace(client=client, instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1}, after_action=None)
+        result = execute_actions([{
+            "type": "order", "symbol": "PF_TESTUSD", "side": "buy", "orderType": "lmt",
+            "size": 10, "limitPrice": 9, "cliOrdId": "caller-reused-id",
+        }], ctx, True)[0]
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertTrue(result["order"]["cliOrdId"].startswith("kt-order-PF_TESTUSD-"))
+        self.assertNotEqual(result["order"]["cliOrdId"], "caller-reused-id")
+
+    def test_partially_accepted_ladder_reports_partial(self):
+        class Client:
+            def __init__(self):
+                self.index = 0
+
+            def post(self, _path, **_kwargs):
+                self.index += 1
+                status = "placed" if self.index <= 2 else "postWouldExecute"
+                return {"result": "success", "sendStatus": {"status": status, "order_id": f"o{self.index}"}}
+
+        ctx = SimpleNamespace(
+            client=Client(), current_price=lambda _symbol: Decimal("10"),
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1, "contractSize": 1},
+            after_action=None,
+        )
+        result = execute_actions([{
+            "type": "ladder", "symbol": "PF_TESTUSD", "side": "buy", "notional": 300,
+            "orders": 3, "depthPercent": 3, "orderType": "post",
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual([row["outcome"] for row in result["responses"]], ["confirmed", "confirmed", "rejected"])
+        self.assertEqual(len({row["params"]["cliOrdId"] for row in result["responses"]}), 3)
+
+    def test_cancel_all_reports_partial_nested_failures(self):
+        orders = [
+            {"symbol": "PF_TESTUSD", "cliOrdId": "c1"},
+            {"symbol": "PF_TESTUSD", "cliOrdId": "c2"},
+        ]
+        responses = iter((
+            {"result": "success", "cancelStatus": {"status": "cancelled", "order_id": "o1"}},
+            {"result": "success", "cancelStatus": {"status": "notFound"}},
+        ))
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: next(responses))
+        ctx = SimpleNamespace(client=client, get_orders=lambda: orders, refresh_orders=None, after_action=None)
+        result = execute_actions([{"type": "cancel_all", "symbol": "PF_TESTUSD"}], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual([row["outcome"] for row in result["results"]], ["confirmed", "unknown"])
+
+    def test_failed_write_stops_remaining_live_batch(self):
+        calls = []
+
+        def post(path, **_kwargs):
+            calls.append(path)
+            return {"result": "success", "sendStatus": {"status": "postWouldExecute"}}
+
+        ctx = SimpleNamespace(client=SimpleNamespace(post=post), instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1}, after_action=None)
+        action = {"type": "order", "symbol": "PF_TESTUSD", "side": "buy", "orderType": "post", "size": 1, "limitPrice": 9}
+        results = execute_actions([action, action], ctx, True)
+        self.assertEqual(calls, ["/sendorder"])
+        self.assertEqual([result["outcome"] for result in results], ["rejected", "rejected"])
+        self.assertIn("not executed", results[1]["error"])
+
+    def test_write_timeout_is_unknown_and_never_blindly_retried(self):
+        calls = []
+
+        def post(path, **_kwargs):
+            calls.append(path)
+            if path == "/sendorder":
+                raise TimeoutError("timed out")
+            return {"result": "success", "orders": []}
+
+        result = submit_one(SimpleNamespace(client=SimpleNamespace(post=post)), {"symbol": "PF_TESTUSD", "size": 1}, "kt-test")
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(calls, ["/sendorder", "/orders/status"])
+        self.assertTrue(result["params"]["cliOrdId"].startswith("kt-test-"))
+
+    def test_client_ids_are_unique(self):
+        ids = {ensure_client_id({}, "kt-test")["cliOrdId"] for _ in range(200)}
+        self.assertEqual(len(ids), 200)
 
     def test_server_loads_env_before_reading_port(self):
         source = (Path(__file__).parent / "server.py").read_text(encoding="utf-8")

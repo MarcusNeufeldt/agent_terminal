@@ -32,7 +32,7 @@ Kraken credentials load from `terminal/.env` or process environment variables. A
 - The terminal starts **DISARMED** on every server start. Disarmed, orders/cancels/chases return the exact dry-run plan without touching Kraken.
 - Arming requires clicking the sidebar button and typing `ARM`. Armed state is in-memory only.
 - The AI assistant reads everything itself (market data, positions, account, fills, contract specs, performance) and can also place orders directly through the same tools the Execute button uses - **all write tools are ARM-gated**: disarmed they return the exact plan simulated, armed they hit the live account. `propose_actions` cards (human clicks Execute) remain available for draft/plan requests; the chase engine stays propose-only.
-- Order responses are logged in `actions_log`; bounded AI tool calls/results are logged as `ai_tool` events. Rejections surface with Kraken's actual reason.
+- Every submitted order receives a fresh server-generated client ID. Ticket, chart, action-card, AI, protection, and Chase writes share the same nested-status parser and report `simulated`, `confirmed`, `partial`, `rejected`, or `unknown` in `actions_log`.
 
 ## Layout
 
@@ -69,7 +69,7 @@ Live Chase uses unique client IDs, strict nested Kraken statuses, exact order-st
 - `events` — arm toggles, executions, managed-protection edits, chase lifecycles, bounded AI tool calls/results, compactions, rejections
 - `protection_alerts` — active `UNPROTECTED` states retained until live order coverage is restored
 - **Compaction** — token-tracked from OpenRouter's exact usage; at `CHAT_CONTEXT_LIMIT` the oldest turns beyond the last 20 are summarized as non-authoritative context and dropped from model context. Proposal cards and execution traces are excluded; the living memory file is never compacted.
-- **Contract types matter:** `futures_inverse` (PI_*): 1 contract = contractSize USD notional, whole contracts. `flexible_futures` (PF_*): 1 contract = 1 unit of underlying, notional = size × price. Sizing is handled server-side for ladders/chases/closes and sizes are rounded to the instrument's precision everywhere.
+- **Contract types matter:** the terminal submits only `PF_*` flexible futures, where 1 contract = 1 unit of underlying and notional = size × price. Sizes are rounded to each instrument's precision for tickets, ladders, Chase, protection, and closes.
 
 ## Liquidation price
 
@@ -134,4 +134,4 @@ frontend/           React (Vite) source, `npm run build` outputs to terminal/sta
 - The hub keeps ~25h of 1m candles built from the trade feed as a charts-API fallback.
 - Stop/take-profit triggers use `triggerSignal=mark` by default.
 - Pro-Mode is display-only by design — Kraken rejects orders sized beyond real margin.
-- `PI_*` (inverse) symbols may be trade-forbidden on some accounts (`CONTRACT_ACCESS_FORBIDDEN`); the terminal surfaces that error.
+- Trading endpoints reject `PI_*` inverse symbols; executable symbols must use the `PF_*` family.
