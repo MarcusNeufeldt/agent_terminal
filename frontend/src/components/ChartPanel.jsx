@@ -1,81 +1,140 @@
 import { useEffect, useRef, useState } from "react";
-import ChartController from "../chart";
+import { VelaWorkspace } from "@luxalgo/vela/workspace";
 import { api, fmt } from "../api";
 import useStore from "../store";
+import { VelaChartController } from "../vela-overlays";
+import { TerminalVelaProvider, toTerminalTimeframe, toVelaTimeframe, VELA_TIMEFRAMES } from "../vela-provider";
 
-const TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "12h", "1d", "1w"];
-
-export default function ChartPanel({ source }) {
-  source = useStore(s => s.chartSource); // reactive — App's prop is read once at mount
+export default function ChartPanel() {
   const containerRef = useRef(null);
-  const ctrlRef = useRef(null);
-  const symbol = useStore(s => s.symbol);
-  const res = useStore(s => s.res);
-  const setRes = useStore(s => s.setRes);
-  const instruments = useStore(s => s.instruments);
-  const bindChart = useStore(s => s.bindChart);
-  const unbindChart = useStore(s => s.unbindChart);
-  const [note, setNote] = useState("");
+  const controllerRef = useRef(null);
+  const bindChart = useStore(state => state.bindChart);
+  const unbindChart = useStore(state => state.unbindChart);
+  const symbol = useStore(state => state.symbol);
   const [signal, setSignal] = useState(null);
+  const [note, setNote] = useState("");
   const [riskEnabled, setRiskEnabled] = useState(() => localStorage.getItem("kt.riskEnabled") === "1");
 
   useEffect(() => {
-    const ctrl = new ChartController();
-    ctrlRef.current = ctrl;
-    bindChart(ctrl);
-    ctrl.mount(containerRef.current, useStore.getState().symbol, useStore.getState().instruments);
-    return () => { ctrl.destroy(); unbindChart(); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const initial = useStore.getState();
+    const workspace = new VelaWorkspace(containerRef.current, {
+      layout: "1",
+      symbol: initial.symbol,
+      timeframe: toVelaTimeframe(initial.res),
+      cells: {
+        primary: { symbol: initial.symbol, timeframe: toVelaTimeframe(initial.res) },
+      },
+      providers: { terminal: () => new TerminalVelaProvider() },
+      timeframes: VELA_TIMEFRAMES,
+      live: true,
+      theme: "dark",
+      persist: "terminal-vela-workspace",
+      drawings: false,
+      drawingToolbar: false,
+      bottombar: false,
+      topbar: {
+        left: ["symbol", "timeframes", "style", "layout"],
+        right: ["screenshot"],
+      },
+    });
+    const controller = new VelaChartController(workspace);
+    controllerRef.current = controller;
+    bindChart(controller);
+    controller.setRiskEnabled(localStorage.getItem("kt.riskEnabled") === "1");
+    window.__velaWorkspace = workspace;
+
+    const syncActiveMarket = () => {
+      const market = workspace.chart.market;
+      const nextSymbol = String(market.symbol || "").toUpperCase();
+      if (!nextSymbol) return;
+      const res = toTerminalTimeframe(market.timeframe);
+      const current = useStore.getState();
+      useStore.setState({ symbol: nextSymbol, res, prevPrice: null });
+      localStorage.setItem("kt.symbol", nextSymbol);
+      localStorage.setItem("kt.res", res);
+      api(`/api/tickers?symbols=${encodeURIComponent(nextSymbol)}`).catch(() => {});
+      current.applyOverlayLines();
+      current.refreshBook?.();
+      current.refreshSignal();
+    };
+
+    const cellSubscriptions = new Map();
+    const bindCell = cell => {
+      if (!cell || cellSubscriptions.has(cell.id)) return;
+      cellSubscriptions.set(cell.id, cell.chart.on("market:changed", () => {
+        if (workspace.getState().activeCellId === cell.id) syncActiveMarket();
+        else useStore.getState().applyOverlayLines();
+      }));
+    };
+    workspace.cells().forEach(bindCell);
+    const offActive = workspace.on("cell:active", syncActiveMarket);
+    const offCreated = workspace.on("cell:created", ({ id }) => {
+      bindCell(workspace.cell(id));
+      useStore.getState().applyOverlayLines();
+    });
+    const offDestroyed = workspace.on("cell:destroyed", ({ id }) => {
+      cellSubscriptions.get(id)?.();
+      cellSubscriptions.delete(id);
+    });
+
+    return () => {
+      offActive();
+      offCreated();
+      offDestroyed();
+      for (const unsubscribe of cellSubscriptions.values()) unsubscribe();
+      unbindChart();
+      controller.destroy();
+      workspace.destroy();
+      controllerRef.current = null;
+      delete window.__velaWorkspace;
+    };
+  }, [bindChart, unbindChart]);
 
   useEffect(() => {
-    const ctrl = ctrlRef.current;
-    if (ctrl) ctrl.applyPriceFormat(symbol, instruments);
     api(`/api/signal?symbol=${encodeURIComponent(symbol)}`)
-      .then(s => setSignal(s.error ? null : s))
+      .then(result => setSignal(result.error ? null : result))
       .catch(() => setSignal(null));
-  }, [symbol, instruments]);
+  }, [symbol]);
 
-  useEffect(() => { ctrlRef.current?.setRiskEnabled(riskEnabled); }, [riskEnabled]);
+  useEffect(() => { controllerRef.current?.setRiskEnabled(riskEnabled); }, [riskEnabled]);
 
   const toggleRisk = () => {
     const enabled = !riskEnabled;
     localStorage.setItem("kt.riskEnabled", enabled ? "1" : "0");
     setRiskEnabled(enabled);
+    setNote("");
   };
-  const fitRisk = () => {
-    if (!ctrlRef.current?.fitRisk()) setNote("No visible TP risk levels to fit");
-  };
-  const side = signal && signal.side ? signal.side : "";
 
+  const fitRisk = () => {
+    setNote(controllerRef.current?.fitRisk() ? "" : "No visible TP risk levels to fit");
+  };
+
+  const side = signal?.side || "";
   return (
-    <div id="chart-panel">
-      <div className="tf-bar" id="tf-bar">
-        {TIMEFRAMES.map(r => (
-          <button key={r} className={"tf-btn" + (r === res ? " active" : "")} onClick={() => setRes(r)}>{r}</button>
-        ))}
+    <div id="chart-panel" className="vela-chart-panel">
+      <div className="vela-terminal-tools">
         <button
           className={"risk-toggle" + (riskEnabled ? " active" : "")}
           aria-pressed={riskEnabled}
-          title="Show 1:1, 1:2, and 1:3 mirrored loss lines for the take profit"
+          title="Show 1:1, 1:2, and 1:3 mirrored loss lines for the active chart"
           onClick={toggleRisk}
         >
           RISK {riskEnabled ? "ON" : "OFF"}
         </button>
         {riskEnabled && (
-          <button className="risk-toggle" title="Fit the price scale to the current mirrored risk levels" onClick={fitRisk}>
+          <button className="risk-toggle" title="Fit the active chart to its mirrored risk levels" onClick={fitRisk}>
             FIT RISK
           </button>
         )}
         <span
-          className={"ema-badge" + (side ? " " + side : "")}
-          title={signal && signal.price !== undefined ? `price ${fmt(signal.price)} · ema${signal.fast} ${fmt(signal.emaFast)} · ema${signal.slow} ${fmt(signal.emaSlow)}` : "EMA trend signal on closed 1m mark candles"}
+          className={"ema-badge" + (side ? ` ${side}` : "")}
+          title={signal?.price !== undefined ? `price ${fmt(signal.price)} · ema${signal.fast} ${fmt(signal.emaFast)} · ema${signal.slow} ${fmt(signal.emaSlow)}` : "EMA trend signal on closed 1m mark candles"}
         >
           {signal && !signal.error ? `EMA${signal.fast}/${signal.slow}: ${side ? side.toUpperCase() : "flat"}` : "EMA –"}
         </span>
       </div>
-      <div id="chart" ref={containerRef}></div>
-      <div id="chart-note">{note || (source === "hub" ? "built from live trades" : source === "rest" ? "Kraken charts API" : source === "binance" ? "Binance USDT-M klines" : "")}</div>
+      <div className="vela-status-badge">{note || "VELA · ACTIVE CHART DRIVES TERMINAL"}</div>
+      <div id="vela-chart" ref={containerRef}></div>
     </div>
   );
 }

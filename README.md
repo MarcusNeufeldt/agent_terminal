@@ -12,7 +12,7 @@ A self-hosted Kraken Futures trading terminal with live market data, chart-based
 - PF-only market, limit, post-only, stop, take-profit, ladder, and Chase orders with unique client IDs and explicit write outcomes
 - Draggable TP/SL controls with confirmation, actual protection coverage, and persistent 1:1/1:2/1:3 mirrored loss lines
 - Exact-ID TP/SL edits with rollback and persistent `UNPROTECTED` alerts; managed full-position resizing after confirmed size changes
-- React 19 workspace with lightweight-charts, Zustand, and Markdown chat
+- React 19 workspace with Vela 0.6.15 multi-chart layouts, active-chart routing, Zustand, and Markdown chat
 - OpenRouter assistant with audited read and ARM-gated write tools
 - SQLite chat, execution, tool-call, equity, and account-history persistence
 
@@ -82,7 +82,7 @@ npm ci
 npm run dev
 ```
 
-The Vite server proxies API traffic to port `8787`.
+The Vite server proxies API traffic to port `8787`. The main chart workspace uses the exact `@luxalgo/vela@0.6.15` release; keep Vela's built-in visible attribution enabled and retain [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) plus the bundled [Apache-2.0 license](THIRD_PARTY_LICENSES/VELA-APACHE-2.0.txt) in source and binary distributions.
 
 Run all checks:
 

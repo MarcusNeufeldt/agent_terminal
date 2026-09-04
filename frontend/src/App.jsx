@@ -31,7 +31,7 @@ export default function App() {
       <Sidebar />
       <HeaderBar />
       <main id="main">
-        <ChartPanel source={useStore.getState().chartSource} />
+        <ChartPanel />
         <BottomTabs />
       </main>
       <aside id="right" aria-label="Order ticket and AI assistant">

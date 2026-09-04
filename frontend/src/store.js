@@ -5,6 +5,8 @@ import { create } from "zustand";
 import { api, newRequestId, RES_SECONDS } from "./api";
 import { formatContractSize, normalizeContractSize } from "./size-precision";
 import { buildProtectionAction } from "./protection-action";
+import { buildChartOverlays } from "./chart-overlays";
+import { toVelaTimeframe } from "./vela-provider";
 
 let chart = null; // chart controller (set by ChartPanel on mount)
 let audioCtx = null;
@@ -137,7 +139,8 @@ const useStore = create((set, get) => ({
     set({ symbol: sym, prevPrice: null });
     localStorage.setItem("kt.symbol", sym);
     api(`/api/tickers?symbols=${encodeURIComponent(sym)}`).catch(() => {});
-    get().loadChart();
+    if (chart?.ownsData) chart.setMarket({ symbol: sym }).catch(e => get().toast(`Chart error: ${e.message}`, "err"));
+    else get().loadChart();
     get().refreshBook?.();
     get().refreshSignal();
   },
@@ -215,11 +218,16 @@ const useStore = create((set, get) => ({
   setRes(res) {
     set({ res });
     localStorage.setItem("kt.res", res);
-    get().loadChart();
+    if (chart?.ownsData) chart.setMarket({ timeframe: toVelaTimeframe(res) }).catch(e => get().toast(`Chart error: ${e.message}`, "err"));
+    else get().loadChart();
   },
 
   async loadChart() {
     const { symbol, res } = get();
+    if (chart?.ownsData) {
+      await chart.setMarket({ symbol, timeframe: toVelaTimeframe(res) });
+      return;
+    }
     set({ overlayPrices: [] }); // drop previous symbol's overlays before setData
     if (chart) chart.applyPriceFormat(symbol, get().instruments);
     try {
@@ -240,68 +248,19 @@ const useStore = create((set, get) => ({
   },
 
   applyOverlayLines() {
-    const { positions, orders, symbol } = get();
-    const overlays = [];
-    const pos = positions.find(p => !p.error && p.symbol === symbol && p.size);
-    const inst = get().instruments.find(i => i.symbol === symbol) || {};
-    const tick = Number(inst.tickSize) || 0.01;
-    const mult = Number(inst.contractSize || 1);
-    for (const p of positions) {
-      if (!p.error && p.symbol === symbol && p.size) {
-        const dir = String(p.side).toLowerCase() === "short" ? -1 : 1;
-        overlays.push({
-          price: p.price, color: p.side === "long" ? "#26a69a" : "#ef5350",
-          title: `${p.side} ${Number(p.size)}`, dashed: false,
-          position: { symbol, entry: Number(p.price), size: Number(p.size), mult, dir, tick, side: p.side },
-        });
-        if (p.liqPriceEstimate) overlays.push({ price: p.liqPriceEstimate, color: "#f0b90b", title: `LIQ ${Number(p.liqPriceEstimate)}`, dashed: true });
-      }
-    }
-    for (const o of orders) {
-      if (o.error || o.symbol !== symbol) continue;
-      const orderId = o.order_id || o.orderId || null;
-      const order = (o.cliOrdId || orderId) ? {
-        symbol: o.symbol, side: o.side, orderType: o.orderType,
-        cliOrdId: o.cliOrdId || null, orderId,
-        price: Number(o.stopPrice || o.limitPrice),
-      } : null;
-      if (o.limitPrice) {
-        const size = o.size !== null && o.size !== undefined ? ` ${Number(o.size)}` : "";
-        overlays.push({
-          price: o.limitPrice, color: "#4f8cff", title: `${o.side} ${o.orderType}${size}`, dashed: true,
-          ...(!o.stopPrice && order ? { order } : {}),
-        });
-      }
-      if (o.stopPrice) {
-        const isTp = String(o.orderType).toLowerCase() === "take_profit";
-        const type = isTp ? "TP" : "SL";
-        if (pos) {
-          const dir = String(pos.side).toLowerCase() === "short" ? -1 : 1;
-          const positionSize = Number(pos.size);
-          const orderSize = Number(o.unfilledSize ?? o.size ?? positionSize);
-          const coveredSize = Math.min(positionSize, orderSize);
-          const coverage = positionSize > 0 ? Math.round(orderSize / positionSize * 100) : 0;
-          const pnl = dir * (Number(o.stopPrice) - Number(pos.price)) * coveredSize * mult;
-          overlays.push({
-            price: o.stopPrice, color: isTp ? "#26a69a" : "#ef5350", dashed: true,
-            title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) · ${coverage}%`,
-            ...(isTp ? { tp: { symbol, entry: Number(pos.price), size: coveredSize, mult, dir, tick, fullPosition: orderSize === positionSize, order } } : {}),
-            ...(order ? { order } : {}),
-          });
-        } else {
-          overlays.push({
-            price: o.stopPrice, color: isTp ? "#26a69a" : "#ef5350", title: `${type} ${Number(o.stopPrice)}`, dashed: true,
-            ...(order ? { order } : {}),
-          });
-        }
-      }
-    }
-    set({ overlayPrices: overlays.map(o => o.price) });
-    if (chart) chart.setOverlays(overlays);
+    const { positions, orders, instruments, symbol } = get();
+    const symbols = new Set([symbol, ...(chart?.symbols?.() || [])]);
+    const bySymbol = Object.fromEntries(
+      [...symbols].map(current => [current, buildChartOverlays(current, positions, orders, instruments)]),
+    );
+    const overlays = bySymbol[symbol] || [];
+    set({ overlayPrices: overlays.map(line => line.price) });
+    if (chart?.setOverlayMap) chart.setOverlayMap(bySymbol);
+    else chart?.setOverlays(overlays);
   },
 
   // ---- account / tables ----
-  proAdj(v) { return get().pro ? Number(v || 0) + 5600 : Number(v || 0); },
+  proAdj(v) { return get().pro ? Number(v || 0) + 4400 : Number(v || 0); },
 
   async refreshAccount() {
     try {
@@ -797,7 +756,7 @@ const useStore = create((set, get) => ({
     set({ pro });
     localStorage.setItem("kt.pro", pro ? "1" : "0");
     get().refreshAccount();
-    get().toast(pro ? "Pro-Mode on: Balance and Avail margin shown +$5,600 (display only — orders use real margin)." : "Pro-Mode off: balances are real.", "warn", 6000);
+    get().toast(pro ? "Pro-Mode on: Balance and Avail margin shown +$4,400 (display only — orders use real margin)." : "Pro-Mode off: balances are real.", "warn", 6000);
   },
 
   toggleSound() {

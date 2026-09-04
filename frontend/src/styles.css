@@ -184,6 +184,19 @@ body.right-collapsed #root { grid-template-columns: 232px minmax(0, 1fr) 36px; }
 #chart-zone { display: grid; grid-template-columns: 1fr 235px; min-height: 0; }
 
 #chart-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--border); }
+.vela-chart-panel { position: relative; overflow: hidden; }
+#vela-chart { position: absolute; inset: 0; }
+.vela-terminal-tools {
+  position: absolute; top: 5px; right: 42px; z-index: 30;
+  display: flex; align-items: center; gap: 4px;
+}
+.vela-terminal-tools .risk-toggle { margin-left: 0; background: rgba(11, 14, 20, 0.92); }
+.vela-terminal-tools .ema-badge { background: rgba(11, 14, 20, 0.92); }
+.vela-status-badge {
+  position: absolute; right: 10px; bottom: 8px; z-index: 20; pointer-events: none;
+  padding: 3px 7px; border: 1px solid rgba(79, 140, 255, 0.5); border-radius: 4px;
+  background: rgba(11, 14, 20, 0.82); color: var(--accent); font: 9px var(--mono);
+}
 .tf-bar { display: flex; align-items: center; gap: 4px; padding: 7px 12px; border-bottom: 1px solid var(--border); }
 .tf-btn {
   background: none; border: none; color: var(--muted); font-size: 12px;

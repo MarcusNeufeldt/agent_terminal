@@ -28,9 +28,9 @@ export default function Sidebar() {
     if (!live.length) return null;
     return live.reduce((acc, p) => acc + s.computeUpnl(p), 0);
   });
-  const balance = pro ? Number(account.balanceValue || 0) + 5600 : Number(account.balanceValue || 0);
+  const balance = pro ? Number(account.balanceValue || 0) + 4400 : Number(account.balanceValue || 0);
   const availRaw = Number(account.availableMargin ?? account.collateralValue ?? 0);
-  const avail = pro ? availRaw + 5600 : availRaw;
+  const avail = pro ? availRaw + 4400 : availRaw;
 
   const search = async (sym) => {
     setQuery("");

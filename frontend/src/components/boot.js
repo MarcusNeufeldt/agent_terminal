@@ -1,6 +1,7 @@
 /* Boot sequence + SSE wiring. Non-React glue: runs once on mount. */
 
 import { api, fmt } from "../api";
+import { publishBinanceCandle } from "../market-events";
 import useStore from "../store";
 
 export async function bootTerminal() {
@@ -71,7 +72,13 @@ export async function bootTerminal() {
     } catch (err) {}
   });
   es.addEventListener("armed", e => { try { useStore.setState({ armed: !!JSON.parse(e.data).armed }); } catch (err) {} });
-  es.addEventListener("bcandle", e => { try { useStore.getState().onBinanceCandle(JSON.parse(e.data)); } catch (err) {} });
+  es.addEventListener("bcandle", e => {
+    try {
+      const candle = JSON.parse(e.data);
+      useStore.getState().onBinanceCandle(candle);
+      publishBinanceCandle(candle);
+    } catch (err) {}
+  });
   es.addEventListener("protection_sync", e => {
     try {
       const sync = JSON.parse(e.data);
