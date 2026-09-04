@@ -2,7 +2,7 @@
    store drives it — charting never goes through React's render cycle. */
 
 import * as LightweightCharts from "lightweight-charts";
-import { mirroredRisk } from "./risk-preview";
+import { mirroredRisk, riskLineOptions } from "./risk-preview";
 
 export class ChartController {
   constructor(onNote) {
@@ -11,6 +11,8 @@ export class ChartController {
     this.candleSeries = null;
     this.priceLines = [];
     this.overlayPrices = [];
+    this.riskPrices = [];
+    this._fitRiskPrices = [];
     this.tpLines = [];
     this._drag = null;
     this._dragRaf = 0;
@@ -42,10 +44,11 @@ export class ChartController {
     this.candleSeries.applyOptions({
       autoscaleInfoProvider: (original) => {
         const res = original ? original() : {};
-        if (!this.overlayPrices.length) return res;
+        const prices = [...this.overlayPrices, ...this._fitRiskPrices];
+        if (!prices.length) return res;
         let min = res.priceRange ? res.priceRange.minValue : Infinity;
         let max = res.priceRange ? res.priceRange.maxValue : -Infinity;
-        for (const v of this.overlayPrices) { if (v < min) min = v; if (v > max) max = v; }
+        for (const v of prices) { if (v < min) min = v; if (v > max) max = v; }
         if (!Number.isFinite(min) || !Number.isFinite(max)) return res;
         const pad = (max - min) * 0.04 || Math.abs(min) * 0.005 || 1;
         return { ...res, priceRange: { minValue: min - pad, maxValue: max + pad } };
@@ -96,6 +99,13 @@ export class ChartController {
     else this._renderIdleRiskLines();
   }
 
+  fitRisk() {
+    if (!this.riskPrices.length || !this.chart) return false;
+    this._fitRiskPrices = [...this.riskPrices];
+    this.chart.priceScale("right").applyOptions({ autoScale: true });
+    return true;
+  }
+
   setData(candles) {
     if (!this.candleSeries) return;
     this.candleSeries.setData(candles.map(c => ({ time: c[0], open: c[1], high: c[2], low: c[3], close: c[4] })));
@@ -124,6 +134,8 @@ export class ChartController {
     for (const line of this.priceLines) { try { this.candleSeries.removePriceLine(line); } catch {} }
     this.priceLines = [];
     this.overlayPrices = [];
+    this.riskPrices = [];
+    this._fitRiskPrices = [];
     this.tpLines = [];
     this.riskLines = [];
     this._drag = null;
@@ -290,11 +302,14 @@ export class ChartController {
   }
 
   _clearRiskLines() {
-    if (!this.candleSeries || !this.riskLines.length) return;
     const removed = new Set(this.riskLines);
-    for (const line of this.riskLines) { try { this.candleSeries.removePriceLine(line); } catch {} }
+    if (this.candleSeries) {
+      for (const line of this.riskLines) { try { this.candleSeries.removePriceLine(line); } catch {} }
+    }
     this.priceLines = this.priceLines.filter(line => !removed.has(line));
     this.riskLines = [];
+    this.riskPrices = [];
+    this._fitRiskPrices = [];
     if (this._drag) this._drag.riskLines = [];
     for (const tp of this.tpLines) tp.riskLines = [];
   }
@@ -312,20 +327,22 @@ export class ChartController {
       this._clearRiskLines();
       return;
     }
+    const risks = [1, 2, 3].map(ratio => mirroredRisk({
+      entry: t.entry, target: t.price, dir: t.dir, ratio,
+      tick, size: t.size, mult: t.mult || 1,
+    }));
     if (!t.riskLines?.length) {
       this._clearRiskLines();
-      t.riskLines = [1, 2, 3].map(() => this.candleSeries.createPriceLine({
-        color: "#ef5350", lineWidth: 2,
-        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true,
+      t.riskLines = risks.map(risk => this.candleSeries.createPriceLine({
+        ...riskLineOptions(risk.price),
+        lineStyle: LightweightCharts.LineStyle.Dashed,
       }));
       this.riskLines = t.riskLines;
       this.priceLines.push(...t.riskLines);
     }
-    for (const [index, ratio] of [1, 2, 3].entries()) {
-      const risk = mirroredRisk({
-        entry: t.entry, target: t.price, dir: t.dir, ratio,
-        tick, size: t.size, mult: t.mult || 1,
-      });
+    this.riskPrices = risks.map(risk => risk.price);
+    for (const [index, risk] of risks.entries()) {
+      const ratio = index + 1;
       const loss = Math.abs(risk.pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       t.riskLines[index].applyOptions({
         price: risk.price,

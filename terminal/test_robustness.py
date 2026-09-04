@@ -17,7 +17,7 @@ import chat_compaction
 import market_hub
 import scanner
 from actions import (
-    MANAGED_TP_PREFIX, ActionError, _replace_protection_plan,
+    MANAGED_TP_PREFIX, ActionContext, ActionError, _replace_protection_plan, cancel_one,
     execute_actions, managed_protection_sync_actions, normalize_actions, submit_one,
 )
 from chase import ChaseManager, ChaseRejected, ChaseTransient, ChaseUnknown, ChaseWorker
@@ -25,6 +25,7 @@ from db import Database
 from exchange_ops import ensure_client_id, parse_operation
 from kraken_client import KrakenFuturesClient, load_env_file
 from local_security import LocalSecurity, safe_static_path
+from read_state import account_payload, rows_payload
 
 
 class FakeResponse:
@@ -464,7 +465,12 @@ class RobustnessTests(unittest.TestCase):
         client = SimpleNamespace(post=lambda *_args, **_kwargs: {
             "result": "success", "sendStatus": {"status": "placed", "order_id": "o1"},
         })
-        ctx = SimpleNamespace(client=client, instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1}, after_action=None)
+        ctx = SimpleNamespace(
+            client=client,
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1},
+            require_new_exposure=lambda _symbol: None,
+            after_action=None,
+        )
         result = execute_actions([{
             "type": "order", "symbol": "PF_TESTUSD", "side": "buy", "orderType": "lmt",
             "size": 10, "limitPrice": 9, "cliOrdId": "caller-reused-id",
@@ -486,6 +492,7 @@ class RobustnessTests(unittest.TestCase):
         ctx = SimpleNamespace(
             client=Client(), current_price=lambda _symbol: Decimal("10"),
             instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1, "contractSize": 1},
+            require_new_exposure=lambda _symbol: None,
             after_action=None,
         )
         result = execute_actions([{
@@ -496,6 +503,37 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "partial")
         self.assertEqual([row["outcome"] for row in result["responses"]], ["confirmed", "confirmed", "rejected"])
         self.assertEqual(len({row["params"]["cliOrdId"] for row in result["responses"]}), 3)
+
+    def test_ladder_stops_after_unknown_rung(self):
+        class Client:
+            def __init__(self):
+                self.send_calls = 0
+
+            def post(self, path, **_kwargs):
+                if path == "/orders/status":
+                    return {"result": "success", "orders": []}
+                self.send_calls += 1
+                if self.send_calls == 2:
+                    raise TimeoutError("timed out")
+                return {"result": "success", "sendStatus": {"status": "placed", "order_id": "o1"}}
+
+        client = Client()
+        ctx = SimpleNamespace(
+            client=client, current_price=lambda _symbol: Decimal("10"),
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1, "contractSize": 1},
+            require_new_exposure=lambda _symbol: None,
+            after_action=None,
+        )
+        result = execute_actions([{
+            "type": "ladder", "symbol": "PF_TESTUSD", "side": "buy", "notional": 400,
+            "orders": 4, "depthPercent": 4, "orderType": "post",
+        }], ctx, True)[0]
+        self.assertEqual(client.send_calls, 2)
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual(
+            [row["outcome"] for row in result["responses"]],
+            ["confirmed", "unknown", "rejected", "rejected"],
+        )
 
     def test_cancel_all_reports_partial_nested_failures(self):
         orders = [
@@ -513,6 +551,66 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "partial")
         self.assertEqual([row["outcome"] for row in result["results"]], ["confirmed", "unknown"])
 
+    def test_unavailable_reads_preserve_last_known_state_and_age(self):
+        positions = rows_payload("positions", [{
+            "error": "API unavailable", "lastKnown": [{"symbol": "PF_TESTUSD"}], "ageSeconds": 4.2,
+        }])
+        account = account_payload({
+            "error": "API unavailable", "lastKnown": {"availableMargin": 123}, "ageSeconds": 3.1,
+        })
+        self.assertEqual(positions, {
+            "positions": [{"symbol": "PF_TESTUSD"}], "state": "unavailable",
+            "error": "API unavailable", "ageSeconds": 4.2,
+        })
+        self.assertEqual(account["availableMargin"], 123)
+        self.assertEqual((account["state"], account["ageSeconds"]), ("unavailable", 3.1))
+        self.assertEqual(rows_payload("orders", []), {"orders": [], "state": "current", "ageSeconds": 0})
+
+    def test_ambiguous_cancel_with_unavailable_orders_stays_unknown(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {
+            "result": "success", "cancelStatus": {"status": "notFound"},
+        })
+        ctx = SimpleNamespace(
+            client=client,
+            refresh_orders=None,
+            get_orders=lambda: [{"error": "open orders API unavailable"}],
+        )
+        result = cancel_one(ctx, {"order_id": "order-1"})
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(result["verification"], {"source": "openorders", "state": "unavailable"})
+
+    def test_action_context_rejects_stale_market_or_account_state(self):
+        stale = {"last": 10, "markPrice": 9.9, "time": time.time() - 30}
+        ctx = ActionContext(
+            client=SimpleNamespace(), hub=SimpleNamespace(ticker=lambda _symbol: stale),
+            get_account=lambda: {"availableMargin": 100}, get_positions=lambda: [], get_orders=lambda: [],
+            get_instruments=lambda: {"instruments": []}, get_ticker_rest=lambda _symbol: None,
+        )
+        with self.assertRaisesRegex(ActionError, "unavailable or stale"):
+            ctx.current_price("PF_TESTUSD")
+        ctx.get_ticker_rest = lambda _symbol: {"last": 10, "markPrice": 9.9, "_receivedAt": time.time()}
+        self.assertEqual(ctx.current_price("PF_TESTUSD"), Decimal("10"))
+        ctx.get_account = lambda: {"error": "accounts API unavailable"}
+        with self.assertRaisesRegex(ActionError, "new exposure rejected"):
+            ctx.require_new_exposure("PF_TESTUSD")
+
+    def test_write_request_replay_returns_stored_result_without_reclaiming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            try:
+                payload = {"symbol": "PF_TESTUSD", "side": "buy"}
+                self.assertEqual(db.claim_write_request("request-123", "/api/order", payload)["state"], "new")
+                self.assertEqual(db.claim_write_request("request-123", "/api/order", payload)["state"], "pending")
+                db.complete_write_request("request-123", 200, {"outcome": "confirmed", "exchangeId": "o1"})
+                replay = db.claim_write_request("request-123", "/api/order", payload)
+                self.assertEqual((replay["state"], replay["status"], replay["result"]["exchangeId"]), ("replay", 200, "o1"))
+                self.assertEqual(
+                    db.claim_write_request("request-123", "/api/order", {**payload, "side": "sell"})["state"],
+                    "conflict",
+                )
+            finally:
+                db._conn.close()
+
     def test_failed_write_stops_remaining_live_batch(self):
         calls = []
 
@@ -520,7 +618,12 @@ class RobustnessTests(unittest.TestCase):
             calls.append(path)
             return {"result": "success", "sendStatus": {"status": "postWouldExecute"}}
 
-        ctx = SimpleNamespace(client=SimpleNamespace(post=post), instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1}, after_action=None)
+        ctx = SimpleNamespace(
+            client=SimpleNamespace(post=post),
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0, "tickSize": 0.1},
+            require_new_exposure=lambda _symbol: None,
+            after_action=None,
+        )
         action = {"type": "order", "symbol": "PF_TESTUSD", "side": "buy", "orderType": "post", "size": 1, "limitPrice": 9}
         results = execute_actions([action, action], ctx, True)
         self.assertEqual(calls, ["/sendorder"])

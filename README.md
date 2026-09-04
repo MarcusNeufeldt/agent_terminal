@@ -22,6 +22,8 @@ A self-hosted Kraken Futures trading terminal with live market data, chart-based
 - DISARMED writes return an exact simulation and do not call Kraken's trading endpoints.
 - Arming requires the sidebar control and an `ARM` confirmation.
 - Managed protection changes run only while ARMED.
+- Persisted request IDs prevent identical HTTP retries from submitting duplicate trades.
+- Failed private reads show last-known data and block new exposure instead of appearing empty.
 - Partial TP/SL ladders are not automatically resized.
 - Kraken credentials stay in `terminal/.env`, which Git ignores.
 - Runtime databases, logs, screenshots, and local auth files are not committed.

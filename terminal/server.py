@@ -46,6 +46,7 @@ import binance_ws as binance_ws_mod  # noqa: E402
 import chat_compaction  # noqa: E402
 from actions import ActionContext  # noqa: E402
 from local_security import LocalSecurity, safe_static_path  # noqa: E402
+from read_state import account_payload as _account_payload, rows_payload as _rows_payload  # noqa: E402
 
 STATIC_DIR = HERE / "static"
 
@@ -56,6 +57,8 @@ PORT = int(os.getenv("PORT", "8787"))
 VITE_ORIGINS = tuple(filter(None, (value.strip().lower() for value in os.getenv("VITE_DEV_ORIGINS", "").split(","))))
 security = LocalSecurity(PORT, VITE_ORIGINS)
 DEBUG_ENDPOINTS = os.getenv("TERMINAL_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+IDEMPOTENT_WRITE_PATHS = {"/api/order", "/api/cancel", "/api/action", "/api/chase", "/api/chase/abort", "/api/chat"}
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,100}$")
 
 client = KrakenFuturesClient.from_env()
 hub = MarketHub(client.base_url)
@@ -67,24 +70,30 @@ arm_lock = threading.RLock()
 class TTLCache:
     def __init__(self) -> None:
         self._data: dict[str, tuple[float, Any]] = {}
+        self._invalidated: set[str] = set()
         self._lock = threading.Lock()
 
     def get(self, key: str, ttl: float) -> Any | None:
         now = time.monotonic()
         with self._lock:
             hit = self._data.get(key)
-            if hit and now - hit[0] < ttl:
+            if key not in self._invalidated and hit and now - hit[0] < ttl:
                 return hit[1]
         return None
+
+    def peek(self, key: str) -> tuple[Any, float] | None:
+        with self._lock:
+            hit = self._data.get(key)
+        return (hit[1], max(0.0, time.monotonic() - hit[0])) if hit else None
 
     def put(self, key: str, value: Any) -> None:
         with self._lock:
             self._data[key] = (time.monotonic(), value)
+            self._invalidated.discard(key)
 
     def drop(self, *prefixes: str) -> None:
         with self._lock:
-            for key in [k for k in self._data if k.startswith(prefixes)]:
-                del self._data[key]
+            self._invalidated.update(key for key in self._data if key.startswith(prefixes))
 
 
 cache = TTLCache()
@@ -163,6 +172,16 @@ def extract_account(accounts_payload: Any) -> dict[str, Any]:
     }
 
 
+def _unavailable(key: str, error: Exception | str) -> dict[str, Any]:
+    previous = cache.peek(key)
+    return {
+        "error": str(error),
+        "state": "unavailable",
+        "lastKnown": previous[0] if previous else None,
+        "ageSeconds": round(previous[1], 1) if previous else None,
+    }
+
+
 def get_account() -> dict[str, Any]:
     cached = cache.get("account", 3)
     if cached is not None:
@@ -170,10 +189,12 @@ def get_account() -> dict[str, Any]:
     try:
         payload = client.get("/accounts", private=True)
         account = extract_account(payload)
+        if not account:
+            raise KrakenFuturesError("invalid accounts response")
         cache.put("account", account)
         return account
     except KrakenFuturesError as exc:
-        return {"error": str(exc)}
+        return _unavailable("account", exc)
 
 
 def get_positions() -> list[dict[str, Any]]:
@@ -182,13 +203,14 @@ def get_positions() -> list[dict[str, Any]]:
         return cached
     try:
         payload = client.get("/openpositions", private=True)
-        positions = payload.get("openPositions", []) if isinstance(payload, dict) else []
-        result = positions if isinstance(positions, list) else []
-        result = enrich_positions(result)
+        positions = payload.get("openPositions") if isinstance(payload, dict) else None
+        if not isinstance(positions, list):
+            raise KrakenFuturesError("invalid open positions response")
+        result = enrich_positions(positions)
         cache.put("positions", result)
         return result
     except KrakenFuturesError as exc:
-        return [{"error": str(exc)}]
+        return [_unavailable("positions", exc)]
 
 
 def enrich_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -256,12 +278,13 @@ def get_orders() -> list[dict[str, Any]]:
         return cached
     try:
         payload = client.get("/openorders", private=True)
-        orders = payload.get("openOrders", []) if isinstance(payload, dict) else []
-        result = orders if isinstance(orders, list) else []
-        cache.put("orders", result)
-        return result
+        orders = payload.get("openOrders") if isinstance(payload, dict) else None
+        if not isinstance(orders, list):
+            raise KrakenFuturesError("invalid open orders response")
+        cache.put("orders", orders)
+        return orders
     except KrakenFuturesError as exc:
-        return [{"error": str(exc)}]
+        return [_unavailable("orders", exc)]
 
 
 def get_fills() -> list[dict[str, Any]]:
@@ -298,10 +321,11 @@ def get_ticker_rest(symbol: str) -> dict[str, Any] | None:
             (t for t in payload.get("tickers", []) if t.get("symbol") == symbol),
             None,
         ) if isinstance(payload, dict) else None
-        cache.put(f"ticker:{symbol}", match or {})
+        if match:
+            match = {**match, "_receivedAt": time.time()}
+            cache.put(f"ticker:{symbol}", match)
         return match
     except KrakenFuturesError:
-        cache.put(f"ticker:{symbol}", {})
         return None
 
 
@@ -335,12 +359,31 @@ def _refresh_after_action(action: dict[str, Any], result: dict[str, Any], is_arm
 action_ctx = ActionContext(
     client=client,
     hub=hub,
+    get_account=get_account,
     get_positions=get_positions,
     get_orders=get_orders,
     get_instruments=get_instruments,
     get_ticker_rest=get_ticker_rest,
 )
 db = db_mod.Database()
+
+
+def _ticker_payload(symbol: str) -> dict[str, Any]:
+    try:
+        ticker = action_ctx.fresh_ticker(symbol)
+        return {**ticker, "state": "current", "ageSeconds": round(action_ctx._ticker_age(ticker) or 0, 1)}
+    except trading_actions.ActionError as exc:
+        ticker = hub.ticker(symbol)
+        if not ticker:
+            previous = cache.peek(f"ticker:{symbol}")
+            ticker = previous[0] if previous and isinstance(previous[0], dict) else {}
+        age = action_ctx._ticker_age(ticker) if ticker else None
+        return {
+            **ticker,
+            "state": "unavailable",
+            "error": str(exc),
+            "ageSeconds": round(age, 1) if age is not None else None,
+        }
 
 
 def _publish_chase(kind: str, payload: dict[str, Any]) -> None:
@@ -404,6 +447,7 @@ def _start_chase_if_armed(spec: dict[str, Any]) -> dict[str, Any]:
     with arm_lock:
         if not armed:
             raise trading_actions.ActionError("chase requires an ARMED terminal")
+        action_ctx.require_new_exposure(str(spec["symbol"]))
         return chase_manager.start(spec, action_ctx)
 
 
@@ -609,6 +653,8 @@ def place_order(params: dict[str, Any]) -> dict[str, Any]:
                 "message": "Terminal is DISARMED — order was not sent. Arm the terminal to trade live.",
                 "params": params, "order": params,
             }
+        if not params.get("reduceOnly"):
+            action_ctx.require_new_exposure(params["symbol"])
         submitted = trading_actions.submit_one(action_ctx, params, f"kt-ticket-{params['symbol']}")
     cache.drop("positions", "orders", "account", "fills")
     result = {"simulated": False, "order": submitted["params"], **submitted}
@@ -647,6 +693,10 @@ class TerminalHandler(BaseHTTPRequestHandler):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
     def _send_json(self, obj: Any, status: int = 200) -> None:
+        request_id = getattr(self, "_write_request_id", None)
+        if request_id:
+            db.complete_write_request(request_id, status, obj)
+            self._write_request_id = None
         body = json.dumps(obj, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -755,11 +805,11 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 limit = int(query.get("limit", "50"))
                 self._send_json({"trades": hub.recent_trades(symbol, limit)})
             elif path == "/api/account":
-                self._send_json(get_account())
+                self._send_json(_account_payload(get_account()))
             elif path == "/api/positions":
-                self._send_json({"positions": get_positions()})
+                self._send_json(_rows_payload("positions", get_positions()))
             elif path == "/api/orders":
-                self._send_json({"orders": get_orders()})
+                self._send_json(_rows_payload("orders", get_orders()))
             elif path == "/api/equity":
                 self._send_json({"rows": db.get_equity()})
             elif path == "/api/stats":
@@ -866,6 +916,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        self._write_request_id = None
         denied = security.validate_write(self.headers)
         if denied:
             status, message = denied
@@ -877,6 +928,26 @@ class TerminalHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._send_json({"error": "request body must be a JSON object"}, 400)
             return
+        if path in IDEMPOTENT_WRITE_PATHS:
+            request_id = str(body.get("requestId") or "")
+            if not REQUEST_ID_RE.fullmatch(request_id):
+                self._send_json({"error": "valid requestId required"}, 400)
+                return
+            payload = {key: value for key, value in body.items() if key != "requestId"}
+            claim = db.claim_write_request(request_id, path, payload)
+            if claim["state"] == "conflict":
+                self._send_json({"error": "requestId was already used for different input"}, 409)
+                return
+            if claim["state"] == "pending":
+                self._send_json({
+                    "outcome": "unknown",
+                    "error": "request is already in progress or ended before its result was stored; not resubmitted",
+                }, 409)
+                return
+            if claim["state"] == "replay":
+                self._send_json(claim["result"], claim["status"])
+                return
+            self._write_request_id = request_id
         try:
             if path == "/api/arm":
                 want = bool(body.get("armed"))
@@ -1010,10 +1081,13 @@ class TerminalHandler(BaseHTTPRequestHandler):
         extra_syms = [s for s in _mentioned_symbols(message) if s != symbol]
         if extra_syms:
             hub.watch(extra_syms[:6])
-        account = get_account()
-        positions = [p for p in get_positions() if "error" not in p]
-        orders = [o for o in get_orders() if "error" not in o]
-        ticker = hub.ticker(symbol) or get_ticker_rest(symbol)
+        account_state = _account_payload(get_account())
+        positions_state = _rows_payload("positions", get_positions())
+        orders_state = _rows_payload("orders", get_orders())
+        account = {key: value for key, value in account_state.items() if key not in {"state", "error", "ageSeconds"}}
+        positions = positions_state["positions"]
+        orders = orders_state["orders"]
+        ticker = _ticker_payload(symbol)
         candles = hub.candles_1m(symbol)
         if not candles:
             candles = get_candles(symbol, "1m").get("candles", [])
@@ -1031,6 +1105,16 @@ class TerminalHandler(BaseHTTPRequestHandler):
             candles=candles,
             signal=signal,
         )
+        unavailable = [
+            f"{name} unavailable; showing last-known data"
+            + (f" from {state['ageSeconds']}s ago" if state.get("ageSeconds") is not None else " only if present")
+            + f"; error: {state.get('error')}"
+            for name, state in (("account", account_state), ("positions", positions_state), ("orders", orders_state), ("market", ticker))
+            if state.get("state") == "unavailable"
+        ]
+        if unavailable:
+            snapshot += "\nDATA AVAILABILITY (AUTHORITATIVE): " + " | ".join(unavailable)
+            snapshot += "\nDo not interpret unavailable data as an empty account, position list, or order list."
         with arm_lock:
             snapshot = f"TERMINAL: {'ARMED — write tools are LIVE' if armed else 'DISARMED — write tools simulate only'}\n" + snapshot
         try:
@@ -1043,7 +1127,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
 
         extra_lines = []
         for sym in extra_syms[:6]:
-            t = hub.ticker(sym) or get_ticker_rest(sym)
+            t = _ticker_payload(sym)
             if t:
                 extra_lines.append("MENTIONED " + sym + ": " + json.dumps(
                     {k: t.get(k) for k in ("last", "markPrice", "bid", "ask", "change24h", "fundingRate") if t.get(k) is not None}
@@ -1203,19 +1287,21 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if not sym:
             return {"error": "symbol required"}
         hub.watch([sym])
-        t = hub.ticker(sym) or get_ticker_rest(sym)
-        if not t:
-            return {"error": f"no market data for {sym} (unknown symbol?)"}
+        t = _ticker_payload(sym)
         out = {
             "symbol": sym,
+            "state": t.get("state"),
+            "ageSeconds": t.get("ageSeconds"),
             "ticker": {k: t.get(k) for k in ("last", "markPrice", "bid", "ask", "open24h", "high24h", "low24h", "change24h", "fundingRate", "openInterest") if t.get(k) is not None},
+            **({"error": t["error"]} if t.get("error") else {}),
         }
         try:
             ob = client.get("/orderbook", params={"symbol": sym})
             obb = ob.get("orderBook") or {}
             out["bookTop"] = {"bids": obb.get("bids", [])[:5], "asks": obb.get("asks", [])[:5]}
-        except Exception:
-            pass
+        except Exception as exc:
+            out["bookState"] = "unavailable"
+            out["bookError"] = str(exc)
         candles = hub.candles_1m(sym, limit=60)
         if candles:
             out["recent1m"] = {
@@ -1225,12 +1311,11 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         return out
     if name == "get_positions":
-        return {"positions": [p for p in get_positions() if isinstance(p, dict) and "error" not in p]}
+        return _rows_payload("positions", get_positions())
     if name == "get_account":
-        acct = get_account()
-        return acct if acct else {"error": "account unavailable (keys not configured?)"}
+        return _account_payload(get_account())
     if name == "get_orders":
-        return {"orders": [o for o in get_orders() if isinstance(o, dict) and "error" not in o]}
+        return _rows_payload("orders", get_orders())
     if name == "get_fills":
         sym = _normalize_symbol(str(args.get("symbol") or ""))
         fills = get_fills()

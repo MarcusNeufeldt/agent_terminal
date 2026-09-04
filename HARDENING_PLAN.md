@@ -25,7 +25,7 @@ This document records the review findings that are worth acting on. It separates
 
 The reconciled engine requires nested placement/cancellation success, queries exact order status and fills before classifying disappearance or replacing, recalculates remaining size after cancellation, persists lifecycle evidence, aborts on DISARM, and restores unfinished/orphan alerts on startup. Verification passed 44 backend tests, the frontend suite/lint/build, a read-only live `/orders/status` shape probe, a DISARMED endpoint/action check, and a restart with exact positions and order IDs unchanged. No live Chase order was placed as a deployment test.
 
-Live Chase should not be trusted until its reconciliation logic is replaced.
+The reconciled Chase engine remains enabled. A controlled Kraken demo lifecycle is still required before treating its live exchange behavior as fully validated.
 
 ### Confirmed defects
 
@@ -252,6 +252,20 @@ Acceptance criteria:
 - [x] Compaction occurs before a request that would exceed the configured threshold.
 
 Verification passed 68 backend tests, including forced transaction rollback, failed summarization, pre-request ordering, and multi-round usage accounting. The migrated live database has both token columns. A DISARMED restart preserved exact live positions and orders.
+
+## Pre-merge reliability follow-up
+
+**Status: DONE**
+
+- [x] Failed account, position, order, and ticker reads remain `unavailable` instead of becoming known-empty state. APIs and the AI receive last-known data with its age and the read error.
+- [x] New exposure requires a current account read and market ticker no more than five seconds old.
+- [x] Ambiguous cancellation stays `unknown` when open-order verification is unavailable.
+- [x] Trading and AI HTTP requests use persisted request IDs. Replays return the stored result, in-flight or interrupted requests do not resubmit, and conflicting reuse fails.
+- [x] The order ticket blocks a second submission while the first is pending.
+- [x] A ladder stops at the first non-confirmed rung and marks later rungs unexecuted.
+- [x] Risk lines receive `price` at creation. `FIT RISK` includes current risk levels on demand without continuously forcing them into autoscale.
+
+Verification passed 73 backend tests, 8 frontend tests, lint, build, persistent replay checks, a DISARMED double-click test, and a browser sequence covering risk toggle, fit, TP drag confirmation, order-cancel confirmation, and symbol switching. Restarting returned DISARMED and preserved exact live positions and orders. Chase remains enabled as requested; no live Chase lifecycle was executed.
 
 ## Risk controls after execution hardening
 

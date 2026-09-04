@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS actions_log (
     actions_json TEXT NOT NULL,
     results_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS write_requests (
+    request_id TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    response_status INTEGER,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts INTEGER PRIMARY KEY,
     balance REAL,
@@ -316,6 +326,43 @@ class Database:
             except json.JSONDecodeError:
                 meta = None
         return {"role": row["role"], "content": row["content"], "meta": meta, "id": row["id"]}
+
+    # ---- write request idempotency ----
+
+    def claim_write_request(self, request_id: str, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT endpoint, payload_json, state, response_status, result_json FROM write_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row:
+                if row["endpoint"] != endpoint or row["payload_json"] != payload_json:
+                    return {"state": "conflict"}
+                if row["state"] == "completed" and row["result_json"]:
+                    try:
+                        result = json.loads(row["result_json"])
+                    except json.JSONDecodeError:
+                        return {"state": "pending"}
+                    return {"state": "replay", "status": int(row["response_status"] or 200), "result": result}
+                return {"state": "pending"}
+            now = _now()
+            self._conn.execute(
+                "INSERT INTO write_requests (request_id, endpoint, payload_json, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'pending', ?, ?)",
+                (request_id, endpoint, payload_json, now, now),
+            )
+            self._conn.commit()
+            return {"state": "new"}
+
+    def complete_write_request(self, request_id: str, status: int, result: Any) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE write_requests SET state = 'completed', response_status = ?, result_json = ?, updated_at = ? "
+                "WHERE request_id = ? AND state = 'pending'",
+                (status, json.dumps(result, default=str), _now(), request_id),
+            )
+            self._conn.commit()
 
     # ---- actions log ----
 

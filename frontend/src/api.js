@@ -12,6 +12,10 @@ async function getTerminalToken() {
   return terminalToken;
 }
 
+export function newRequestId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 export async function api(path, opts = {}) {
   const token = await getTerminalToken();
   const { body, headers, ...rest } = opts;

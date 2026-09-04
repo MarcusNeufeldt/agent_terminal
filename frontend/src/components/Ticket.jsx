@@ -11,6 +11,7 @@ export default function Ticket() {
   const lev = useStore(s => s.lev);
   const setLev = useStore(s => s.setLev);
   const tickers = useStore(s => s.tickers);
+  const ticketBusy = useStore(s => s.ticketBusy);
   const submitOrder = useStore(s => s.submitOrder);
   const sizeFromPct = useStore(s => s.sizeFromPct);
   const t = tickers[symbol] || {};
@@ -104,8 +105,8 @@ export default function Ticket() {
           <label htmlFor="in-reduce">Reduce-only</label>
         </div>
         <div className="side-btns">
-          <button id="btn-buy" onClick={() => submitOrder("buy")}>{otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
-          <button id="btn-sell" onClick={() => submitOrder("sell")}>{otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
+          <button id="btn-buy" disabled={ticketBusy} onClick={() => submitOrder("buy")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
+          <button id="btn-sell" disabled={ticketBusy} onClick={() => submitOrder("sell")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
         </div>
         <div className="ticket-note" style={{ color: isChase ? (armed ? "var(--accent)" : "var(--muted)") : (armed ? "var(--red)" : "var(--muted)") }}>
           {isChase

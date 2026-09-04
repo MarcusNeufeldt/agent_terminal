@@ -11,11 +11,13 @@ export default function HeaderBar() {
   const positions = useStore(s => s.positions);
   const chases = useStore(s => s.chases);
   const protectionAlerts = useStore(s => s.protectionAlerts);
+  const dataStatus = useStore(s => s.dataStatus);
   const toggleSound = useStore(s => s.toggleSound);
   const t = tickers[symbol] || {};
   const ch = t.change24h !== undefined ? Number(t.change24h) : null;
   const chaseAlert = Object.values(chases || {}).find(chase => ["unknown", "orphaned"].includes(chase.status));
   const protectionAlert = Object.values(protectionAlerts || {})[0];
+  const unavailableData = Object.entries(dataStatus || {}).filter(([, state]) => state?.state === "unavailable");
   // worst LIQ distance across open positions (percent)
   let risk = null;
   for (const p of positions) {
@@ -51,6 +53,19 @@ export default function HeaderBar() {
       <button id="bell-btn" className={"h-action" + (soundOn ? "" : " off")} title={soundOn ? "Fill sound on — click to mute" : "Fill sound muted — click to enable"} onClick={toggleSound}>
         {soundOn ? "🔔" : "🔕"}
       </button>
+      {unavailableData.length > 0 && (() => {
+        const [name, state] = unavailableData[0];
+        const age = state.ageSeconds == null ? "no saved snapshot" : `${Number(state.ageSeconds).toFixed(1)}s old`;
+        return (
+          <button
+            className="risk-chip crit"
+            title={`${name} unavailable; showing last-known data (${age}). ${state.error || ""}`}
+            onClick={() => useStore.getState().toast(`${name} unavailable. Displaying last-known data (${age}).`, "err", 12000)}
+          >
+            ⚠ DATA STALE {name.toUpperCase()} {age}
+          </button>
+        );
+      })()}
       {protectionAlert && (
         <button
           className="risk-chip crit"

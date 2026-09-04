@@ -2,7 +2,7 @@
    the chart controller registers itself here so live data can drive it imperatively. */
 
 import { create } from "zustand";
-import { api, RES_SECONDS } from "./api";
+import { api, newRequestId, RES_SECONDS } from "./api";
 import { formatContractSize, normalizeContractSize } from "./size-precision";
 import { buildProtectionAction } from "./protection-action";
 
@@ -32,6 +32,8 @@ const useStore = create((set, get) => ({
   account: {},
   positions: [],
   orders: [],
+  dataStatus: {},
+  ticketBusy: false,
   fills: [],
   scannerRows: [],
   scannerMeta: "",
@@ -156,7 +158,7 @@ const useStore = create((set, get) => ({
     if (get().armed && !confirm(`${label} ${symbol} at ${fmt(stopPrice)}${pnlText}?\n\nThis will change a LIVE reduce-only protection order.`)) return false;
     try {
       const action = buildProtectionAction(kind, symbol, stopPrice, order);
-      const r = await api("/api/action", { method: "POST", body: { actions: [action] } });
+      const r = await api("/api/action", { method: "POST", body: { actions: [action], requestId: newRequestId() } });
       const res = (r.results || [])[0] || {};
       if (res.error) { get().toast(`${label} failed: ${res.error}`, "err"); return false; }
       if (res.simulated) { get().toast(`${label} simulated — terminal is disarmed, nothing sent.`, "warn"); return false; }
@@ -304,9 +306,14 @@ const useStore = create((set, get) => ({
   async refreshAccount() {
     try {
       const a = await api("/api/account");
-      if (a.error) { set({ account: {} }); return; }
-      set({ account: a });
-    } catch (e) {}
+      const { state, error, ageSeconds, ...account } = a;
+      set(s => ({
+        account: Object.keys(account).length ? account : s.account,
+        dataStatus: { ...s.dataStatus, account: { state, error, ageSeconds } },
+      }));
+    } catch (e) {
+      set(s => ({ dataStatus: { ...s.dataStatus, account: { state: "unavailable", error: e.message } } }));
+    }
   },
 
   computeUpnl(p) {
@@ -334,7 +341,15 @@ const useStore = create((set, get) => ({
       const [pos, ord] = await Promise.all([api("/api/positions"), api("/api/orders")]);
       const positions = pos.positions || [];
       const orders = ord.orders || [];
-      set({ positions, orders });
+      set(s => ({
+        positions,
+        orders,
+        dataStatus: {
+          ...s.dataStatus,
+          positions: { state: pos.state, error: pos.error, ageSeconds: pos.ageSeconds },
+          orders: { state: ord.state, error: ord.error, ageSeconds: ord.ageSeconds },
+        },
+      }));
       const posSymbols = positions.filter(p => p.symbol && !p.error).map(p => p.symbol);
       if (posSymbols.length) api(`/api/tickers?symbols=${encodeURIComponent(posSymbols.join(","))}`).catch(() => {});
       get().updatePositionCells();
@@ -370,11 +385,13 @@ const useStore = create((set, get) => ({
   // ---- orders ----
   async submitOrder(side) {
     const s = get();
-    if (s.otype === "chase") return get().submitChase(side);
-    const body = get().ticketPayload(side);
-    if (!body) return;
+    if (s.ticketBusy) return;
+    set({ ticketBusy: true });
     try {
-      const r = await api("/api/order", { method: "POST", body });
+      if (s.otype === "chase") return await get().submitChase(side);
+      const body = get().ticketPayload(side);
+      if (!body) return;
+      const r = await api("/api/order", { method: "POST", body: { ...body, requestId: newRequestId() } });
       if (r.simulated) {
         get().toast(`<b>Simulated order</b> — ${body.side} ${fmt(body.size)} ${body.symbol}. Terminal is disarmed.`, "warn", 9000);
       } else if (r.outcome !== "confirmed") {
@@ -385,6 +402,8 @@ const useStore = create((set, get) => ({
       get().refreshTables(); get().refreshAccount();
     } catch (e) {
       get().toast(`Order failed: ${e.message}`, "err", 8000);
+    } finally {
+      set({ ticketBusy: false });
     }
   },
 
@@ -420,7 +439,7 @@ const useStore = create((set, get) => ({
     try {
       const r = await api("/api/chase", {
         method: "POST",
-        body: { symbol: body.symbol, side: body.side, size: body.size },
+        body: { symbol: body.symbol, side: body.side, size: body.size, requestId: newRequestId() },
       });
       const chase = r.chase;
       get().onChaseEvent(chase);
@@ -438,7 +457,7 @@ const useStore = create((set, get) => ({
     try {
       const r = await api("/api/order", {
         method: "POST",
-        body: { symbol, orderType: "mkt", size: Number(p.size), side: p.side === "long" ? "sell" : "buy", reduceOnly: true },
+        body: { symbol, orderType: "mkt", size: Number(p.size), side: p.side === "long" ? "sell" : "buy", reduceOnly: true, requestId: newRequestId() },
       });
       if (r.simulated) s.toast("Close simulated — terminal is disarmed.", "warn");
       else s.toast(r.outcome === "confirmed" ? "Close order confirmed." : `Close ${r.outcome || "failed"}: ${r.error || "not confirmed"}`, r.outcome === "confirmed" ? "ok" : "err");
@@ -462,7 +481,7 @@ const useStore = create((set, get) => ({
   async cancelOrder(payload) {
     const s = get();
     try {
-      const body = payload.cliOrdId ? { cliOrdId: payload.cliOrdId } : { orderId: payload.orderId };
+      const body = { ...(payload.cliOrdId ? { cliOrdId: payload.cliOrdId } : { orderId: payload.orderId }), requestId: newRequestId() };
       const r = await api("/api/cancel", { method: "POST", body });
       let ok = false;
       if (r.simulated) s.toast("Cancel simulated — terminal is disarmed.", "warn");
@@ -484,12 +503,18 @@ const useStore = create((set, get) => ({
     const mine = s.orders.filter(o => o.symbol === s.symbol);
     if (!mine.length) { s.toast(`No open orders on ${s.symbol}.`); return; }
     if (!confirm(`Cancel ${mine.length} open order(s) on ${s.symbol}?`)) return;
+    const results = [];
     for (const o of mine) {
       try {
-        await api("/api/cancel", { method: "POST", body: { cliOrdId: o.cliOrdId || undefined, orderId: o.order_id || undefined } });
-      } catch (e) { s.toast(`Cancel failed: ${e.message}`, "err"); }
+        results.push(await api("/api/cancel", { method: "POST", body: { cliOrdId: o.cliOrdId || undefined, orderId: o.order_id || undefined, requestId: newRequestId() } }));
+      } catch (e) {
+        results.push({ outcome: "unknown", error: e.message });
+      }
     }
-    s.toast(`Cancel-all done for ${s.symbol}.`, "ok");
+    const confirmed = results.filter(result => result.outcome === "confirmed").length;
+    if (!s.armed) s.toast(`Cancel-all simulated for ${s.symbol}.`, "warn");
+    else if (confirmed === mine.length) s.toast(`Canceled ${confirmed} order(s) on ${s.symbol}.`, "ok");
+    else s.toast(`Cancel-all incomplete: ${confirmed}/${mine.length} confirmed. Check live orders before retrying.`, "err", 10000);
     s.refreshTables();
   },
 
@@ -504,7 +529,7 @@ const useStore = create((set, get) => ({
     try {
       r = await api("/api/action", {
         method: "POST",
-        body: { actions: acts, messageId: s.chat[msgIdx]?.id, blockIndex: blockIdx },
+        body: { actions: acts, messageId: s.chat[msgIdx]?.id, blockIndex: blockIdx, requestId: newRequestId() },
       });
     } catch (e) {
       s.toast(`Execute failed: ${e.message}`, "err");
@@ -621,7 +646,7 @@ const useStore = create((set, get) => ({
     try {
       const r = await api("/api/chat", {
         method: "POST",
-        body: { message: text, symbol: s.symbol, lastExecution: s.lastExecution || null },
+        body: { message: text, symbol: s.symbol, lastExecution: s.lastExecution || null, requestId: newRequestId() },
       });
       set({ lastExecution: null });
       s.chat.push({ id: r.messageId, role: "assistant", content: r.text || "(empty response)", proposals: r.orderProposals, actionBlocks: r.actionProposals });

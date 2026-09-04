@@ -18,6 +18,7 @@ Action schema (JSON):
 
 from __future__ import annotations
 
+import time
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Any, Callable
 
@@ -30,6 +31,7 @@ LIMIT_TYPES = {"lmt", "post", "ioc"}
 TRIGGER_TYPES = {"stp", "take_profit"}
 MANAGED_TP_PREFIX = "kt-full-tp-"
 MANAGED_SL_PREFIX = "kt-full-sl-"
+PRICE_MAX_AGE_SECONDS = 5.0
 
 
 class ActionError(Exception):
@@ -65,6 +67,7 @@ class ActionContext:
         *,
         client,
         hub,
+        get_account: Callable[[], dict],
         get_positions: Callable[[], list[dict]],
         get_orders: Callable[[], list[dict]],
         get_instruments: Callable[[], dict],
@@ -73,6 +76,7 @@ class ActionContext:
     ) -> None:
         self.client = client
         self.hub = hub
+        self.get_account = get_account
         self.get_positions = get_positions
         self.get_orders = get_orders
         self.get_instruments = get_instruments
@@ -94,19 +98,46 @@ class ActionContext:
             self._instrument_cache = {str(i.get("symbol")): i for i in instruments}
         return self._instrument_cache.get(symbol, {})
 
+    @staticmethod
+    def _ticker_age(ticker: dict[str, Any]) -> float | None:
+        stamp = ticker.get("_receivedAt") or ticker.get("time")
+        try:
+            return max(0.0, time.time() - float(stamp))
+        except (TypeError, ValueError):
+            return None
+
+    def fresh_ticker(self, symbol: str) -> dict[str, Any]:
+        ticker = self.hub.ticker(symbol) or {}
+        age = self._ticker_age(ticker)
+        if age is not None and age <= PRICE_MAX_AGE_SECONDS:
+            return ticker
+        ticker = self.get_ticker_rest(symbol) or {}
+        age = self._ticker_age(ticker)
+        if age is None or age > PRICE_MAX_AGE_SECONDS:
+            detail = f" ({age:.1f}s old)" if age is not None else ""
+            raise ActionError(f"current market data unavailable or stale for {symbol}{detail}")
+        return ticker
+
     def current_price(self, symbol: str) -> Decimal:
-        ticker = self.hub.ticker(symbol) or self.get_ticker_rest(symbol) or {}
+        ticker = self.fresh_ticker(symbol)
         price = ticker.get("last") or ticker.get("markPrice")
         if not price:
             raise ActionError(f"no current price available for {symbol}")
         return _dec(price)
 
     def mark_price(self, symbol: str) -> Decimal:
-        ticker = self.hub.ticker(symbol) or self.get_ticker_rest(symbol) or {}
+        ticker = self.fresh_ticker(symbol)
         price = ticker.get("markPrice")
         if not price:
             raise ActionError(f"no mark price available for {symbol}")
         return _dec(price)
+
+    def require_new_exposure(self, symbol: str) -> None:
+        account = self.get_account()
+        if not isinstance(account, dict) or account.get("error") or not account:
+            error = account.get("error") if isinstance(account, dict) else "invalid response"
+            raise ActionError(f"account state unavailable; new exposure rejected: {error}")
+        self.fresh_ticker(symbol)
 
 
 def apply_size_precision(params: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
@@ -504,17 +535,15 @@ def cancel_one(ctx: ActionContext, target: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         try:
             current = _find_open_order(ctx, target)
-        except ActionError:
-            current = None
-        if current is None:
+        except ActionError as read_exc:
             return {
                 "outcome": "unknown", "target": target, "nestedStatus": None,
-                "verification": {"source": "openorders", "open": False},
-                "error": f"{type(exc).__name__}: {exc}",
+                "verification": {"source": "openorders", "state": "unavailable"},
+                "error": f"cancel transport failed ({type(exc).__name__}: {exc}); verification failed ({read_exc})",
             }
         return {
             "outcome": "unknown", "target": target, "nestedStatus": None,
-            "verification": {"source": "openorders", "open": True},
+            "verification": {"source": "openorders", "open": current is not None},
             "error": f"{type(exc).__name__}: {exc}",
         }
     parsed = parse_operation(response, "cancelStatus", "cancelled", ambiguous_statuses=("notFound",))
@@ -526,8 +555,13 @@ def cancel_one(ctx: ActionContext, target: dict[str, Any]) -> dict[str, Any]:
         }
     try:
         current = _find_open_order(ctx, target)
-    except ActionError:
-        current = None
+    except ActionError as read_exc:
+        return {
+            "outcome": "unknown", "target": target, "response": response,
+            "nestedStatus": parsed.get("nestedStatus"), "exchangeId": parsed.get("exchangeId"),
+            "verification": {"source": "openorders", "state": "unavailable"},
+            "error": f"{parsed.get('error') or 'cancel not confirmed'}; verification failed ({read_exc})",
+        }
     if current is None and parsed["outcome"] == "unknown":
         return {
             "outcome": "confirmed", "target": target, "response": response,
@@ -760,6 +794,8 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
         params.pop("cliOrdId", None)  # every submission gets a fresh server-generated ID
         if not armed:
             return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, "order": params}
+        if not params.get("reduceOnly"):
+            ctx.require_new_exposure(params["symbol"])
         submitted = submit_one(ctx, params, f"kt-order-{params['symbol']}")
         return {"type": kind, "ok": submitted["outcome"] == "confirmed", "order": submitted["params"], **submitted}
 
@@ -767,10 +803,18 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
         plan = _ladder_plan(a, ctx)
         if not armed:
             return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, **plan}
+        if not a.get("reduceOnly"):
+            ctx.require_new_exposure(plan["symbol"])
         responses = []
         for index, order in enumerate(plan["orders"], 1):
             submitted = submit_one(ctx, order, f"kt-ladder-{plan['symbol']}-{index}")
             responses.append({"order": submitted["params"], **submitted})
+            if submitted["outcome"] != "confirmed":
+                responses.extend({
+                    "outcome": "rejected", "error": "not executed after earlier ladder failure",
+                    "order": pending,
+                } for pending in plan["orders"][index:])
+                break
         outcome = _aggregate_outcome(responses)
         return {
             "type": kind, "ok": outcome == "confirmed", "outcome": outcome, **plan, "responses": responses,
