@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kraken Futures Terminal</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%234f8cff'/><text x='8' y='12' font-size='10' text-anchor='middle' fill='white' font-family='monospace'>K</text></svg>">
+</head>
+<body>
+
+<aside id="sidebar">
+  <div class="brand">
+    <h1>KF <span>Terminal</span></h1>
+    <div class="badges">
+      <span class="badge" id="env-badge">LIVE</span>
+      <span class="badge armed" id="armed-badge" style="display:none">ARMED</span>
+      <span class="badge" title="market data feed"><span class="dot" id="feed-dot"></span> <span id="feed-label">connecting</span></span>
+    </div>
+  </div>
+
+  <div class="searchbox">
+    <input id="symbol-search" type="text" placeholder="Search instruments…" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results"></div>
+  </div>
+
+  <div id="watchlist"></div>
+
+  <div class="sidebar-footer">
+    <div class="acct-row"><span class="k">Balance</span><span class="v" id="acct-balance">–</span></div>
+    <div class="acct-row"><span class="k">Avail margin</span><span class="v" id="acct-avail">–</span></div>
+    <div class="acct-row"><span class="k">Unrealized PnL</span><span class="v" id="acct-pnl">–</span></div>
+    <button id="arm-btn" title="Toggle live order entry">DISARMED — click to arm</button>
+    <div class="check-row" style="margin-top:9px">
+      <input id="pro-toggle" type="checkbox">
+      <label for="pro-toggle">Pro-Mode</label>
+    </div>
+  </div>
+</aside>
+
+<header id="header">
+  <div class="h-sym" id="h-symbol">–</div>
+  <div class="h-price" id="h-price">–</div>
+  <div class="h-item"><span class="k">24h change</span><span class="v" id="h-change">–</span></div>
+  <div class="h-item"><span class="k">Mark</span><span class="v" id="h-mark">–</span></div>
+  <div class="h-item"><span class="k">Index</span><span class="v" id="h-index">–</span></div>
+  <div class="h-item"><span class="k">Bid</span><span class="v up" id="h-bid">–</span></div>
+  <div class="h-item"><span class="k">Ask</span><span class="v down" id="h-ask">–</span></div>
+  <div class="h-item"><span class="k">24h high</span><span class="v" id="h-high">–</span></div>
+  <div class="h-item"><span class="k">24h low</span><span class="v" id="h-low">–</span></div>
+  <div class="h-item"><span class="k">24h vol</span><span class="v" id="h-vol">–</span></div>
+  <div class="h-item"><span class="k">Funding</span><span class="v" id="h-funding">–</span></div>
+  <div class="h-item"><span class="k">Open interest</span><span class="v" id="h-oi">–</span></div>
+  <button id="bell-btn" class="h-action" title="Fill sound">🔔</button>
+  <button id="vol-btn" class="h-action" onclick="location.href='/volatility'">Volatility Pairs</button>
+</header>
+
+<section id="main">
+  <div id="chart-zone">
+    <div id="chart-panel">
+      <div class="tf-bar" id="tf-bar">
+      <span class="ema-badge" id="ema-badge" title="EMA trend signal on closed 1m mark candles (ema_volatility_bot rules)">EMA –</span>
+    </div>
+      <div id="chart"></div>
+      <div id="chart-note"></div>
+    </div>
+    <div id="book">
+      <h3>Order book</h3>
+      <div class="book-rows" id="book-asks"></div>
+      <div class="book-mid"><span id="book-mid-price">–</span><span class="spread" id="book-spread"></span></div>
+      <div class="book-rows" id="book-bids"></div>
+    </div>
+  </div>
+
+  <div id="bottom">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="positions">Positions <span class="tab-count" id="cnt-positions"></span></button>
+      <button class="tab-btn" data-tab="orders">Orders <span class="tab-count" id="cnt-orders"></span></button>
+      <button class="tab-btn" data-tab="fills">Fills</button>
+      <button class="tab-btn" data-tab="scanner">Scanner</button>
+      <div id="bottom-actions">
+        <button id="btn-cancel-all">Cancel all (symbol)</button>
+        <button id="btn-refresh">Refresh</button>
+      </div>
+    </div>
+    <div class="tab-body" id="tab-body"></div>
+  </div>
+</section>
+
+<aside id="right">
+  <div class="panel" id="ticket">
+    <h3>Order ticket <span id="ticket-symbol" style="color:var(--text); text-transform:none"></span></h3>
+    <div class="ticket-body">
+      <div class="ord-tabs">
+        <button class="ord-tab active" data-otype="mkt">Market</button>
+        <button class="ord-tab" data-otype="lmt">Limit</button>
+        <button class="ord-tab" data-otype="post">Post-only</button>
+        <button class="ord-tab" data-otype="stp">Stop</button>
+        <button class="ord-tab" data-otype="take_profit">Take profit</button>
+        <button class="ord-tab" data-otype="chase" title="Post-only order that re-pegs to best bid/ask until filled — maker fees">Chase</button>
+      </div>
+      <div class="field" id="f-limit">
+        <label>Limit price</label>
+        <input id="in-limit" type="number" step="any" placeholder="0.00">
+      </div>
+      <div class="field" id="f-stop" style="display:none">
+        <label>Trigger price <span id="trigger-signal-note">(mark)</span></label>
+        <input id="in-stop" type="number" step="any" placeholder="0.00">
+      </div>
+      <div class="field">
+        <label>Size (contracts)</label>
+        <input id="in-size" type="number" step="any" placeholder="0.0">
+        <div class="size-quick">
+          <button data-pct="25">25%</button>
+          <button data-pct="50">50%</button>
+          <button data-pct="75">75%</button>
+          <button data-pct="100">100%</button>
+        </div>
+        <div class="size-quick" id="lev-quick" title="Leverage applied to the % size buttons">
+          <button data-lev="1">1x</button>
+          <button data-lev="2">2x</button>
+          <button data-lev="3">3x</button>
+          <button data-lev="5">5x</button>
+          <button data-lev="10">10x</button>
+        </div>
+      </div>
+      <div class="check-row">
+        <input id="in-reduce" type="checkbox">
+        <label for="in-reduce">Reduce-only</label>
+      </div>
+      <div class="side-btns">
+        <button id="btn-buy">BUY / LONG</button>
+        <button id="btn-sell">SELL / SHORT</button>
+      </div>
+      <div class="ticket-note" id="ticket-note"></div>
+    </div>
+  </div>
+
+  <div class="panel" id="chat">
+    <h3>AI assistant</h3>
+    <div id="chat-messages"></div>
+    <form id="chat-form">
+      <textarea id="chat-input" placeholder="Ask about the market, your positions… (Enter to send)" rows="1"></textarea>
+      <button id="chat-send" type="submit">Send</button>
+    </form>
+  </div>
+</aside>
+
+<div id="toasts"></div>
+
+<script src="/vendor/lightweight-charts.standalone.production.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

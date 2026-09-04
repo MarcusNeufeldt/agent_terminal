@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Volatility Pairs — Kraken Futures Terminal</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%234f8cff'/><text x='8' y='12' font-size='10' text-anchor='middle' fill='white' font-family='monospace'>V</text></svg>">
+<style>
+  body { display: block; overflow: auto; padding: 18px 24px; }
+  .vol-head { display: flex; align-items: baseline; gap: 16px; margin-bottom: 4px; }
+  .vol-head h1 { font-size: 18px; }
+  .vol-meta { color: var(--muted); font-size: 12px; }
+  .vol-actions { margin-left: auto; display: flex; gap: 8px; }
+  .vol-actions button {
+    background: var(--panel2); border: 1px solid var(--border2); color: var(--text);
+    padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  }
+  .vol-actions button:hover { border-color: var(--accent); }
+  table.grid { margin-top: 10px; }
+  table.grid tbody tr { cursor: pointer; }
+  table.grid tbody tr:hover { background: var(--panel2); }
+</style>
+</head>
+<body>
+  <div class="vol-head">
+    <h1>Volatility Pairs</h1>
+    <span class="vol-meta" id="meta">loading…</span>
+    <div class="vol-actions">
+      <button id="refresh-btn">Refresh</button>
+      <button onclick="location.href='/'">← Terminal</button>
+    </div>
+  </div>
+  <div id="content"><div class="empty">Scanning perpetuals…</div></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const fmt = (x, d) => x === null || x === undefined || Number.isNaN(Number(x)) ? "–" :
+  (d !== undefined ? Number(x).toFixed(d) : Number(x).toLocaleString("en-US", { maximumFractionDigits: 4 }));
+const fmtVol = (x) => {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "–";
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return n.toFixed(1);
+};
+
+async function load() {
+  $("refresh-btn").disabled = true;
+  try {
+    const res = await fetch("/api/volatility?limit=60");
+    const data = await res.json();
+    if (data.error) { $("content").innerHTML = `<div class="empty">${data.error}</div>`; return; }
+    $("meta").textContent =
+      `realized vol over ${data.windowMinutes}m closed 1m mark candles · ${data.marketsScanned} markets scanned` +
+      (data.cached ? " · cached" : "");
+    const rows = data.rows || [];
+    $("content").innerHTML = rows.length
+      ? `<table class="data"><thead><tr>
+          <th>#</th><th>Symbol</th><th class="num">Mark</th><th class="num">Realized vol</th>
+          <th class="num">Range</th><th class="num">Move</th><th class="num">Spread</th><th class="num">24h volume $</th>
+        </tr></thead><tbody>` +
+        rows.map((r, i) => `<tr data-sym="${r.symbol}">
+          <td>${i + 1}</td>
+          <td>${r.symbol}</td>
+          <td class="num">${fmt(r.markPrice)}</td>
+          <td class="num" style="color:${r.realizedVolatilityPercent >= 0.3 ? "var(--green)" : "var(--text)"}">${fmt(r.realizedVolatilityPercent, 3)}%</td>
+          <td class="num">${fmt(r.rangePercent, 2)}%</td>
+          <td class="num" style="color:${r.movePercent >= 0 ? "var(--green)" : "var(--red)"}">${r.movePercent >= 0 ? "+" : ""}${fmt(r.movePercent, 2)}%</td>
+          <td class="num">${fmt(r.spreadPercent, 3)}%</td>
+          <td class="num">$${fmtVol(r.volumeQuote)}</td>
+        </tr>`).join("") + `</tbody></table>`
+      : `<div class="empty">No markets passed the filters</div>`;
+    document.querySelectorAll("tr[data-sym]").forEach(tr =>
+      tr.addEventListener("click", () => {
+        localStorage.setItem("kt.symbol", tr.dataset.sym);
+        location.href = "/";
+      }));
+  } catch (e) {
+    $("content").innerHTML = `<div class="empty">Scan failed: ${e.message}</div>`;
+  } finally {
+    $("refresh-btn").disabled = false;
+  }
+}
+
+$("refresh-btn").addEventListener("click", load);
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
