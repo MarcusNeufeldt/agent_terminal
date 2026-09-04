@@ -42,8 +42,10 @@ class ProtectionContext:
 
     def get_orders(self):
         return [
-            {"symbol": "PF_EGLDUSD", "orderType": "take_profit", "reduceOnly": True, "order_id": "tp-1"},
-            {"symbol": "PF_EGLDUSD", "orderType": "stop", "reduceOnly": True, "order_id": "sl-1"},
+            {"symbol": "PF_EGLDUSD", "side": "buy", "orderType": "take_profit", "reduceOnly": True,
+             "order_id": "tp-1", "size": 644.41, "unfilledSize": 644.41, "stopPrice": 4.622, "triggerSignal": "mark"},
+            {"symbol": "PF_EGLDUSD", "side": "buy", "orderType": "stop", "reduceOnly": True,
+             "order_id": "sl-1", "size": 644.41, "unfilledSize": 644.41, "stopPrice": 4.715, "triggerSignal": "mark"},
         ]
 
     def instrument(self, _symbol):
@@ -71,7 +73,9 @@ class LongProtectionContext(ProtectionContext):
 
 
 class FakeTradingClient:
-    def post(self, _path, **_kwargs):
+    def post(self, path, **_kwargs):
+        if path == "/sendorder":
+            return {"result": "success", "sendStatus": {"status": "placed", "order_id": "fake-order"}}
         return {"result": "success"}
 
 
@@ -87,6 +91,43 @@ class SequentialProtectionContext(LongProtectionContext):
     def _after_action(self, action, result, _armed):
         if action["type"] == "close" and result.get("ok"):
             self.size = result["remainingSize"]
+
+
+class ProtectionScriptClient:
+    def __init__(self, responses):
+        self.responses = {path: list(values) for path, values in responses.items()}
+        self.calls = []
+
+    def post(self, path, params=None, **_kwargs):
+        self.calls.append((path, params))
+        value = self.responses[path].pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class ProtectionExecutionContext:
+    def __init__(self, client, orders):
+        self.client = client
+        self.orders = orders
+        self.alerts = []
+        self.cleared = []
+        self.after_action = None
+        self.refresh_orders = lambda: None
+        self.set_protection_alert = lambda symbol, kind, details: self.alerts.append((symbol, kind, details))
+        self.clear_protection_alert = lambda symbol, kind: self.cleared.append((symbol, kind))
+
+    def get_positions(self):
+        return [{"symbol": "PF_TESTUSD", "side": "long", "size": 10, "price": 90}]
+
+    def get_orders(self):
+        return self.orders
+
+    def instrument(self, _symbol):
+        return {"tickSize": 0.1, "contractValueTradePrecision": 0}
+
+    def mark_price(self, _symbol):
+        return Decimal("100")
 
 
 class ScannerClient:
@@ -443,28 +484,165 @@ class RobustnessTests(unittest.TestCase):
                 {"type": ""},
             ])
 
+    @staticmethod
+    def _open_tp(**changes):
+        order = {
+            "symbol": "PF_TESTUSD", "side": "sell", "orderType": "take_profit",
+            "reduceOnly": True, "order_id": "tp-1", "cliOrdId": f"{MANAGED_TP_PREFIX}PF_TESTUSD-old",
+            "size": 10, "unfilledSize": 10, "stopPrice": 120, "triggerSignal": "mark",
+        }
+        order.update(changes)
+        return order
+
+    def test_protection_edit_uses_exact_id_and_preserves_exchange_id(self):
+        client = ProtectionScriptClient({
+            "/editorder": [{"result": "success", "editStatus": {"status": "edited", "orderId": "tp-1"}}],
+        })
+        ctx = ProtectionExecutionContext(client, [self._open_tp()])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "orderId": "tp-1",
+        }], ctx, True)[0]
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["edited"])
+        self.assertEqual(result["orderId"], "tp-1")
+        self.assertEqual(client.calls, [("/editorder", {"orderId": "tp-1", "size": 10.0, "stopPrice": 125.0})])
+
+    def test_protection_edit_rejection_leaves_original_order_working(self):
+        client = ProtectionScriptClient({
+            "/editorder": [{"result": "success", "editStatus": {"status": "invalidSize"}}],
+        })
+        ctx = ProtectionExecutionContext(client, [self._open_tp()])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "orderId": "tp-1",
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["originalWorking"])
+        self.assertEqual([path for path, _params in client.calls], ["/editorder"])
+        self.assertEqual(ctx.alerts, [])
+
+    def test_edit_not_found_without_original_order_sets_unprotected_alert(self):
+        client = ProtectionScriptClient({
+            "/editorder": [{"result": "success", "editStatus": {"status": "orderForEditNotFound"}}],
+        })
+        ctx = ProtectionExecutionContext(client, [self._open_tp()])
+        reads = iter(([self._open_tp()], []))
+        ctx.get_orders = lambda: next(reads)
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "orderId": "tp-1",
+        }], ctx, True)[0]
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(ctx.alerts[0][0:2], ("PF_TESTUSD", "TP"))
+
+    def test_exact_partial_tp_drag_preserves_size_and_other_ladder_orders(self):
+        partial = self._open_tp(unfilledSize=4, size=4)
+        other = self._open_tp(order_id="tp-2", cliOrdId="manual-tp-2", unfilledSize=6, size=6, stopPrice=130)
+        ctx = ProtectionExecutionContext(Mock(), [partial, other])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 126,
+            "orderId": "tp-1", "preserveSize": True,
+        }], ctx, False)[0]
+        self.assertTrue(result["simulated"])
+        self.assertEqual(result["editParams"], {"orderId": "tp-1", "size": 4.0, "stopPrice": 126.0})
+        ambiguous = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 126,
+        }], ctx, False)[0]
+        self.assertFalse(ambiguous["ok"])
+        self.assertIn("ladder", ambiguous["error"])
+
+    def test_cancel_recreate_rolls_back_previous_protection_on_known_rejection(self):
+        target = self._open_tp(order_id=None)
+        client = ProtectionScriptClient({
+            "/cancelorder": [{"result": "success", "cancelStatus": {"status": "cancelled"}}],
+            "/sendorder": [
+                {"result": "success", "sendStatus": {"status": "insufficientAvailableFunds"}},
+                {"result": "success", "sendStatus": {"status": "placed", "order_id": "rollback-1"}},
+            ],
+        })
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rolledBack"])
+        self.assertEqual([path for path, _params in client.calls], ["/cancelorder", "/sendorder", "/sendorder"])
+        self.assertEqual(ctx.alerts, [])
+
+    def test_cancel_timeout_with_original_still_open_never_sends_replacement(self):
+        target = self._open_tp(order_id=None)
+        client = ProtectionScriptClient({"/cancelorder": [TimeoutError("timed out")]})
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["originalWorking"])
+        self.assertEqual([path for path, _params in client.calls], ["/cancelorder"])
+
+    def test_unknown_replacement_is_reconciled_before_any_rollback(self):
+        target = self._open_tp(order_id=None)
+        client = ProtectionScriptClient({
+            "/cancelorder": [{"result": "success", "cancelStatus": {"status": "cancelled"}}],
+            "/sendorder": [TimeoutError("timed out")],
+            "/orders/status": [{"result": "success", "orders": []}],
+        })
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual([path for path, _params in client.calls], ["/cancelorder", "/sendorder", "/orders/status"])
+        self.assertEqual(ctx.alerts[0][0:2], ("PF_TESTUSD", "TP"))
+
+    def test_rollback_failure_persists_unprotected_alert(self):
+        target = self._open_tp(order_id=None)
+        rejected = {"result": "success", "sendStatus": {"status": "insufficientAvailableFunds"}}
+        client = ProtectionScriptClient({
+            "/cancelorder": [{"result": "success", "cancelStatus": {"status": "cancelled"}}],
+            "/sendorder": [rejected, rejected],
+        })
+        ctx = ProtectionExecutionContext(client, [target])
+        result = execute_actions([{
+            "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "cliOrdId": target["cliOrdId"],
+        }], ctx, True)[0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["unprotected"])
+        self.assertEqual(ctx.alerts[0][0:2], ("PF_TESTUSD", "TP"))
+
+    def test_unprotected_alert_is_persistent_until_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.set_protection_alert("PF_TESTUSD", "TP", {"message": "rollback failed"})
+            alerts = db.protection_alerts()
+            db.clear_protection_alert("PF_TESTUSD", "TP")
+            cleared = db.protection_alerts()
+            db._conn.close()
+        self.assertEqual(alerts[0]["status"], "UNPROTECTED")
+        self.assertEqual(alerts[0]["details"]["message"], "rollback failed")
+        self.assertEqual(cleared, [])
+
     def test_tp_and_sl_replace_only_the_same_protection_type(self):
         ctx = ProtectionContext()
         tp = _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.622}, ctx, "take_profit")
         sl = _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.715}, ctx, "stp")
-        self.assertEqual(tp["cancelOrderIds"], [{"order_id": "tp-1"}])
-        self.assertEqual(sl["cancelOrderIds"], [{"order_id": "sl-1"}])
+        self.assertEqual(tp["orderId"], "tp-1")
+        self.assertEqual(sl["orderId"], "sl-1")
+        self.assertEqual(tp["editParams"], {"orderId": "tp-1", "size": 644.41, "stopPrice": 4.622})
+        self.assertEqual(sl["editParams"], {"orderId": "sl-1", "size": 644.41, "stopPrice": 4.715})
         self.assertEqual(tp["order"]["orderType"], "take_profit")
         self.assertEqual(sl["order"]["orderType"], "stp")
-        self.assertTrue(tp["order"]["cliOrdId"].startswith(MANAGED_TP_PREFIX))
 
     def test_managed_full_tp_resizes_after_position_growth(self):
         positions = [{"symbol": "PF_ENAUSD", "side": "long", "size": 20626}]
         managed = {
             "symbol": "PF_ENAUSD", "orderType": "take_profit", "reduceOnly": True,
-            "cliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1", "unfilledSize": 10313,
-            "stopPrice": 0.17296,
+            "cliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1", "order_id": "managed-tp",
+            "unfilledSize": 10313, "stopPrice": 0.17296,
         }
         actions = managed_protection_sync_actions(positions, [managed])
         self.assertEqual(actions, [{
             "type": "replace_tp", "symbol": "PF_ENAUSD", "stopPrice": 0.17296,
             "managed": True, "syncFromSize": 10313.0, "syncToSize": 20626.0,
-            "sourceCliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1",
+            "orderId": "managed-tp", "sourceCliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-1",
         }])
         self.assertEqual(managed_protection_sync_actions(positions, [{**managed, "unfilledSize": 20626}]), [])
         legacy = {**managed, "cliOrdId": "", "order_id": "legacy-tp"}

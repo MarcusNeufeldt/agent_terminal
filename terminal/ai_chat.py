@@ -460,12 +460,13 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_tp",
-            "description": "Replace take-profit order(s) with one managed full-position TP. It auto-resizes after later position changes. IMMEDIATE.",
+            "description": "Edit an exact take-profit by orderId, or edit/create the only unambiguous managed full-position TP. IMMEDIATE.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string"},
                     "stopPrice": {"type": "number", "description": "New TP trigger price"},
+                    "orderId": {"type": "string", "description": "Exact exchange order ID from the live snapshot"},
                 },
                 "required": ["symbol", "stopPrice"],
             },
@@ -475,12 +476,13 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_sl",
-            "description": "Replace stop-loss order(s) with one managed full-position SL. It auto-resizes after later position changes. IMMEDIATE.",
+            "description": "Edit an exact stop-loss by orderId, or edit/create the only unambiguous managed full-position SL. IMMEDIATE.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string"},
                     "stopPrice": {"type": "number", "description": "New stop-loss trigger price"},
+                    "orderId": {"type": "string", "description": "Exact exchange order ID from the live snapshot"},
                 },
                 "required": ["symbol", "stopPrice"],
             },

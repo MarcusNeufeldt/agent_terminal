@@ -10,10 +10,12 @@ export default function HeaderBar() {
   const soundOn = useStore(s => s.soundOn);
   const positions = useStore(s => s.positions);
   const chases = useStore(s => s.chases);
+  const protectionAlerts = useStore(s => s.protectionAlerts);
   const toggleSound = useStore(s => s.toggleSound);
   const t = tickers[symbol] || {};
   const ch = t.change24h !== undefined ? Number(t.change24h) : null;
   const chaseAlert = Object.values(chases || {}).find(chase => ["unknown", "orphaned"].includes(chase.status));
+  const protectionAlert = Object.values(protectionAlerts || {})[0];
   // worst LIQ distance across open positions (percent)
   let risk = null;
   for (const p of positions) {
@@ -49,6 +51,15 @@ export default function HeaderBar() {
       <button id="bell-btn" className={"h-action" + (soundOn ? "" : " off")} title={soundOn ? "Fill sound on — click to mute" : "Fill sound muted — click to enable"} onClick={toggleSound}>
         {soundOn ? "🔔" : "🔕"}
       </button>
+      {protectionAlert && (
+        <button
+          className="risk-chip crit"
+          title={protectionAlert.details?.message || "Protection could not be confirmed"}
+          onClick={() => useStore.getState().toast(`${protectionAlert.kind} protection for ${protectionAlert.symbol} is not confirmed.`, "err", 15000)}
+        >
+          ⚠ UNPROTECTED {protectionAlert.symbol} {protectionAlert.kind}
+        </button>
+      )}
       {chaseAlert && (
         <button
           className="risk-chip crit"

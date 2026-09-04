@@ -4,6 +4,7 @@
 import { create } from "zustand";
 import { api, RES_SECONDS } from "./api";
 import { formatContractSize, normalizeContractSize } from "./size-precision";
+import { buildProtectionAction } from "./protection-action";
 
 let chart = null; // chart controller (set by ChartPanel on mount)
 let audioCtx = null;
@@ -45,6 +46,7 @@ const useStore = create((set, get) => ({
   sortBy: localStorage.getItem("kt.sortby") || "vol24",
   volLoading: false,
   chases: {},
+  protectionAlerts: {},
   toasts: [],
   lastExecution: null,
   chartSource: "",
@@ -54,7 +56,7 @@ const useStore = create((set, get) => ({
     chart = controller;
     window.__chart = controller; // debug handle
     if (controller) {
-      controller.onTpDrop = (symbol, price) => get().adjustProtection(symbol, "tp", price).then(() => get().applyOverlayLines());
+      controller.onTpDrop = ({ symbol, price, order }) => get().adjustProtection(symbol, "tp", price, null, order).then(() => get().applyOverlayLines());
       controller.onProtectionDrop = ({ symbol, kind, price, pnl }) => get().adjustProtection(symbol, kind, price, pnl).then(() => get().applyOverlayLines());
       controller.onOrderCancel = order => get().cancelChartOrder(order);
     }
@@ -138,7 +140,7 @@ const useStore = create((set, get) => ({
     get().refreshSignal();
   },
 
-  async adjustProtection(symbol, kind, stopPrice, previewPnl = null) {
+  async adjustProtection(symbol, kind, stopPrice, previewPnl = null, order = null) {
     const label = kind === "sl" ? "Stop loss" : "Take profit";
     let pnl = Number(previewPnl);
     if (!Number.isFinite(pnl)) {
@@ -153,8 +155,8 @@ const useStore = create((set, get) => ({
     const pnlText = Number.isFinite(pnl) ? ` (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })})` : "";
     if (get().armed && !confirm(`${label} ${symbol} at ${fmt(stopPrice)}${pnlText}?\n\nThis will change a LIVE reduce-only protection order.`)) return false;
     try {
-      const actionType = kind === "sl" ? "replace_sl" : "replace_tp";
-      const r = await api("/api/action", { method: "POST", body: { actions: [{ type: actionType, symbol, stopPrice }] } });
+      const action = buildProtectionAction(kind, symbol, stopPrice, order);
+      const r = await api("/api/action", { method: "POST", body: { actions: [action] } });
       const res = (r.results || [])[0] || {};
       if (res.error) { get().toast(`${label} failed: ${res.error}`, "err"); return false; }
       if (res.simulated) { get().toast(`${label} simulated — terminal is disarmed, nothing sent.`, "warn"); return false; }
@@ -281,7 +283,7 @@ const useStore = create((set, get) => ({
           overlays.push({
             price: o.stopPrice, color: isTp ? "#26a69a" : "#ef5350", dashed: true,
             title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) · ${coverage}%`,
-            ...(isTp ? { tp: { symbol, entry: Number(pos.price), size: positionSize, mult, dir, tick, fullPosition: orderSize === positionSize } } : {}),
+            ...(isTp ? { tp: { symbol, entry: Number(pos.price), size: coveredSize, mult, dir, tick, fullPosition: orderSize === positionSize, order } } : {}),
             ...(order ? { order } : {}),
           });
         } else {
@@ -680,6 +682,17 @@ const useStore = create((set, get) => ({
   onChaseEvent(c) {
     if (!c || !c.id) return;
     set(s => ({ chases: { ...s.chases, [c.id]: { ...c, updated: Date.now() } } }));
+  },
+
+  onProtectionAlert(alert) {
+    if (!alert?.symbol || !alert?.kind) return;
+    const key = `${alert.symbol}:${alert.kind}`;
+    set(s => {
+      const protectionAlerts = { ...s.protectionAlerts };
+      if (alert.status === "RESTORED") delete protectionAlerts[key];
+      else protectionAlerts[key] = alert;
+      return { protectionAlerts };
+    });
   },
 
   async resetChat() {

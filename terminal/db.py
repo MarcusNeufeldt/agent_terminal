@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL,
     payload TEXT
 );
+CREATE TABLE IF NOT EXISTS protection_alerts (
+    symbol TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, kind)
+);
 """
 
 
@@ -296,6 +304,39 @@ class Database:
                 if order_id:
                     latest[(str(action.get("symbol") or ""), kind)] = str(order_id)
         return set(latest.values())
+
+    # ---- persistent protection alerts ----
+
+    def set_protection_alert(self, symbol: str, kind: str, payload: Any) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO protection_alerts (symbol, kind, status, payload, updated_at) VALUES (?, ?, 'UNPROTECTED', ?, ?) "
+                "ON CONFLICT(symbol, kind) DO UPDATE SET status = excluded.status, payload = excluded.payload, updated_at = excluded.updated_at",
+                (symbol, kind, json.dumps(payload, default=str), _now()),
+            )
+            self._conn.commit()
+
+    def clear_protection_alert(self, symbol: str, kind: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM protection_alerts WHERE symbol = ? AND kind = ?", (symbol, kind))
+            self._conn.commit()
+
+    def protection_alerts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT symbol, kind, status, payload, updated_at FROM protection_alerts ORDER BY updated_at DESC"
+            ).fetchall()
+        alerts = []
+        for row in rows:
+            try:
+                details = json.loads(row["payload"] or "{}")
+            except json.JSONDecodeError:
+                details = {"message": str(row["payload"] or "")}
+            alerts.append({
+                "symbol": row["symbol"], "kind": row["kind"], "status": row["status"],
+                "details": details, "updatedAt": row["updated_at"],
+            })
+        return alerts
 
     # ---- events ----
 

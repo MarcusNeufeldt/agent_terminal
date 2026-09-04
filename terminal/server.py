@@ -343,6 +343,20 @@ def _publish_chase(kind: str, payload: dict[str, Any]) -> None:
     sse.publish(kind, payload)
 
 
+def _set_protection_alert(symbol: str, kind: str, details: dict[str, Any]) -> None:
+    payload = {"symbol": symbol, "kind": kind, "status": "UNPROTECTED", "details": details}
+    db.set_protection_alert(symbol, kind, details)
+    db.log_event("protection_alert", payload)
+    sse.publish("protection_alert", payload)
+
+
+def _clear_protection_alert(symbol: str, kind: str) -> None:
+    db.clear_protection_alert(symbol, kind)
+    payload = {"symbol": symbol, "kind": kind, "status": "RESTORED"}
+    db.log_event("protection_alert", payload)
+    sse.publish("protection_alert", payload)
+
+
 chase_manager = chase_mod.ChaseManager(_publish_chase)
 binance_klines = binance_ws_mod.BinanceKlineStream(hub, sse.publish)
 binance_klines.start()
@@ -389,9 +403,34 @@ def _start_chase_if_armed(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 action_ctx.start_chase = _start_chase_if_armed
+action_ctx.refresh_orders = lambda: cache.drop("orders")
+action_ctx.set_protection_alert = _set_protection_alert
+action_ctx.clear_protection_alert = _clear_protection_alert
 action_ctx.after_action = _refresh_after_action
 _legacy_managed_protection_ids = db.inferred_managed_protection_ids()
 _protection_sync_due: dict[tuple[Any, ...], float] = {}
+
+
+def _reconcile_protection_alerts(positions: list[dict[str, Any]], orders: list[dict[str, Any]]) -> None:
+    if any(row.get("error") for row in positions + orders if isinstance(row, dict)):
+        return
+    by_symbol = {str(position.get("symbol")): position for position in positions if position.get("symbol")}
+    for alert in db.protection_alerts():
+        symbol, kind = alert["symbol"], alert["kind"]
+        position = by_symbol.get(symbol)
+        if not position or not (_as_float(position.get("size")) or 0) > 0:
+            _clear_protection_alert(symbol, kind)
+            continue
+        accepted_types = {"take_profit"} if kind == "TP" else {"stp", "stop"}
+        coverage = sum(
+            _as_float(order.get("unfilledSize") if order.get("unfilledSize") is not None else order.get("size")) or 0
+            for order in orders
+            if str(order.get("symbol") or "") == symbol
+            and str(order.get("orderType") or "").lower() in accepted_types
+            and str(order.get("reduceOnly")).lower() == "true"
+        )
+        if coverage >= (_as_float(position.get("size")) or 0):
+            _clear_protection_alert(symbol, kind)
 
 
 def _managed_protection_loop() -> None:
@@ -400,12 +439,14 @@ def _managed_protection_loop() -> None:
         time.sleep(2.5)
         with arm_lock:
             is_armed = armed
-        if not is_armed:
-            _protection_sync_due.clear()
-            continue
         try:
+            positions, orders = get_positions(), get_orders()
+            _reconcile_protection_alerts(positions, orders)
+            if not is_armed:
+                _protection_sync_due.clear()
+                continue
             candidates = trading_actions.managed_protection_sync_actions(
-                get_positions(), get_orders(), _legacy_managed_protection_ids,
+                positions, orders, _legacy_managed_protection_ids,
             )
             now = time.monotonic()
             active_keys = {
@@ -757,6 +798,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._send_json({"session": {"id": session["id"], "title": session["title"], "summary": bool(session["summary"])}, "messages": msgs})
             elif path == "/api/chase":
                 self._send_json({"chases": chase_manager.list()})
+            elif path == "/api/protection/alerts":
+                self._send_json({"alerts": db.protection_alerts()})
             elif path == "/api/debug/threads":
                 import sys as _sys
                 import threading as _threading

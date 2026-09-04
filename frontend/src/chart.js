@@ -21,7 +21,7 @@ export class ChartController {
     this.riskLines = [];
     this.orderButtons = [];
     this._listeners = null;
-    this.onTpDrop = null; // set by the store: (symbol, newPrice) => Promise<boolean>
+    this.onTpDrop = null; // set by the store: ({ symbol, price, order }) => Promise<boolean>
     this.onProtectionDrop = null; // set by the store: ({symbol, kind, price, pnl}) => Promise<boolean>
     this.onOrderCancel = null; // set by the store: (order) => Promise<boolean>
   }
@@ -379,7 +379,7 @@ export class ChartController {
       }
       return;
     }
-    if (t.price !== t.origPrice && this.onTpDrop) this.onTpDrop(t.symbol, t.price);
+    if (t.price !== t.origPrice && this.onTpDrop) this.onTpDrop({ symbol: t.symbol, price: t.price, order: t.order });
   }
 
   onPrice(last, prev) {

@@ -148,7 +148,11 @@ Load configuration first, then derive `PORT` and create the Kraken client. Keep 
 
 ## Priority 2: recoverable TP/SL replacement
 
-Current manual and managed protection replacement does:
+**Status: DONE**
+
+Exact-ID protection changes now use Kraken `editorder` and require `editStatus.status == "edited"`. Unsupported legacy targets use confirmed cancel/recreate with exact state preservation, known replacement rejection triggers rollback, and uncertain/failed recovery persists an audible `UNPROTECTED` alert until authoritative coverage returns. Verification passed 53 backend tests, 6 frontend tests, lint, build, browser alert checks, and a DISARMED restart with exact positions and order IDs unchanged. No live protection order was edited during deployment verification.
+
+Before this section was implemented, manual and managed protection replacement did:
 
 ```text
 cancel existing protection
@@ -171,14 +175,14 @@ A rejected or timed-out replacement can leave the position unprotected. The mana
 
 Dragging one TP currently sends only symbol and price. It must carry the exact order ID so one line cannot accidentally replace every same-type protection order.
 
-### Protection acceptance criteria
+### Protection acceptance criteria: DONE
 
-- A successful edit preserves the same exchange order ID and updates the requested trigger or size.
-- An edit rejection leaves the original protection working.
-- Cancel/recreate confirms each transition and restores the old order on replacement failure.
-- Rollback failure produces a persistent `UNPROTECTED` alert.
-- Partial ladders remain untouched.
-- Tests use fake clients and DISARMED contexts only.
+- [x] A successful edit preserves the same exchange order ID and updates the requested trigger or size.
+- [x] An edit rejection leaves the original protection working.
+- [x] Cancel/recreate confirms each transition and restores the old order on replacement failure.
+- [x] Rollback failure produces a persistent `UNPROTECTED` alert.
+- [x] Partial ladders remain untouched unless a user explicitly drags one exact ladder order, in which case its size is preserved.
+- [x] Tests use fake clients and DISARMED contexts only.
 
 ## Priority 3: converge write handling
 
