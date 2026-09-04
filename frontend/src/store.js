@@ -760,7 +760,8 @@ const useStore = create((set, get) => ({
       if (answer !== "ARM") { s.toast("Arm cancelled.", ""); return; }
     }
     try {
-      const r = await api("/api/arm", { method: "POST", body: { armed: true, confirm: "yes" } });
+      const { challenge } = await api("/api/arm/challenge");
+      const r = await api("/api/arm", { method: "POST", body: { armed: true, challenge } });
       set({ armed: !!r.armed });
       if (r.armed) s.toast("Order entry ARMED. Orders are now live.", "warn");
     } catch (e) { s.toast(`Arm failed: ${e.message}`, "err"); }

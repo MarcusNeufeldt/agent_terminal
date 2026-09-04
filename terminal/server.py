@@ -6,9 +6,9 @@ Stdlib-only HTTP server (ThreadingHTTPServer) serving:
   - SSE stream /api/stream fanning out live tickers, trades, and hub status
   - AI chat POST /api/chat (OpenRouter, live account/market context)
 
-Order safety: POST /api/order is SIMULATED until the terminal is armed via
-POST /api/arm {"armed": true}. Armed state lives in memory only; restarting
-the server always disarms.
+Order safety: every POST needs the per-process browser token and an exact local
+Origin. POST /api/order is SIMULATED until /api/arm consumes a one-time signed
+challenge. Armed state lives in memory only; restarting always disarms.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ import account_log  # noqa: E402
 import binance_candles  # noqa: E402
 import binance_ws as binance_ws_mod  # noqa: E402
 from actions import ActionContext  # noqa: E402
+from local_security import LocalSecurity, safe_static_path  # noqa: E402
 
 STATIC_DIR = HERE / "static"
 
@@ -51,6 +52,9 @@ STATIC_DIR = HERE / "static"
 load_env_file(HERE / ".env")
 load_env_file(Path(r"F:\explore\kraken-futures-cli") / ".env")
 PORT = int(os.getenv("PORT", "8787"))
+VITE_ORIGINS = tuple(filter(None, (value.strip().lower() for value in os.getenv("VITE_DEV_ORIGINS", "").split(","))))
+security = LocalSecurity(PORT, VITE_ORIGINS)
+DEBUG_ENDPOINTS = os.getenv("TERMINAL_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 
 client = KrakenFuturesClient.from_env()
 hub = MarketHub(client.base_url)
@@ -650,25 +654,27 @@ class TerminalHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(min(length, 1_000_000))
+    def _read_body(self) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > 1_000_000:
+            return None
+        raw = self.rfile.read(length)
         try:
             data = json.loads(raw.decode("utf-8"))
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
+            return data if isinstance(data, dict) else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
 
     def _serve_static(self, path: str) -> None:
         if path == "/":
             path = "/index.html"
         elif path == "/volatility":
             path = "/volatility.html"
-        rel = path.lstrip("/")
-        target = (STATIC_DIR / rel).resolve()
-        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
+        target = safe_static_path(STATIC_DIR, path)
+        if target is None:
             self._send_json({"error": "not found"}, 404)
             return
         content_types = {
@@ -680,6 +686,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
             ".json": "application/json",
         }
         body = target.read_bytes()
+        if target.suffix == ".html":
+            body = body.replace(b"__TERMINAL_TOKEN__", security.token.encode("ascii"))
         self.send_response(200)
         self.send_header("Content-Type", content_types.get(target.suffix, "application/octet-stream"))
         self.send_header("Content-Length", str(len(body)))
@@ -699,7 +707,17 @@ class TerminalHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            if path == "/api/health":
+            if path == "/api/session":
+                if not security.valid_host(self.headers):
+                    self._send_json({"error": "invalid Host"}, 403)
+                    return
+                self._send_json({"token": security.token})
+            elif path == "/api/arm/challenge":
+                if not security.valid_token(self.headers):
+                    self._send_json({"error": "invalid terminal token"}, 403)
+                    return
+                self._send_json({"challenge": security.issue_arm_challenge()})
+            elif path == "/api/health":
                 with arm_lock:
                     is_armed = armed
                 self._send_json({
@@ -789,7 +807,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._send_json({"chases": chase_manager.list()})
             elif path == "/api/protection/alerts":
                 self._send_json({"alerts": db.protection_alerts()})
-            elif path == "/api/debug/threads":
+            elif path == "/api/debug/threads" and DEBUG_ENDPOINTS:
                 import sys as _sys
                 import threading as _threading
                 import traceback as _tb
@@ -847,19 +865,29 @@ class TerminalHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        denied = security.validate_write(self.headers)
+        if denied:
+            status, message = denied
+            self.close_connection = True
+            self._send_json({"error": message}, status)
+            return
         body = self._read_body()
+        if body is None:
+            self.close_connection = True
+            self._send_json({"error": "request body must be a JSON object"}, 400)
+            return
         try:
             if path == "/api/arm":
                 want = bool(body.get("armed"))
-                confirm = str(body.get("confirm", "")).lower() == "yes"
+                challenge = str(body.get("challenge") or "")
                 with arm_lock:
                     global armed
-                    if want and not confirm:
+                    if want and not security.consume_arm_challenge(challenge):
                         self._send_json({
-                            "armed": False,
+                            "armed": armed,
                             "needsConfirm": True,
-                            "message": "Live order entry. Type ARM in the confirm box to enable real orders on this account.",
-                        })
+                            "message": "A fresh one-time arming challenge is required.",
+                        }, 403)
                         return
                     armed = want
                     state = armed

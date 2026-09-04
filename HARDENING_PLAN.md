@@ -219,19 +219,16 @@ The generic action path already rejects non-`placed` `sendStatus` values. It is 
 
 ## Priority 4: localhost write protection
 
-Binding to `127.0.0.1` is useful but not sufficient. The server currently parses JSON regardless of content type and does not validate `Origin`, `Host`, or a session token.
+**Status: DONE**
 
-Add:
+- [x] Every process creates a random token required by every POST.
+- [x] The production HTML receives the token at serve time; the Vite client can fetch it through its same-origin proxy.
+- [x] Writes require `Content-Type: application/json`, a JSON object body, an exact local `Host`, and an exact allowed `Origin`.
+- [x] Arming consumes a one-time HMAC challenge tied to the process token.
+- [x] Static file containment uses `Path.is_relative_to()`.
+- [x] `/api/debug/threads` requires `TERMINAL_DEBUG=true`.
 
-- A random per-process token required by every write endpoint.
-- Token injection into the served app and `X-Terminal-Token` on writes.
-- `Content-Type: application/json` enforcement.
-- Exact allowed `Origin` and `Host` checks, including the Vite development origin.
-- A one-time arming challenge tied to the process token.
-- `Path.is_relative_to()` for static path containment.
-- `/api/debug/threads` only when an explicit development flag is enabled.
-
-Read-only market endpoints may remain token-free. Tests should prove that cross-origin, wrong-host, missing-token, non-JSON, and replayed arming requests fail without changing ARM state.
+Verification passed 63 backend tests, 6 frontend tests, lint, build, a real-browser boot, and live HTTP rejection checks for cross-origin, wrong-host, missing/wrong token, non-JSON content, malformed JSON, invalid arming challenges, and disabled debug access. The terminal remained DISARMED and exact live positions and orders did not change.
 
 ## Priority 5: safe AI context compaction
 

@@ -22,6 +22,7 @@ from chase import ChaseManager, ChaseRejected, ChaseTransient, ChaseUnknown, Cha
 from db import Database
 from exchange_ops import ensure_client_id, parse_operation
 from kraken_client import KrakenFuturesClient, load_env_file
+from local_security import LocalSecurity, safe_static_path
 
 
 class FakeResponse:
@@ -941,6 +942,45 @@ class RobustnessTests(unittest.TestCase):
                 self.assertFalse(db.claim_action_proposal(session_id, message_id, 0, block))
             finally:
                 db._conn.close()
+
+    def test_local_write_security_rejects_bad_headers(self):
+        security = LocalSecurity(8787)
+        valid = {
+            "Host": "127.0.0.1:8787",
+            "Origin": "http://127.0.0.1:8787",
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Terminal-Token": security.token,
+        }
+        self.assertIsNone(security.validate_write(valid))
+        for key, value, status in (
+            ("Host", "evil.test", 403),
+            ("Origin", "https://evil.test", 403),
+            ("Content-Type", "text/plain", 415),
+            ("X-Terminal-Token", "wrong", 403),
+        ):
+            headers = {**valid, key: value}
+            self.assertEqual(security.validate_write(headers)[0], status)
+
+    def test_arm_challenge_is_tied_to_process_token_and_one_time(self):
+        security = LocalSecurity(8787)
+        challenge = security.issue_arm_challenge()
+        self.assertTrue(security.consume_arm_challenge(challenge))
+        self.assertFalse(security.consume_arm_challenge(challenge))
+        other_process = LocalSecurity(8787)
+        self.assertFalse(other_process.consume_arm_challenge(challenge))
+        expired = security.issue_arm_challenge(ttl_seconds=-1)
+        self.assertFalse(security.consume_arm_challenge(expired))
+
+    def test_static_path_must_remain_inside_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "static"
+            root.mkdir()
+            allowed = root / "index.html"
+            allowed.write_text("ok")
+            (parent / "secret.txt").write_text("no")
+            self.assertEqual(safe_static_path(root, "/index.html"), allowed.resolve())
+            self.assertIsNone(safe_static_path(root, "/../secret.txt"))
 
     @patch("ai_chat.time.sleep", return_value=None)
     @patch("ai_chat.requests.post")

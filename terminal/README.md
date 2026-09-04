@@ -25,12 +25,13 @@ npm run build        # production bundle -> ../terminal/static
 
 The original vanilla JS app is kept in `terminal/legacy/` for reference. `/volatility` remains a standalone page (`frontend/public/volatility.html`). Chart rendering is imperative lightweight-charts (v5) wrapped in one React component; state lives in a zustand store (`src/store.js`); SSE streams into the store.
 
-Kraken credentials load from `terminal/.env` or process environment variables. A local compatibility fallback checks the author's adjacent `kraken-futures-cli/.env` checkout when present. Copy `.env.example` to `.env`; never commit the populated file. Supported variables are `PORT`, `KRAKEN_FUTURES_API_KEY`, `KRAKEN_FUTURES_API_SECRET`, `KRAKEN_FUTURES_ENV=demo`, `AI_CHAT_MODEL` (default `google/gemini-3.8-flash` via OpenRouter), and `CHAT_CONTEXT_LIMIT` (default 200000 tokens).
+Kraken credentials load from `terminal/.env` or process environment variables. A local compatibility fallback checks the author's adjacent `kraken-futures-cli/.env` checkout when present. Copy `.env.example` to `.env`; never commit the populated file. Supported variables include `PORT`, the Kraken credentials and environment, `AI_CHAT_MODEL` (default `google/gemini-3.8-flash`), `CHAT_CONTEXT_LIMIT`, `VITE_DEV_ORIGINS`, and `TERMINAL_DEBUG`.
 
 ## Safety model
 
 - The terminal starts **DISARMED** on every server start. Disarmed, orders/cancels/chases return the exact dry-run plan without touching Kraken.
-- Arming requires clicking the sidebar button and typing `ARM`. Armed state is in-memory only.
+- Arming requires clicking the sidebar button and typing `ARM`. The server then consumes a one-time challenge signed with its per-process token. Armed state is in-memory only.
+- Every POST requires JSON, an exact local Host and Origin, and the per-process token injected into the served app. Restarting the server invalidates open tabs, so reload before the next write. `/api/debug/threads` exists only with `TERMINAL_DEBUG=true`.
 - The AI assistant reads everything itself (market data, positions, account, fills, contract specs, performance) and can also place orders directly through the same tools the Execute button uses - **all write tools are ARM-gated**: disarmed they return the exact plan simulated, armed they hit the live account. `propose_actions` cards (human clicks Execute) remain available for draft/plan requests; the chase engine stays propose-only.
 - Every submitted order receives a fresh server-generated client ID. Ticket, chart, action-card, AI, protection, and Chase writes share the same nested-status parser and report `simulated`, `confirmed`, `partial`, `rejected`, or `unknown` in `actions_log`.
 

@@ -1,8 +1,24 @@
+let terminalToken = typeof document === "undefined"
+  ? ""
+  : document.querySelector('meta[name="terminal-token"]')?.content || "";
+if (terminalToken.includes("__TERMINAL_TOKEN__")) terminalToken = "";
+
+async function getTerminalToken() {
+  if (terminalToken) return terminalToken;
+  const res = await fetch("/api/session", { cache: "no-store" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.token) throw new Error(data.error || "Could not start terminal session");
+  terminalToken = data.token;
+  return terminalToken;
+}
+
 export async function api(path, opts = {}) {
+  const token = await getTerminalToken();
+  const { body, headers, ...rest } = opts;
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    ...rest,
+    headers: { "Content-Type": "application/json", "X-Terminal-Token": token, ...headers },
+    body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
