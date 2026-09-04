@@ -529,9 +529,7 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
             return {"type": kind, "ok": True, "simulated": True,
                     "spec": spec,
                     "note": f"would peg {'best bid' if side == 'buy' else 'best ask'} (now {t.get('bid') if side == 'buy' else t.get('ask')}) and re-peg every {spec['repegSec']}s up to {spec['timeoutSec']}s"}
-        snap = ctx.chase.start(spec, ctx)
-        return {"type": kind, "ok": True, "chase": snap,
-                "note": f"chase {snap['id']} running — fills arrive as notifications"}
+        raise ActionError("live Chase is temporarily disabled pending reconciliation hardening")
 
     raise ActionError(f"unknown action type {kind!r}")
 

@@ -16,6 +16,13 @@ This document records the review findings that are worth acting on. It separates
 
 ## Priority 0: suspend live Chase
 
+**Status: IN PROGRESS**
+
+- [x] Disable live Chase in the ticket, direct endpoint, and armed action execution.
+- [x] Keep DISARMED action simulation available.
+- [x] Deploy the block with a restart to DISARMED and verify positions and exact order IDs are unchanged.
+- [ ] Replace Chase reconciliation and re-enable it only after every acceptance criterion passes.
+
 Live Chase should not be trusted until its reconciliation logic is replaced.
 
 ### Confirmed defects
@@ -29,9 +36,9 @@ Live Chase should not be trusted until its reconciliation logic is replaced.
 
 Kraken documents that root-level `result: "success"` only means the request was received and assessed. The nested operation status determines whether the operation happened.
 
-### Temporary change
+### Temporary change: DONE
 
-Disable live Chase in the ticket, `/api/chase`, and action execution. A DISARMED simulation may remain available. Explain in the UI that Chase is temporarily disabled pending reconciliation hardening.
+Live Chase is disabled in the ticket, `/api/chase`, and armed action execution. DISARMED action simulation remains available. The UI explains that Chase is temporarily disabled pending reconciliation hardening.
 
 ### Required Chase behavior
 

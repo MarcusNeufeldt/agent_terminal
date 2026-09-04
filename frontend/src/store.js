@@ -408,19 +408,8 @@ const useStore = create((set, get) => ({
     return body;
   },
 
-  async submitChase(side) {
-    const s = get();
-    const sizeEl = document.getElementById("in-size");
-    const size = Number(sizeEl ? sizeEl.value : NaN);
-    if (!Number.isFinite(size) || size <= 0) { get().toast("Enter a size.", "err"); return; }
-    if (!s.armed) { s.toast("CHASE requires an armed terminal — arm it first.", "warn"); return; }
-    try {
-      const r = await api("/api/chase", { method: "POST", body: { symbol: s.symbol, side, size } });
-      const c = r.chase;
-      s.toast(`Chase ${c.id} running: ${side} ${fmt(size)} ${s.symbol} — pegging best ${side === "buy" ? "bid" : "ask"} (max 300s). Fills will ping.`, "ok", 9000);
-    } catch (e) {
-      s.toast(`Chase failed: ${e.message}`, "err");
-    }
+  async submitChase() {
+    get().toast("Live Chase is temporarily disabled pending reconciliation hardening.", "warn", 8000);
   },
 
   async closePosition(symbol) {

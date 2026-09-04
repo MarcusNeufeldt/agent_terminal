@@ -3,7 +3,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import account_log
 import ai_chat
@@ -99,6 +100,22 @@ class ScannerClient:
 
 
 class RobustnessTests(unittest.TestCase):
+    def test_live_chase_is_disabled_while_simulation_remains_available(self):
+        manager = Mock()
+        ctx = SimpleNamespace(
+            chase=manager,
+            hub=SimpleNamespace(ticker=lambda _symbol: {"bid": 1.0, "ask": 1.1}),
+            get_ticker_rest=lambda _symbol: None,
+            after_action=None,
+        )
+        action = {"type": "chase", "symbol": "PF_TESTUSD", "side": "buy", "size": 10}
+        simulated = execute_actions([action], ctx, False)[0]
+        rejected = execute_actions([action], ctx, True)[0]
+        self.assertTrue(simulated["simulated"])
+        self.assertFalse(rejected["ok"])
+        self.assertIn("temporarily disabled", rejected["error"])
+        manager.start.assert_not_called()
+
     def test_missing_action_type_is_repaired_for_order_payload(self):
         raw = [{"symbol": "PF_ETHUSD", "side": "buy", "orderType": "post", "size": 1, "limitPrice": 2000}]
         normalized = normalize_actions(raw)

@@ -837,26 +837,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
             elif path == "/api/chat":
                 self._handle_chat(body)
             elif path == "/api/chase":
-                with arm_lock:
-                    is_armed = armed
-                if not is_armed:
-                    self._send_json({"error": "chase requires an ARMED terminal (it places real orders)"}, 400)
-                    return
-                symbol = str(body.get("symbol", "")).strip().upper()
-                side = str(body.get("side", "")).strip().lower()
-                size = _as_float(body.get("size"))
-                if not symbol or side not in {"buy", "sell"} or not size or size <= 0:
-                    self._send_json({"error": "symbol, side (buy|sell) and positive size required"}, 400)
-                    return
-                spec = {
-                    "symbol": symbol, "side": side, "size": size,
-                    "timeoutSec": float(body.get("timeoutSec") or 300),
-                    "maxRepegs": int(body.get("maxRepegs") or 120),
-                    "repegSec": float(body.get("repegSec") or 5),
-                    "offsetTicks": int(body.get("offsetTicks") or 0),
-                }
-                hub.watch([symbol])
-                self._send_json({"chase": chase_manager.start(spec, action_ctx)})
+                self._send_json({"error": "live Chase is temporarily disabled pending reconciliation hardening"}, 503)
             elif path == "/api/chase/abort":
                 self._send_json(chase_manager.abort(str(body.get("chaseId", ""))))
             elif path == "/api/chat/note":

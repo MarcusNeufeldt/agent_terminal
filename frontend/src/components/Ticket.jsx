@@ -2,6 +2,8 @@ import { useEffect } from "react";
 import { fmt } from "../api";
 import useStore from "../store";
 
+const CHASE_ENABLED = false;
+
 export default function Ticket() {
   const symbol = useStore(s => s.symbol);
   const otype = useStore(s => s.otype);
@@ -64,7 +66,7 @@ export default function Ticket() {
       <div className="ticket-body">
         <div className="ord-tabs">
           {[["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["stp", "Stop"], ["take_profit", "Take profit"], ["chase", "Chase"]].map(([v, label]) => (
-            <button key={v} className={"ord-tab" + (otype === v ? " active" : "")} data-otype={v} onClick={() => setOtype(v)} title={v === "chase" ? "Post-only order that re-pegs to best bid/ask until filled — maker fees" : ""}>{label}</button>
+            <button key={v} className={"ord-tab" + (otype === v ? " active" : "")} data-otype={v} onClick={() => setOtype(v)} disabled={v === "chase" && !CHASE_ENABLED} title={v === "chase" ? "Temporarily disabled pending reconciliation hardening" : ""}>{label}</button>
           ))}
         </div>
         {isLimit && (
@@ -103,12 +105,12 @@ export default function Ticket() {
           <label htmlFor="in-reduce">Reduce-only</label>
         </div>
         <div className="side-btns">
-          <button id="btn-buy" onClick={() => submitOrder("buy")}>{otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
-          <button id="btn-sell" onClick={() => submitOrder("sell")}>{otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
+          <button id="btn-buy" disabled={isChase && !CHASE_ENABLED} onClick={() => submitOrder("buy")}>{otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
+          <button id="btn-sell" disabled={isChase && !CHASE_ENABLED} onClick={() => submitOrder("sell")}>{otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
         </div>
         <div className="ticket-note" style={{ color: isChase ? (armed ? "var(--accent)" : "var(--muted)") : (armed ? "var(--red)" : "var(--muted)") }}>
           {isChase
-            ? (armed ? "CHASE: rests post-only at best bid/ask and re-pegs until filled (max 300s). Maker fees." : "CHASE requires an armed terminal.")
+            ? (!CHASE_ENABLED ? "CHASE is temporarily disabled pending reconciliation hardening." : armed ? "CHASE: rests post-only at best bid/ask and re-pegs until filled (max 300s). Maker fees." : "CHASE requires an armed terminal.")
             : (armed ? `LIVE: orders go straight to Kraken (${window.__env || "live"}).` : "SIMULATION: arm the terminal to send real orders.")}
         </div>
       </div>

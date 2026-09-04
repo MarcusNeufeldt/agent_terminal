@@ -59,7 +59,7 @@ Backed by OpenRouter (key from `~/.pi/agent/auth.json`) with **native tool calli
 
 ## Chase engine (`chase.py`)
 
-Post-only limit orders that rest at best bid (buy) / best ask (sell) and re-peg as the market moves until filled, timeout, or max re-pegs. Partial fills are preserved across re-pegs; post-only rejections (would-cross) step a tick more passive. One thread per chase, status broadcast over SSE, fills ping the bell. Requires an armed terminal. Also available from the CLI: `python -m kraken_futures_cli chase SYMBOL buy|sell SIZE [--chase-timeout --repeg --max-repegs --offset --no-wait --json --terminal]`.
+Live Chase is temporarily disabled while placement, cancellation, fill reconciliation, disarm, and restart recovery are hardened. The intended mode uses post-only limit orders that rest at best bid (buy) / best ask (sell) and re-peg as the market moves until filled, timeout, or max re-pegs. Also available from the CLI: `python -m kraken_futures_cli chase SYMBOL buy|sell SIZE [--chase-timeout --repeg --max-repegs --offset --no-wait --json --terminal]`.
 
 ## Persistence (`db.py`, SQLite WAL — `terminal.db`)
 
