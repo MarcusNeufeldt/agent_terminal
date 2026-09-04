@@ -46,11 +46,11 @@ import binance_ws as binance_ws_mod  # noqa: E402
 from actions import ActionContext  # noqa: E402
 
 STATIC_DIR = HERE / "static"
-PORT = int(os.getenv("PORT", "8787"))
 
-# Load credentials: local .env first, then the kraken-futures-cli .env.
+# Load configuration before reading PORT or constructing clients.
 load_env_file(HERE / ".env")
 load_env_file(Path(r"F:\explore\kraken-futures-cli") / ".env")
+PORT = int(os.getenv("PORT", "8787"))
 
 client = KrakenFuturesClient.from_env()
 hub = MarketHub(client.base_url)

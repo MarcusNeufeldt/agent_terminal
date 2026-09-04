@@ -3,6 +3,7 @@
 
 import { create } from "zustand";
 import { api, RES_SECONDS } from "./api";
+import { formatContractSize, normalizeContractSize } from "./size-precision";
 
 let chart = null; // chart controller (set by ChartPanel on mount)
 let audioCtx = null;
@@ -389,8 +390,11 @@ const useStore = create((set, get) => ({
   ticketPayload(side) {
     const s = get();
     const sizeEl = document.getElementById("in-size");
-    const size = Number(sizeEl ? sizeEl.value : NaN);
-    if (!Number.isFinite(size) || size <= 0) { get().toast("Enter a size.", "err"); return null; }
+    const rawSize = Number(sizeEl ? sizeEl.value : NaN);
+    const inst = s.instruments.find(i => i.symbol === s.symbol) || {};
+    const size = normalizeContractSize(rawSize, inst.contractValueTradePrecision ?? 0);
+    if (!Number.isFinite(size) || size <= 0) { get().toast("Enter a size that meets the contract lot size.", "err"); return null; }
+    if (sizeEl) sizeEl.value = formatContractSize(size, inst.contractValueTradePrecision ?? 0);
     const body = { symbol: s.symbol, side, orderType: s.otype, size };
     if (["lmt", "post", "ioc"].includes(s.otype)) {
       const lp = Number(document.getElementById("in-limit") ? document.getElementById("in-limit").value : NaN);
@@ -502,11 +506,12 @@ const useStore = create((set, get) => ({
     s.toast(`${toastLead} — ${lines.join(" · ")}`, sim ? "warn" : allFailed ? "err" : "ok", 9000);
 
     await new Promise(res => setTimeout(res, 900));
-    await s.refreshTables();
-    const afterIds = new Set(s.orders.map(o => o.cliOrdId || o.order_id || o.orderId).filter(Boolean));
+    await get().refreshTables();
+    const freshOrders = get().orders;
+    const afterIds = new Set(freshOrders.map(o => o.cliOrdId || o.order_id || o.orderId).filter(Boolean));
     const orderType = value => String(value || "").toLowerCase() === "stop" ? "stp" : String(value || "").toLowerCase();
     const sigOf = o => JSON.stringify([o.symbol, o.side, orderType(o.orderType), o.limitPrice ?? null, o.stopPrice ?? null]);
-    const afterSigs = new Set(s.orders.filter(o => !o.error).map(sigOf));
+    const afterSigs = new Set(freshOrders.filter(o => !o.error).map(sigOf));
     const rows = [];
     const needsFills = !sim && results.some((res, i) => {
       const a = res.order ? { ...res.order, type: res.type } : (executed[i] || {});
@@ -765,9 +770,8 @@ const useStore = create((set, get) => ({
     const isInverse = inst.type === "futures_inverse";
     const notional = avail * (pct / 100) * s.lev;
     const size = isInverse ? notional / mult : notional / (mult * Number(t.last));
-    const prec = Math.max(0, Math.min(8, Number(inst.contractValueTradePrecision ?? 2)));
     const el = document.getElementById("in-size");
-    if (el) el.value = size.toFixed(prec);
+    if (el) el.value = formatContractSize(size, inst.contractValueTradePrecision ?? 2);
   },
 
   updatePositionCells() { /* positions render live from the store in React */ },

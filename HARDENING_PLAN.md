@@ -84,7 +84,11 @@ Rules:
 
 ## Priority 1: confirmed correctness fixes
 
-These are small defects and should be fixed together with focused tests.
+**Status: DONE**
+
+Implemented and deployed with 28 passing backend tests, 4 passing frontend tests, a clean frontend lint run apart from pre-existing vendored warnings, and a successful production build. The server restarted DISARMED with unchanged positions and exact order IDs.
+
+These were small confirmed defects and were fixed together with focused tests.
 
 ### Websocket fallback
 
@@ -131,14 +135,14 @@ Add one frontend size-normalization helper that supports positive and negative p
 
 Load configuration first, then derive `PORT` and create the Kraken client. Keep restart-to-DISARMED. Do not add another live-startup phrase or change the default environment as part of this fix.
 
-### Correctness-fix acceptance criteria
+### Correctness-fix acceptance criteria: DONE
 
-- Vendored websocket fallback starts without the adjacent CLI checkout.
-- Demo history requests target `demo-futures.kraken.com`.
-- A concurrency test produces no duplicate nonces.
-- Action verification reads the refreshed Zustand state.
-- Negative precision rounds to the same quantity in the UI and backend.
-- `PORT` from `terminal/.env` is honored.
+- [x] Vendored websocket fallback starts without the adjacent CLI checkout.
+- [x] Demo history requests target `demo-futures.kraken.com`.
+- [x] A 200-request concurrency test produces no duplicate nonces.
+- [x] Action verification reads the refreshed Zustand state.
+- [x] Negative precision rounds to the same quantity in the UI and backend.
+- [x] Configuration loads before `PORT` is read, with a source-order regression test.
 
 ## Priority 2: recoverable TP/SL replacement
 

@@ -1,19 +1,23 @@
+import base64
 import json
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import account_log
 import ai_chat
+import market_hub
 import scanner
 from actions import (
     MANAGED_TP_PREFIX, ActionError, _replace_protection_plan,
     execute_actions, managed_protection_sync_actions, normalize_actions,
 )
 from db import Database
+from kraken_client import KrakenFuturesClient, load_env_file
 
 
 class FakeResponse:
@@ -100,6 +104,66 @@ class ScannerClient:
 
 
 class RobustnessTests(unittest.TestCase):
+    def test_websocket_fallback_imports_connection_type(self):
+        with patch.object(market_hub.Path, "exists", return_value=False):
+            open_socket, connection_type, endpoint = market_hub._import_upstream()
+        self.assertTrue(callable(open_socket))
+        self.assertTrue(callable(connection_type))
+        self.assertTrue(callable(endpoint))
+
+    def test_demo_account_log_uses_client_base_url(self):
+        requested = []
+
+        class Client:
+            base_url = "https://demo-futures.kraken.com"
+
+            @staticmethod
+            def _auth_headers_for_path(_path, _params):
+                return {}
+
+        class Response:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            @staticmethod
+            def read():
+                return b'{"logs": []}'
+
+        def open_url(req, timeout):
+            requested.append((req.full_url, timeout))
+            return Response()
+
+        with patch.object(account_log.request, "urlopen", side_effect=open_url):
+            account_log._get(Client(), "/api/history/v2/account-log", "count=1")
+        self.assertEqual(requested, [("https://demo-futures.kraken.com/api/history/v2/account-log?count=1", 30)])
+
+    def test_private_request_nonces_are_unique_under_concurrency(self):
+        secret = base64.b64encode(b"nonce-test-secret").decode()
+        client = KrakenFuturesClient(api_key="key", api_secret=secret)
+        with patch("kraken_client.time.time", return_value=1000.0):
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                nonces = list(pool.map(lambda _: client._auth_headers_for_path("/api/v3/openorders", "")["Nonce"], range(200)))
+        values = [int(nonce) for nonce in nonces]
+        self.assertEqual(len(set(values)), 200)
+        self.assertEqual(min(values), 1_000_000)
+        self.assertEqual(max(values), 1_000_199)
+
+    def test_server_loads_env_before_reading_port(self):
+        source = (Path(__file__).parent / "server.py").read_text(encoding="utf-8")
+        self.assertLess(source.index('load_env_file(HERE / ".env")'), source.index('PORT = int(os.getenv("PORT"'))
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text("PORT=9123\n", encoding="utf-8")
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertTrue(load_env_file(env_file))
+                import os
+                self.assertEqual(int(os.getenv("PORT", "8787")), 9123)
+
     def test_live_chase_is_disabled_while_simulation_remains_available(self):
         manager = Mock()
         ctx = SimpleNamespace(

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { fmt } from "../api";
+import { formatContractSize } from "../size-precision";
 import useStore from "../store";
 
 const CHASE_ENABLED = false;
@@ -38,7 +39,7 @@ export default function Ticket() {
       const isInverse = inst.type === "futures_inverse";
       return isInverse ? Number(inst.contractSize || 1) : Number(inst.contractSize || 1) * price();
     };
-    const prec = () => Math.max(0, Math.min(8, Number((useStore.getState().instruments.find(i => i.symbol === symbol) || {}).contractValueTradePrecision ?? 2)));
+    const prec = () => Number((useStore.getState().instruments.find(i => i.symbol === symbol) || {}).contractValueTradePrecision ?? 2);
     const syncEquiv = () => {
       const n = Number(sizeEl.value || 0);
       const m = mult();
@@ -48,7 +49,7 @@ export default function Ticket() {
     const syncSize = () => {
       const usd = Number(usdEl.value || 0);
       const m = mult();
-      if (usd > 0 && m > 0) sizeEl.value = String(Number((usd / m).toFixed(prec())));
+      if (usd > 0 && m > 0) sizeEl.value = formatContractSize(usd / m, prec());
       syncEquiv();
     };
     usdEl.addEventListener("input", syncSize);
