@@ -16,6 +16,7 @@ Vite proxies API and websocket traffic to the backend.
 ## Checks and production build
 
 ```bash
+npm test
 npm run lint
 npm run build
 ```

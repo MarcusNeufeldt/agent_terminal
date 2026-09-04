@@ -17,6 +17,7 @@ export default function ChartPanel({ source }) {
   const unbindChart = useStore(s => s.unbindChart);
   const [note, setNote] = useState("");
   const [signal, setSignal] = useState(null);
+  const [riskEnabled, setRiskEnabled] = useState(() => localStorage.getItem("kt.riskEnabled") === "1");
 
   useEffect(() => {
     const ctrl = new ChartController();
@@ -35,6 +36,13 @@ export default function ChartPanel({ source }) {
       .catch(() => setSignal(null));
   }, [symbol, instruments]);
 
+  useEffect(() => { ctrlRef.current?.setRiskEnabled(riskEnabled); }, [riskEnabled]);
+
+  const toggleRisk = () => {
+    const enabled = !riskEnabled;
+    localStorage.setItem("kt.riskEnabled", enabled ? "1" : "0");
+    setRiskEnabled(enabled);
+  };
   const side = signal && signal.side ? signal.side : "";
 
   return (
@@ -43,6 +51,14 @@ export default function ChartPanel({ source }) {
         {TIMEFRAMES.map(r => (
           <button key={r} className={"tf-btn" + (r === res ? " active" : "")} onClick={() => setRes(r)}>{r}</button>
         ))}
+        <button
+          className={"risk-toggle" + (riskEnabled ? " active" : "")}
+          aria-pressed={riskEnabled}
+          title="Show 1:1, 1:2, and 1:3 mirrored loss lines for the take profit"
+          onClick={toggleRisk}
+        >
+          RISK {riskEnabled ? "ON" : "OFF"}
+        </button>
         <span
           className={"ema-badge" + (side ? " " + side : "")}
           title={signal && signal.price !== undefined ? `price ${fmt(signal.price)} · ema${signal.fast} ${fmt(signal.emaFast)} · ema${signal.slow} ${fmt(signal.emaSlow)}` : "EMA trend signal on closed 1m mark candles"}

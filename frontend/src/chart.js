@@ -2,6 +2,7 @@
    store drives it — charting never goes through React's render cycle. */
 
 import * as LightweightCharts from "lightweight-charts";
+import { mirroredRisk } from "./risk-preview";
 
 export class ChartController {
   constructor(onNote) {
@@ -16,6 +17,8 @@ export class ChartController {
     this._handleRaf = 0;
     this._protection = null;
     this._protectionHandle = null;
+    this._riskEnabled = false;
+    this.riskLines = [];
     this.orderButtons = [];
     this._listeners = null;
     this.onTpDrop = null; // set by the store: (symbol, newPrice) => Promise<boolean>
@@ -86,6 +89,13 @@ export class ChartController {
     this.candleSeries.applyOptions({ priceFormat: { type: "price", precision: decimals, minMove: tick } });
   }
 
+  setRiskEnabled(enabled) {
+    this._riskEnabled = Boolean(enabled);
+    if (!this._riskEnabled) this._clearRiskLines();
+    else if (this._drag) this._updateRiskLines(this._drag, this._drag.tick || 0.01);
+    else this._renderIdleRiskLines();
+  }
+
   setData(candles) {
     if (!this.candleSeries) return;
     this.candleSeries.setData(candles.map(c => ({ time: c[0], open: c[1], high: c[2], low: c[3], close: c[4] })));
@@ -115,6 +125,7 @@ export class ChartController {
     this.priceLines = [];
     this.overlayPrices = [];
     this.tpLines = [];
+    this.riskLines = [];
     this._drag = null;
     this._setProtection(null);
   }
@@ -137,6 +148,7 @@ export class ChartController {
       if (o.position) protection = o.position;
     }
     this._setProtection(protection);
+    this._renderIdleRiskLines();
   }
 
   _bindTpDrag(container) {
@@ -227,6 +239,7 @@ export class ChartController {
 
   _protectionDown(e) {
     if (e.button !== 0 || !this._protection || !this.candleSeries) return;
+    this._clearRiskLines();
     const p = this._protection;
     const line = this.candleSeries.createPriceLine({
       price: p.entry, color: "#f0b90b", lineWidth: 2,
@@ -260,6 +273,7 @@ export class ChartController {
     if (e.target?.closest?.(".chart-protection-handle, .chart-order-cancel")) return;
     const t = this._tpHit(e);
     if (!t) return;
+    this._clearRiskLines();
     this._drag = { ...t, mode: "tp", kind: "tp" };
     e.stopPropagation();
     e.preventDefault();
@@ -273,6 +287,51 @@ export class ChartController {
 
   _tpDecimals(tick) {
     return Math.max(0, Math.min(10, Math.ceil(-Math.log10(tick || 0.01) - 1e-9)));
+  }
+
+  _clearRiskLines() {
+    if (!this.candleSeries || !this.riskLines.length) return;
+    const removed = new Set(this.riskLines);
+    for (const line of this.riskLines) { try { this.candleSeries.removePriceLine(line); } catch {} }
+    this.priceLines = this.priceLines.filter(line => !removed.has(line));
+    this.riskLines = [];
+    if (this._drag) this._drag.riskLines = [];
+    for (const tp of this.tpLines) tp.riskLines = [];
+  }
+
+  _renderIdleRiskLines() {
+    if (!this._riskEnabled || this._drag || !this.tpLines.length) return;
+    const t = this.tpLines.find(tp => tp.fullPosition) || (this.tpLines.length === 1 ? this.tpLines[0] : null);
+    if (!t) return;
+    t.pnl = t.dir * (t.price - t.entry) * t.size * (t.mult || 1);
+    this._updateRiskLines(t, t.tick || 0.01);
+  }
+
+  _updateRiskLines(t, tick) {
+    if (!this._riskEnabled || !(t.pnl > 0) || !this.candleSeries) {
+      this._clearRiskLines();
+      return;
+    }
+    if (!t.riskLines?.length) {
+      this._clearRiskLines();
+      t.riskLines = [1, 2, 3].map(() => this.candleSeries.createPriceLine({
+        color: "#ef5350", lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true,
+      }));
+      this.riskLines = t.riskLines;
+      this.priceLines.push(...t.riskLines);
+    }
+    for (const [index, ratio] of [1, 2, 3].entries()) {
+      const risk = mirroredRisk({
+        entry: t.entry, target: t.price, dir: t.dir, ratio,
+        tick, size: t.size, mult: t.mult || 1,
+      });
+      const loss = Math.abs(risk.pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      t.riskLines[index].applyOptions({
+        price: risk.price,
+        title: `RISK ${risk.price.toFixed(this._tpDecimals(tick))} (-$${loss}) · 1:${ratio}`,
+      });
+    }
   }
 
   _applyDragY(y) {
@@ -289,6 +348,7 @@ export class ChartController {
     const type = t.kind === "sl" ? "SL" : t.kind === "tp" ? "TP" : "BE";
     const color = t.kind === "sl" ? "#ef5350" : t.kind === "tp" ? "#26a69a" : "#f0b90b";
     t.line.applyOptions({ price: t.price, color, lineWidth: 2, title: `${type} ${t.price.toFixed(dec)} (${label})` });
+    this._updateRiskLines(t, tick);
   }
 
   _tpDragMove(e) {
@@ -306,6 +366,7 @@ export class ChartController {
     if (!t) return;
     if (this._dragRaf) { cancelAnimationFrame(this._dragRaf); this._dragRaf = 0; }
     if (e?.clientY !== undefined) this._applyDragY(this._tpY(e));
+    if (t.mode === "protection") this._clearRiskLines();
     this._drag = null;
     this._protectionHandle?.classList.remove("dragging");
     this.chart.applyOptions({ handleScroll: true, handleScale: true });

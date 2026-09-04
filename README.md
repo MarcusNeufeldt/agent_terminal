@@ -10,7 +10,7 @@ A self-hosted Kraken Futures trading terminal with live market data, chart-based
 - Kraken Futures positions, orders, fills, margin, and account history
 - Binance USDT-M candles for charting, with Kraken as the trading authority
 - Market, limit, post-only, stop, take-profit, ladder, and chase orders
-- Draggable TP/SL controls with confirmation and actual protection coverage
+- Draggable TP/SL controls with confirmation, actual protection coverage, and persistent 1:1/1:2/1:3 mirrored loss lines
 - Managed full-position TP/SL resizing after confirmed position-size changes
 - React 19 workspace with lightweight-charts, Zustand, and Markdown chat
 - OpenRouter assistant with audited read and ARM-gated write tools
@@ -89,6 +89,7 @@ cd terminal
 python -m unittest -v
 
 cd ../frontend
+npm test
 npm run lint
 npm run build
 ```

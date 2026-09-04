@@ -280,7 +280,7 @@ const useStore = create((set, get) => ({
           overlays.push({
             price: o.stopPrice, color: isTp ? "#26a69a" : "#ef5350", dashed: true,
             title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) · ${coverage}%`,
-            ...(isTp ? { tp: { symbol, entry: Number(pos.price), size: positionSize, mult, dir, tick } } : {}),
+            ...(isTp ? { tp: { symbol, entry: Number(pos.price), size: positionSize, mult, dir, tick, fullPosition: orderSize === positionSize } } : {}),
             ...(order ? { order } : {}),
           });
         } else {

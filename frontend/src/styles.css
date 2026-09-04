@@ -191,8 +191,15 @@ body.right-collapsed #root { grid-template-columns: 232px minmax(0, 1fr) 36px; }
 }
 .tf-btn:hover { color: var(--text); }
 .tf-btn.active { background: var(--panel2); color: var(--text); }
+.risk-toggle {
+  margin-left: auto; padding: 3px 7px; border-radius: 3px;
+  border: 1px solid var(--border2); background: none;
+  color: var(--muted); font: 9px var(--mono); cursor: pointer;
+}
+.risk-toggle:hover { color: var(--text); }
+.risk-toggle.active { color: var(--red); border-color: rgba(239, 83, 80, 0.65); background: rgba(239, 83, 80, 0.08); }
 .ema-badge {
-  margin-left: auto; font-size: 11px; font-family: var(--mono);
+  margin-left: 4px; font-size: 11px; font-family: var(--mono);
   padding: 3px 9px; border-radius: 3px; border: 1px solid var(--border2); color: var(--text);
 }
 .ema-badge.long { color: var(--green); border-color: var(--green); }
