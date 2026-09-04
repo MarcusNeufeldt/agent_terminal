@@ -2,6 +2,8 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
+const apiTarget = 'http://127.0.0.1:8787'
+
 // Build output is served by the Python terminal server (server.py) from
 // terminal/static/. In dev, /api is proxied to the running terminal.
 export default defineConfig({
@@ -12,7 +14,11 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:8787',
+      '/api': {
+        target: apiTarget,
+        changeOrigin: true,
+        headers: { Origin: apiTarget },
+      },
     },
   },
 })

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/api.test.js src/risk-preview.test.js src/size-precision.test.js src/protection-action.test.js src/chart-overlays.test.js src/vela-provider.test.js src/vela-overlays.test.js",
+    "test": "node --test src/api.test.js src/risk-preview.test.js src/size-precision.test.js src/protection-action.test.js src/chart-overlays.test.js src/vela-provider.test.js src/vela-overlays.test.js src/vite-config.test.js",
     "lint": "oxlint",
     "preview": "vite preview"
   },
