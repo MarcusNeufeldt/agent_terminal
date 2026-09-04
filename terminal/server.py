@@ -335,9 +335,18 @@ action_ctx = ActionContext(
     get_instruments=get_instruments,
     get_ticker_rest=get_ticker_rest,
 )
-chase_manager = chase_mod.ChaseManager(sse.publish)
+db = db_mod.Database()
+
+
+def _publish_chase(kind: str, payload: dict[str, Any]) -> None:
+    db.log_event("chase", payload)
+    sse.publish(kind, payload)
+
+
+chase_manager = chase_mod.ChaseManager(_publish_chase)
 binance_klines = binance_ws_mod.BinanceKlineStream(hub, sse.publish)
 binance_klines.start()
+
 
 def _equity_snapshot_loop() -> None:
     # Record portfolio value every 30s so the equity curve includes open PnL.
@@ -353,10 +362,34 @@ def _equity_snapshot_loop() -> None:
             pass
         time.sleep(30)
 
+
+def _detect_orphan_chases() -> None:
+    try:
+        orders = get_orders()
+        failed = next((order.get("error") for order in orders if order.get("error")), None)
+        if failed:
+            db.log_event("chase_orphan_scan", {"ok": False, "error": str(failed)[:300]})
+            return
+        found = chase_manager.recover(db.latest_chase_snapshots(), orders)
+        db.log_event("chase_orphan_scan", {"ok": True, "count": len(found)})
+    except Exception as exc:
+        db.log_event("chase_orphan_scan", {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]})
+
+
 threading.Thread(target=_equity_snapshot_loop, name="equity-snapshots", daemon=True).start()
+threading.Thread(target=_detect_orphan_chases, name="chase-orphan-scan", daemon=True).start()
 action_ctx.chase = chase_manager
+
+
+def _start_chase_if_armed(spec: dict[str, Any]) -> dict[str, Any]:
+    with arm_lock:
+        if not armed:
+            raise trading_actions.ActionError("chase requires an ARMED terminal")
+        return chase_manager.start(spec, action_ctx)
+
+
+action_ctx.start_chase = _start_chase_if_armed
 action_ctx.after_action = _refresh_after_action
-db = db_mod.Database()
 _legacy_managed_protection_ids = db.inferred_managed_protection_ids()
 _protection_sync_due: dict[tuple[Any, ...], float] = {}
 
@@ -798,9 +831,10 @@ class TerminalHandler(BaseHTTPRequestHandler):
                         return
                     armed = want
                     state = armed
+                aborting = chase_manager.abort_all() if not state else {"requested": [], "completed": [], "pending": []}
                 sse.publish("armed", {"armed": state})
-                db.log_event("arm", {"armed": state, "env": "demo" if client.is_demo else "live"})
-                self._send_json({"armed": state, "env": "demo" if client.is_demo else "live"})
+                db.log_event("arm", {"armed": state, "env": "demo" if client.is_demo else "live", "abortingChases": aborting})
+                self._send_json({"armed": state, "env": "demo" if client.is_demo else "live", "abortingChases": aborting})
             elif path == "/api/order":
                 params, error = validate_order_params(body)
                 if error:
@@ -837,7 +871,33 @@ class TerminalHandler(BaseHTTPRequestHandler):
             elif path == "/api/chat":
                 self._handle_chat(body)
             elif path == "/api/chase":
-                self._send_json({"error": "live Chase is temporarily disabled pending reconciliation hardening"}, 503)
+                symbol = str(body.get("symbol", "")).strip().upper()
+                side = str(body.get("side", "")).strip().lower()
+                size = _as_float(body.get("size"))
+                if not symbol.startswith("PF_") or side not in {"buy", "sell"} or not size or size <= 0:
+                    self._send_json({"error": "PF_ symbol, side (buy|sell), and positive size required"}, 400)
+                    return
+                try:
+                    spec = {
+                        "symbol": symbol, "side": side, "size": size,
+                        "timeoutSec": float(body.get("timeoutSec") or 300),
+                        "maxRepegs": int(body.get("maxRepegs") or 120),
+                        "repegSec": max(1.0, float(body.get("repegSec") or 5)),
+                        "offsetTicks": max(0, int(body.get("offsetTicks") or 0)),
+                    }
+                except (TypeError, ValueError):
+                    self._send_json({"error": "invalid Chase timing parameters"}, 400)
+                    return
+                if spec["timeoutSec"] <= 0 or spec["maxRepegs"] <= 0:
+                    self._send_json({"error": "Chase timeoutSec and maxRepegs must be positive"}, 400)
+                    return
+                hub.watch([symbol])
+                try:
+                    snapshot = _start_chase_if_armed(spec)
+                except trading_actions.ActionError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                self._send_json({"chase": snapshot})
             elif path == "/api/chase/abort":
                 self._send_json(chase_manager.abort(str(body.get("chaseId", ""))))
             elif path == "/api/chat/note":

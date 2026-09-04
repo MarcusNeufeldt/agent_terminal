@@ -1,9 +1,11 @@
 import base64
 import json
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,6 +18,7 @@ from actions import (
     MANAGED_TP_PREFIX, ActionError, _replace_protection_plan,
     execute_actions, managed_protection_sync_actions, normalize_actions,
 )
+from chase import ChaseManager, ChaseRejected, ChaseTransient, ChaseUnknown, ChaseWorker
 from db import Database
 from kraken_client import KrakenFuturesClient, load_env_file
 
@@ -104,6 +107,251 @@ class ScannerClient:
 
 
 class RobustnessTests(unittest.TestCase):
+    @staticmethod
+    def _chase_worker(client):
+        context = SimpleNamespace(
+            client=client,
+            get_instruments=lambda: {"instruments": [{"symbol": "PF_TESTUSD", "tickSize": 0.1, "contractValueTradePrecision": 0}]},
+            get_ticker_rest=lambda _symbol: {"bid": 10, "ask": 11},
+            hub=SimpleNamespace(ticker=lambda _symbol: {"bid": 10, "ask": 11}),
+        )
+        spec = {"symbol": "PF_TESTUSD", "side": "buy", "size": 10, "settlePollSec": 0, "visibilityGraceSec": 0}
+        return ChaseWorker(spec, context, lambda *_args: None)
+
+    def test_chase_rejects_nested_placement_failure(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {"result": "success", "sendStatus": {"status": "postWouldExecute"}})
+        worker = self._chase_worker(client)
+        worker.pegs = 1
+        with self.assertRaises(ChaseRejected):
+            worker._place(Decimal("10"), Decimal("10"))
+        self.assertIsNone(worker._active)
+
+    def test_chase_placed_without_exchange_id_is_unknown_and_not_retried(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {"result": "success", "sendStatus": {"status": "placed"}})
+        worker = self._chase_worker(client)
+        worker.pegs = 1
+        with self.assertRaises(ChaseUnknown):
+            worker._place(Decimal("10"), Decimal("10"))
+        self.assertIsNotNone(worker._active)
+        self.assertIsNone(worker._active["orderId"])
+
+    def test_chase_missing_order_without_full_fill_is_unknown(self):
+        def get(path, **_kwargs):
+            return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": []}
+
+        worker = self._chase_worker(SimpleNamespace(get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseUnknown):
+            worker._reconcile_resting()
+        self.assertEqual(worker.filled, 0)
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_open_order_read_failure_leaves_order_untouched(self):
+        def get(*_args, **_kwargs):
+            raise RuntimeError("temporary read failure")
+
+        worker = self._chase_worker(SimpleNamespace(get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseTransient):
+            worker._reconcile_resting()
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_cancel_failure_never_clears_active_order(self):
+        def post(*_args, **_kwargs):
+            raise RuntimeError("cancel timed out")
+
+        worker = self._chase_worker(SimpleNamespace(post=post))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseUnknown):
+            worker._cancel_active()
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_nested_cancel_failure_never_clears_active_order(self):
+        client = SimpleNamespace(post=lambda *_args, **_kwargs: {
+            "result": "success", "cancelStatus": {"status": "notFound"},
+        })
+        worker = self._chase_worker(client)
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        with self.assertRaises(ChaseUnknown):
+            worker._cancel_active()
+        self.assertIsNotNone(worker._active)
+
+    def test_chase_reconciles_late_fill_after_confirmed_cancel(self):
+        def post(path, **_kwargs):
+            if path == "/orders/status":
+                return {"result": "success", "orders": [{
+                    "status": "CANCELLED", "order": {"orderId": "order-1", "filled": 3},
+                }]}
+            return {"result": "success", "cancelStatus": {"status": "cancelled", "order_id": "order-1"}}
+
+        def get(path, **_kwargs):
+            if path == "/openorders":
+                return {"result": "success", "openOrders": []}
+            return {"result": "success", "fills": [{"order_id": "order-1", "size": 3}]}
+
+        worker = self._chase_worker(SimpleNamespace(post=post, get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 1, "placedAt": 0}
+        worker._cancel_active()
+        self.assertEqual(worker.filled, 3)
+        self.assertEqual(worker._base_filled, 3)
+        self.assertIsNone(worker._active)
+        self.assertEqual(worker.state, "RECONCILED")
+
+    def test_chase_timeout_after_partial_fill_reports_partial(self):
+        def post(path, **_kwargs):
+            if path == "/orders/status":
+                return {"result": "success", "orders": [{
+                    "status": "CANCELLED", "order": {"orderId": "order-1", "filled": 3},
+                }]}
+            return {"result": "success", "cancelStatus": {"status": "cancelled"}}
+
+        def get(path, **_kwargs):
+            return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": [{"order_id": "order-1", "size": 3}]}
+
+        worker = self._chase_worker(SimpleNamespace(post=post, get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 1, "placedAt": 0}
+        worker._stop_after_cancel("timeout")
+        self.assertEqual(worker.status, "partial")
+        self.assertEqual(worker.stop_reason, "timeout")
+        self.assertEqual(worker.filled, 3)
+
+    def test_chase_full_execution_requires_authoritative_order_status(self):
+        def post(path, **_kwargs):
+            self.assertEqual(path, "/orders/status")
+            return {"result": "success", "orders": [{
+                "status": "FULLY_EXECUTED", "order": {"orderId": "order-1", "filled": 10},
+            }]}
+
+        def get(path, **_kwargs):
+            return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": [{"order_id": "order-1", "size": 10}]}
+
+        worker = self._chase_worker(SimpleNamespace(post=post, get=get))
+        worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
+        self.assertTrue(worker._reconcile_resting())
+        self.assertEqual(worker.filled, 10)
+        self.assertIsNone(worker._active)
+
+    def test_chase_rejects_size_below_contract_lot_without_placing(self):
+        client = Mock()
+        worker = self._chase_worker(client)
+        worker.ctx.get_instruments = lambda: {"instruments": [{
+            "symbol": "PF_TESTUSD", "tickSize": 0.1, "contractValueTradePrecision": -2,
+        }]}
+        worker.spec["size"] = 10
+        worker.run()
+        self.assertEqual(worker.status, "rejected")
+        client.post.assert_not_called()
+
+    def test_chase_replaces_only_after_cancel_and_uses_reconciled_remaining_size(self):
+        class Client:
+            def __init__(self):
+                self.send_count = 0
+                self.open_count = 0
+                self.write_calls = []
+
+            def post(self, path, params=None, **_kwargs):
+                if path == "/sendorder":
+                    self.send_count += 1
+                    self.write_calls.append(("send", params["size"]))
+                    return {"result": "success", "sendStatus": {"status": "placed", "order_id": f"order-{self.send_count}"}}
+                if path == "/cancelorder":
+                    self.write_calls.append(("cancel", params["cliOrdId"]))
+                    return {"result": "success", "cancelStatus": {"status": "cancelled"}}
+                order_id = f"order-{self.send_count}"
+                filled = 3 if order_id == "order-1" else 7
+                status = "CANCELLED" if order_id == "order-1" else "FULLY_EXECUTED"
+                return {"result": "success", "orders": [{"status": status, "order": {"orderId": order_id, "filled": filled}}]}
+
+            def get(self, path, **_kwargs):
+                if path == "/openorders":
+                    self.open_count += 1
+                    if self.open_count == 1:
+                        return {"result": "success", "openOrders": [{"order_id": "order-1", "filledSize": 2, "unfilledSize": 8}]}
+                    return {"result": "success", "openOrders": []}
+                order_id = f"order-{self.send_count}"
+                size = 3 if order_id == "order-1" else 7
+                return {"result": "success", "fills": [{"order_id": order_id, "size": size}]}
+
+        client = Client()
+        worker = self._chase_worker(client)
+        bids = iter((10, 9))
+        worker.ctx.hub.ticker = lambda _symbol: {"bid": next(bids, 9), "ask": 11}
+        worker.spec.update({"repegSec": 0.01, "timeoutSec": 2})
+        worker.run()
+        self.assertEqual(worker.status, "filled")
+        self.assertEqual(client.write_calls[0], ("send", 10.0))
+        self.assertEqual(client.write_calls[1][0], "cancel")
+        self.assertEqual(client.write_calls[2], ("send", 7.0))
+
+    def test_disarm_aborts_cancels_and_reconciles_running_worker(self):
+        placed = threading.Event()
+
+        class Client:
+            def post(self, path, params=None, **_kwargs):
+                if path == "/sendorder":
+                    placed.set()
+                    return {"result": "success", "sendStatus": {"status": "placed", "order_id": "order-1"}}
+                if path == "/cancelorder":
+                    return {"result": "success", "cancelStatus": {"status": "cancelled"}}
+                return {"result": "success", "orders": [{"status": "CANCELLED", "order": {"orderId": "order-1", "filled": 0}}]}
+
+            def get(self, path, **_kwargs):
+                return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": []}
+
+        manager = ChaseManager(lambda *_args: None)
+        worker = self._chase_worker(Client())
+        worker.spec.update({"repegSec": 1, "timeoutSec": 10})
+        manager._chases[worker.id] = worker
+        worker.start()
+        self.assertTrue(placed.wait(1))
+        report = manager.abort_all(wait_timeout=2)
+        self.assertEqual(report["requested"], [worker.id])
+        self.assertEqual(report["pending"], [])
+        self.assertEqual(report["completed"][0]["status"], "aborted")
+
+    def test_disarm_reports_a_worker_that_did_not_finish(self):
+        manager = ChaseManager(lambda *_args: None)
+        worker = Mock(status="running", id="active")
+        worker.is_alive.return_value = True
+        manager._chases["active"] = worker
+        report = manager.abort_all(wait_timeout=0)
+        self.assertEqual(report["requested"], ["active"])
+        self.assertEqual(len(report["pending"]), 1)
+        worker.abort.assert_called_once_with()
+
+    def test_startup_orphan_detection_is_read_only_and_visible(self):
+        published = []
+        manager = ChaseManager(lambda kind, payload: published.append((kind, payload)))
+        found = manager.detect_orphans([{
+            "cliOrdId": "ch-old-1", "order_id": "order-1", "symbol": "PF_TESTUSD",
+            "side": "buy", "filledSize": 2, "unfilledSize": 8,
+        }])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["status"], "orphaned")
+        self.assertEqual(manager.list()[0]["activeOrderId"], "order-1")
+        self.assertEqual(published[0][0], "chase")
+
+    def test_startup_recovers_unfinished_sqlite_chase_without_exchange_mutation(self):
+        manager = ChaseManager(lambda *_args: None)
+        recovered = manager.recover([{
+            "id": "old-worker", "symbol": "PF_TESTUSD", "side": "buy", "size": 10,
+            "status": "running", "activeCliOrdId": "ch-old-2", "activeOrderId": "order-2",
+        }], [])
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["status"], "unknown")
+        self.assertIn("SQLite", recovered[0]["events"][0])
+
+    def test_latest_chase_snapshot_is_persisted_by_chase_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.log_event("chase", {"id": "c1", "status": "running"})
+            db.log_event("chase", {"id": "c1", "status": "filled"})
+            db.log_event("chase", {"id": "c2", "status": "unknown"})
+            latest = {item["id"]: item for item in db.latest_chase_snapshots()}
+            db._conn.close()
+        self.assertEqual(latest["c1"]["status"], "filled")
+        self.assertEqual(latest["c2"]["status"], "unknown")
+
     def test_websocket_fallback_imports_connection_type(self):
         with patch.object(market_hub.Path, "exists", return_value=False):
             open_socket, connection_type, endpoint = market_hub._import_upstream()
@@ -164,21 +412,23 @@ class RobustnessTests(unittest.TestCase):
                 import os
                 self.assertEqual(int(os.getenv("PORT", "8787")), 9123)
 
-    def test_live_chase_is_disabled_while_simulation_remains_available(self):
+    def test_chase_simulates_disarmed_and_starts_reconciled_worker_armed(self):
         manager = Mock()
+        manager.start.return_value = {"id": "chase-1", "status": "running"}
         ctx = SimpleNamespace(
             chase=manager,
+            start_chase=None,
             hub=SimpleNamespace(ticker=lambda _symbol: {"bid": 1.0, "ask": 1.1}),
             get_ticker_rest=lambda _symbol: None,
             after_action=None,
         )
         action = {"type": "chase", "symbol": "PF_TESTUSD", "side": "buy", "size": 10}
         simulated = execute_actions([action], ctx, False)[0]
-        rejected = execute_actions([action], ctx, True)[0]
+        live = execute_actions([action], ctx, True)[0]
         self.assertTrue(simulated["simulated"])
-        self.assertFalse(rejected["ok"])
-        self.assertIn("temporarily disabled", rejected["error"])
-        manager.start.assert_not_called()
+        self.assertTrue(live["ok"])
+        self.assertEqual(live["chase"]["id"], "chase-1")
+        manager.start.assert_called_once()
 
     def test_missing_action_type_is_repaired_for_order_payload(self):
         raw = [{"symbol": "PF_ETHUSD", "side": "buy", "orderType": "post", "size": 1, "limitPrice": 2000}]

@@ -15,6 +15,11 @@ export async function bootTerminal() {
   }
 
   try {
+    const data = await api("/api/chase");
+    for (const chase of data.chases || []) useStore.getState().onChaseEvent(chase);
+  } catch (e) {}
+
+  try {
     const inst = await api("/api/instruments");
     useStore.setState({ instruments: (inst.instruments || []).filter(i => i.tradeable !== false) });
   } catch (e) {}
@@ -77,7 +82,7 @@ export async function bootTerminal() {
       if (c.status && c.status !== "running") {
         useStore.getState().toast(
           `Chase ${c.id} ${c.status}: filled ${fmt(c.filled)}/${fmt(c.size)} ${c.symbol}`,
-          c.status === "filled" ? "ok" : "warn", 9000,
+          c.status === "filled" ? "ok" : ["unknown", "orphaned"].includes(c.status) ? "err" : "warn", 9000,
         );
         if (c.status === "filled" && useStore.getState().soundOn) useStore.getState().playChime();
       }

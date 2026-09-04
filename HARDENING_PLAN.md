@@ -16,12 +16,14 @@ This document records the review findings that are worth acting on. It separates
 
 ## Priority 0: suspend live Chase
 
-**Status: IN PROGRESS**
+**Status: DONE**
 
 - [x] Disable live Chase in the ticket, direct endpoint, and armed action execution.
 - [x] Keep DISARMED action simulation available.
 - [x] Deploy the block with a restart to DISARMED and verify positions and exact order IDs are unchanged.
-- [ ] Replace Chase reconciliation and re-enable it only after every acceptance criterion passes.
+- [x] Replace Chase reconciliation and re-enable it only after every acceptance criterion passes.
+
+The reconciled engine requires nested placement/cancellation success, queries exact order status and fills before classifying disappearance or replacing, recalculates remaining size after cancellation, persists lifecycle evidence, aborts on DISARM, and restores unfinished/orphan alerts on startup. Verification passed 44 backend tests, the frontend suite/lint/build, a read-only live `/orders/status` shape probe, a DISARMED endpoint/action check, and a restart with exact positions and order IDs unchanged. No live Chase order was placed as a deployment test.
 
 Live Chase should not be trusted until its reconciliation logic is replaced.
 
@@ -72,15 +74,15 @@ Rules:
 9. On startup, detect open `ch-*` orders and show a persistent orphan-order alert. Startup remains DISARMED and must not cancel them automatically.
 10. Persist Chase intent, client IDs, state changes, fills, cancellation results, and final status in SQLite.
 
-### Chase acceptance criteria
+### Chase acceptance criteria: DONE
 
-- Post-only rejection never becomes a fill.
-- Missing open order never becomes a fill without authoritative evidence.
-- Failed or timed-out cancellation never causes a replacement.
-- A late fill during cancellation reduces the replacement size correctly.
-- Disarming leaves no silently running Chase worker.
-- Restart identifies orphan `ch-*` orders without mutating Kraken.
-- Tests cover rejection, partial fill, late fill, cancel failure, timeout, disarm, restart, and API-read failure.
+- [x] Post-only rejection never becomes a fill.
+- [x] Missing open order never becomes a fill without authoritative evidence.
+- [x] Failed or timed-out cancellation never causes a replacement.
+- [x] A late fill during cancellation reduces the replacement size correctly.
+- [x] Disarming leaves no silently running Chase worker.
+- [x] Restart identifies orphan `ch-*` orders without mutating Kraken.
+- [x] Tests cover rejection, partial fill, late fill, cancel failure, timeout, disarm, restart, and API-read failure.
 
 ## Priority 1: confirmed correctness fixes
 

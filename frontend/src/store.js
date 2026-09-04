@@ -412,8 +412,21 @@ const useStore = create((set, get) => ({
     return body;
   },
 
-  async submitChase() {
-    get().toast("Live Chase is temporarily disabled pending reconciliation hardening.", "warn", 8000);
+  async submitChase(side) {
+    const body = get().ticketPayload(side);
+    if (!body) return;
+    if (!get().armed) { get().toast("CHASE requires an armed terminal — arm it first.", "warn"); return; }
+    try {
+      const r = await api("/api/chase", {
+        method: "POST",
+        body: { symbol: body.symbol, side: body.side, size: body.size },
+      });
+      const chase = r.chase;
+      get().onChaseEvent(chase);
+      get().toast(`Chase ${chase.id} running: ${side} ${fmt(body.size)} ${body.symbol}.`, "ok", 9000);
+    } catch (e) {
+      get().toast(`Chase failed: ${e.message}`, "err");
+    }
   },
 
   async closePosition(symbol) {

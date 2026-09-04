@@ -91,6 +91,7 @@ class ActionContext:
         self.get_instruments = get_instruments
         self.get_ticker_rest = get_ticker_rest
         self.chase = chase
+        self.start_chase: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         self.after_action: Callable[[dict[str, Any], dict[str, Any], bool], None] | None = None
         self._instrument_cache: dict[str, dict] | None = None
 
@@ -511,8 +512,8 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
         symbol = str(a.get("symbol") or "").strip().upper()
         side = str(a.get("side") or "").strip().lower()
         size = _dec(a.get("size"))
-        if not symbol or side not in {"buy", "sell"}:
-            raise ActionError("symbol and side (buy|sell) required")
+        if not symbol.startswith("PF_") or side not in {"buy", "sell"}:
+            raise ActionError("PF_ symbol and side (buy|sell) required")
         if size <= 0:
             raise ActionError("size must be positive")
         if ctx.chase is None:
@@ -529,7 +530,10 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
             return {"type": kind, "ok": True, "simulated": True,
                     "spec": spec,
                     "note": f"would peg {'best bid' if side == 'buy' else 'best ask'} (now {t.get('bid') if side == 'buy' else t.get('ask')}) and re-peg every {spec['repegSec']}s up to {spec['timeoutSec']}s"}
-        raise ActionError("live Chase is temporarily disabled pending reconciliation hardening")
+        starter = getattr(ctx, "start_chase", None)
+        snap = starter(spec) if starter else ctx.chase.start(spec, ctx)
+        return {"type": kind, "ok": True, "chase": snap,
+                "note": f"chase {snap['id']} running; fills arrive as notifications"}
 
     raise ActionError(f"unknown action type {kind!r}")
 

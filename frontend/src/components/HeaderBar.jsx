@@ -9,9 +9,11 @@ export default function HeaderBar() {
   const tickers = useStore(s => s.tickers);
   const soundOn = useStore(s => s.soundOn);
   const positions = useStore(s => s.positions);
+  const chases = useStore(s => s.chases);
   const toggleSound = useStore(s => s.toggleSound);
   const t = tickers[symbol] || {};
   const ch = t.change24h !== undefined ? Number(t.change24h) : null;
+  const chaseAlert = Object.values(chases || {}).find(chase => ["unknown", "orphaned"].includes(chase.status));
   // worst LIQ distance across open positions (percent)
   let risk = null;
   for (const p of positions) {
@@ -47,6 +49,15 @@ export default function HeaderBar() {
       <button id="bell-btn" className={"h-action" + (soundOn ? "" : " off")} title={soundOn ? "Fill sound on — click to mute" : "Fill sound muted — click to enable"} onClick={toggleSound}>
         {soundOn ? "🔔" : "🔕"}
       </button>
+      {chaseAlert && (
+        <button
+          className="risk-chip crit"
+          title={chaseAlert.unknownReason || "A Chase order needs manual reconciliation"}
+          onClick={() => useStore.getState().toast(chaseAlert.unknownReason || "A Chase order needs manual reconciliation.", "err", 15000)}
+        >
+          ⚠ CHASE UNKNOWN {chaseAlert.symbol}
+        </button>
+      )}
       {risk && (() => {
         // ATR tiers when available: red < 0.5 daily ATR, yellow < 1 ATR ("one average day liquidates you")
         const cls = risk.mult !== null

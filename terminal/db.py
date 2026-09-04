@@ -306,3 +306,20 @@ class Database:
                 (_now(), kind, json.dumps(payload, default=str)),
             )
             self._conn.commit()
+
+    def latest_chase_snapshots(self, limit: int = 1000) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload FROM events WHERE kind = 'chase' ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            chase_id = str(payload.get("id") or "") if isinstance(payload, dict) else ""
+            if chase_id and chase_id not in latest:
+                latest[chase_id] = payload
+        return list(latest.values())
