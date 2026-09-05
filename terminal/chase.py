@@ -90,7 +90,7 @@ class ChaseWorker(threading.Thread):
         return {
             "id": self.id,
             "spec": {key: self.spec.get(key) for key in (
-                "symbol", "side", "size", "timeoutSec", "maxRepegs", "repegSec", "offsetTicks",
+                "symbol", "side", "size", "reduceOnly", "timeoutSec", "maxRepegs", "repegSec", "offsetTicks",
             )},
             "symbol": self.spec.get("symbol"),
             "side": self.spec.get("side"),
@@ -169,6 +169,7 @@ class ChaseWorker(threading.Thread):
             "size": float(size),
             "limitPrice": float(price),
             "cliOrdId": cli_id,
+            **({"reduceOnly": True} if self.spec.get("reduceOnly") else {}),
         }
         state = "REPLACING" if self.pegs > 1 else "PLACING"
         self._audit("placement_intent", params=params)
@@ -381,7 +382,8 @@ class ChaseWorker(threading.Thread):
             raise ChaseError("timeoutSec and maxRepegs must be positive")
         deadline = time.monotonic() + timeout
         offset = max(0, int(self.spec.get("offsetTicks") or 0))
-        self._log(f"chasing {side} {size_total} {self.spec['symbol']} post-only")
+        self._log(f"chasing {side} {size_total} {self.spec['symbol']} post-only"
+                  f"{' reduce-only' if self.spec.get('reduceOnly') else ''}")
 
         while self.status == "running":
             if self._abort.is_set():
@@ -462,6 +464,12 @@ class ChaseManager:
             workers = sorted(self._chases.values(), key=lambda worker: worker.started, reverse=True)
             orphans = list(self._orphans.values())
         return [worker.snapshot() for worker in workers[:20]] + orphans
+
+    def active(self) -> list[dict[str, Any]]:
+        with self._lock:
+            workers = [worker for worker in self._chases.values() if worker.status in {"running", "unknown"}]
+            orphans = list(self._orphans.values())
+        return [worker.snapshot() for worker in workers] + orphans
 
     def abort(self, chase_id: str) -> dict[str, Any]:
         with self._lock:

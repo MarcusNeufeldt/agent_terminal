@@ -4,9 +4,9 @@ import useStore from "../store";
 export default function BottomTabs() {
   const tab = useStore(s => s.tab);
   const setTab = useStore(s => s.setTab);
-  const positions = useStore(s => s.positions);
-  const orders = useStore(s => s.orders);
   const cancelAllForSymbol = useStore(s => s.cancelAllForSymbol);
+  const flattenAll = useStore(s => s.flattenAll);
+  const bulkBusy = useStore(s => s.bulkBusy);
 
   return (
     <div id="bottom">
@@ -15,7 +15,21 @@ export default function BottomTabs() {
           <button key={id} className={"tab-btn" + (tab === id ? " active" : "")} onClick={() => setTab(id)}>{label}</button>
         ))}
         <div id="bottom-actions">
-          <button onClick={cancelAllForSymbol}>Cancel all (symbol)</button>
+          <button disabled={bulkBusy} onClick={cancelAllForSymbol}>Cancel all (symbol)</button>
+          <button
+            className="bulk-icon emergency"
+            disabled={bulkBusy}
+            title="Emergency: market-close every position, confirm each is flat, then cancel all orders"
+            aria-label="Emergency market close all positions and cancel all orders"
+            onClick={() => flattenAll("emergency")}
+          >⏹</button>
+          <button
+            className="bulk-icon soft"
+            disabled={bulkBusy}
+            title="Soft close: start reduce-only Chase exits for every position"
+            aria-label="Soft close all positions with reduce-only Chase orders"
+            onClick={() => flattenAll("chase")}
+          >≫</button>
         </div>
       </div>
       <div className="tab-body" id="tab-body">
@@ -133,7 +147,6 @@ function Scanner() {
   const rows = useStore(s => s.scannerRows);
   const meta = useStore(s => s.scannerMeta);
   const loading = useStore(s => s.scannerLoading);
-  const refreshScanner = useStore(s => s.refreshScanner);
   const selectSymbol = useStore(s => s.selectSymbol);
   if (loading && !rows.length) return <div className="empty">Scanning perpetuals… (first scan fetches 1m mark candles per market)</div>;
   return (

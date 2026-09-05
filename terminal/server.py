@@ -57,7 +57,7 @@ PORT = int(os.getenv("PORT", "8787"))
 VITE_ORIGINS = tuple(filter(None, (value.strip().lower() for value in os.getenv("VITE_DEV_ORIGINS", "").split(","))))
 security = LocalSecurity(PORT, VITE_ORIGINS)
 DEBUG_ENDPOINTS = os.getenv("TERMINAL_DEBUG", "").strip().lower() in {"1", "true", "yes"}
-IDEMPOTENT_WRITE_PATHS = {"/api/order", "/api/cancel", "/api/action", "/api/chase", "/api/chase/abort", "/api/chat"}
+IDEMPOTENT_WRITE_PATHS = {"/api/order", "/api/cancel", "/api/action", "/api/flatten", "/api/chase", "/api/chase/abort", "/api/chat"}
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,100}$")
 
 client = KrakenFuturesClient.from_env()
@@ -447,7 +447,11 @@ def _start_chase_if_armed(spec: dict[str, Any]) -> dict[str, Any]:
     with arm_lock:
         if not armed:
             raise trading_actions.ActionError("chase requires an ARMED terminal")
-        action_ctx.require_new_exposure(str(spec["symbol"]))
+        symbol = str(spec["symbol"])
+        if spec.get("reduceOnly"):
+            action_ctx.fresh_ticker(symbol)
+        else:
+            action_ctx.require_new_exposure(symbol)
         return chase_manager.start(spec, action_ctx)
 
 
@@ -679,6 +683,111 @@ def cancel_order(body: dict[str, Any]) -> dict[str, Any]:
     cache.drop("positions", "orders", "account")
     return {"simulated": False, **result, **({"error": result.get("error") or f"cancel outcome {result['outcome']}"}
                                                     if result["outcome"] != "confirmed" else {})}
+
+
+def _flatten_outcome(results: list[dict[str, Any]], is_armed: bool) -> str:
+    if not results:
+        return "confirmed" if is_armed else "simulated"
+    outcomes = [str(result.get("outcome") or "unknown") for result in results]
+    if not is_armed and all(outcome == "simulated" for outcome in outcomes):
+        return "simulated"
+    if all(outcome == "confirmed" for outcome in outcomes):
+        return "confirmed"
+    if any(outcome == "confirmed" for outcome in outcomes):
+        return "partial"
+    if any(outcome == "unknown" for outcome in outcomes):
+        return "unknown"
+    return "rejected"
+
+
+def flatten_all(mode: str) -> dict[str, Any]:
+    """Run a server-authoritative flatten plan under the global ARM/write lock."""
+    with arm_lock:
+        is_armed = armed
+        if is_armed:
+            cache.drop("positions", "orders", "account")
+        try:
+            actions = trading_actions.build_flatten_actions(
+                mode,
+                get_positions(),
+                get_orders() if mode == "emergency" else None,
+            )
+        except trading_actions.ActionError as exc:
+            return {"mode": mode, "armed": is_armed, "outcome": "rejected", "error": str(exc), "actions": [], "results": []}
+        except Exception as exc:
+            return {"mode": mode, "armed": is_armed, "outcome": "unknown",
+                    "error": f"flatten preflight failed: {type(exc).__name__}: {exc}", "actions": [], "results": []}
+
+        aborting = {"requested": [], "completed": [], "pending": []}
+        if is_armed and mode == "chase" and actions:
+            try:
+                active_chases = chase_manager.active()
+            except Exception as exc:
+                return {"mode": mode, "armed": True, "outcome": "unknown",
+                        "error": f"could not inspect active Chase workers: {type(exc).__name__}: {exc}",
+                        "actions": actions, "results": []}
+            if active_chases:
+                unresolved = any(item.get("status") in {"unknown", "orphaned"} for item in active_chases)
+                return {
+                    "mode": mode, "armed": True, "outcome": "unknown" if unresolved else "rejected",
+                    "error": "existing Chase workers/orders must finish or be resolved before soft flatten",
+                    "actions": actions, "results": [], "activeChases": active_chases,
+                    "abortingChases": aborting,
+                }
+
+        if is_armed and mode == "emergency":
+            def stop_chases() -> dict[str, Any]:
+                stopped = chase_manager.abort_all()
+                cache.drop("orders", "account")
+                return stopped
+
+            results, aborting = trading_actions.execute_emergency_flatten(actions, action_ctx, stop_chases)
+        else:
+            results = trading_actions.execute_actions(actions, action_ctx, is_armed, max_actions=None) if actions else []
+
+        outcome = _flatten_outcome(results, is_armed)
+        error = next((str(result.get("stateRefreshError") or result.get("error")) for result in results
+                      if result.get("stateRefreshError") or result.get("outcome") not in {"confirmed", "simulated"}), None)
+        final_state = None
+        if is_armed and mode == "emergency" and outcome == "confirmed":
+            cache.drop("positions", "orders", "account")
+            try:
+                final_positions = get_positions()
+                final_orders = get_orders()
+                final_plan = trading_actions.build_flatten_actions("emergency", final_positions, final_orders)
+                remaining_positions = sum(action["type"] == "close" for action in final_plan)
+                final_state = {"positionCount": remaining_positions, "orderCount": len(final_orders)}
+                if remaining_positions or final_orders:
+                    outcome = "partial"
+                    error = (f"final verification found {remaining_positions} open position(s) "
+                             f"and {len(final_orders)} open order(s); run emergency flatten again")
+            except Exception as exc:
+                outcome = "unknown"
+                error = f"final flat-state verification failed: {type(exc).__name__}: {exc}"
+    cache.drop("positions", "orders", "account", "fills")
+    return {
+        "mode": mode,
+        "armed": is_armed,
+        "simulated": outcome == "simulated",
+        "outcome": outcome,
+        "actions": actions,
+        "results": results,
+        "positionCount": sum(action["type"] in {"close", "chase"} for action in actions),
+        "closedPositionCount": sum(
+            result.get("type") == "close" and result.get("outcome") == "confirmed" and not result.get("noOp")
+            for result in results
+        ),
+        "startedChaseCount": sum(bool(result.get("chase")) for result in results),
+        "cancelledOrderCount": sum(
+            nested.get("outcome") == "confirmed"
+            for result in results if result.get("type") == "cancel_all_orders"
+            for nested in result.get("results", [])
+        ),
+        "abortingChases": aborting,
+        **({"finalState": final_state} if final_state is not None else {}),
+        **({"noOp": True} if not actions or (results and all(result.get("noOp") for result in results)) else {}),
+        **({"error": error or f"flatten outcome {outcome}"} if outcome not in {"confirmed", "simulated"} else {}),
+    }
 
 
 # ---- HTTP handler ----------------------------------------------------------
@@ -1003,6 +1112,17 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 cache.drop("positions", "orders", "account")
                 db.log_action("api", is_armed, normalized, results)
                 self._send_json({"actions": normalized, "results": results, "armed": is_armed})
+            elif path == "/api/flatten":
+                mode = str(body.get("mode") or "").strip().lower()
+                if mode not in {"emergency", "chase"}:
+                    self._send_json({"error": "mode must be emergency or chase"}, 400)
+                    return
+                result = flatten_all(mode)
+                logged_results = result.get("results") or [{
+                    "type": "flatten", "outcome": result.get("outcome"), "error": result.get("error"),
+                }]
+                db.log_action(f"flatten_{mode}", bool(result.get("armed")), result.get("actions") or [], logged_results)
+                self._send_json(result)
             elif path == "/api/chat":
                 self._handle_chat(body)
             elif path == "/api/chase":
@@ -1015,6 +1135,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 try:
                     spec = {
                         "symbol": symbol, "side": side, "size": size,
+                        "reduceOnly": bool(body.get("reduceOnly")),
                         "timeoutSec": float(body.get("timeoutSec") or 300),
                         "maxRepegs": int(body.get("maxRepegs") or 120),
                         "repegSec": max(1.0, float(body.get("repegSec") or 5)),

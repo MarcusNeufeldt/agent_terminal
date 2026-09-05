@@ -12,8 +12,10 @@ Action schema (JSON):
   {"type": "close",      "symbol", "percent?"=100, "size?"}
   {"type": "replace_tp", "symbol", "stopPrice"}
   {"type": "replace_sl", "symbol", "stopPrice"}
-  {"type": "cancel_all", "symbol"}
-  {"type": "cancel",     "cliOrdId"}
+  {"type": "cancel_all",        "symbol"}
+  {"type": "cancel_all_orders"}
+  {"type": "cancel",            "cliOrdId"}
+  {"type": "chase",      "symbol", "side", "size", "reduceOnly?"}
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from typing import Any, Callable
 from exchange_ops import ensure_client_id, parse_operation, unique_client_id
 from kraken_client import KrakenFuturesError
 
-ACTION_TYPES = {"order", "ladder", "close", "replace_tp", "replace_sl", "cancel_all", "cancel", "chase"}
+ACTION_TYPES = {"order", "ladder", "close", "replace_tp", "replace_sl", "cancel_all", "cancel_all_orders", "cancel", "chase"}
 ORDER_TYPES = {"mkt", "lmt", "post", "ioc", "stp", "take_profit"}
 LIMIT_TYPES = {"lmt", "post", "ioc"}
 TRIGGER_TYPES = {"stp", "take_profit"}
@@ -770,8 +772,6 @@ def _cancel_ids(a: dict[str, Any], ctx: ActionContext, symbol_only: bool) -> lis
             ids.append({"cliOrdId": str(o["cliOrdId"])})
         elif o.get("order_id") or o.get("orderId"):
             ids.append({"order_id": str(o.get("order_id") or o.get("orderId"))})
-    if not ids:
-        raise ActionError("no matching open orders")
     return ids
 
 
@@ -823,6 +823,13 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
         }
 
     if kind == "close":
+        if a.get("allowFlat"):
+            symbol = str(a.get("symbol") or "").strip().upper()
+            positions = _checked_rows(ctx.get_positions(), "positions")
+            position = next((row for row in positions if str(row.get("symbol")) == symbol), None)
+            if not position or _dec(position.get("size") or 0) <= 0:
+                return {"type": kind, "ok": True, "outcome": "confirmed", "noOp": True,
+                        "note": f"{symbol} is already flat"}
         params = _close_plan(a, ctx)
         if not armed:
             return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, **params}
@@ -836,10 +843,46 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
             return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, **plan}
         return _execute_protection_change(kind, plan, ctx)
 
+    if kind == "cancel_all_orders":
+        orders = _checked_rows(ctx.get_orders(), "open orders")
+        invalid = next(
+            (str(order.get("symbol") or "<missing>") for order in orders
+             if not str(order.get("symbol") or "").startswith("PF_")),
+            None,
+        )
+        if invalid:
+            raise ActionError(f"cannot cancel unsupported order {invalid}")
+        ids = []
+        seen = set()
+        for order in orders:
+            target = ({"cliOrdId": str(order["cliOrdId"])} if order.get("cliOrdId") else
+                      {"order_id": str(order.get("order_id") or order.get("orderId"))}
+                      if order.get("order_id") or order.get("orderId") else None)
+            if target is None:
+                raise ActionError(f"open order on {order.get('symbol')} is missing an order ID")
+            key = tuple(target.items())
+            if key not in seen:
+                seen.add(key)
+                ids.append(target)
+        if not armed:
+            return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True,
+                    "cancelOrderIds": ids, **({"noOp": True} if not ids else {})}
+        if not ids:
+            return {"type": kind, "ok": True, "outcome": "confirmed", "noOp": True, "results": []}
+        results = [cancel_one(ctx, target) for target in ids]
+        outcome = _aggregate_outcome(results)
+        return {
+            "type": kind, "ok": outcome == "confirmed", "outcome": outcome, "results": results,
+            **({"error": f"cancel-all outcome {outcome}: {sum(r['outcome'] == 'confirmed' for r in results)}/{len(results)} confirmed"}
+               if outcome != "confirmed" else {}),
+        }
+
     if kind == "cancel_all":
         ids = _cancel_ids(a, ctx, symbol_only=True)
         if not armed:
             return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, "cancelOrderIds": ids}
+        if not ids:
+            return {"type": kind, "ok": True, "outcome": "confirmed", "noOp": True, "results": []}
         results = [cancel_one(ctx, target) for target in ids]
         outcome = _aggregate_outcome(results)
         return {
@@ -867,10 +910,24 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
             raise ActionError("PF_ symbol and side (buy|sell) required")
         if size <= 0:
             raise ActionError("size must be positive")
+        if a.get("closePosition"):
+            if not a.get("reduceOnly"):
+                raise ActionError("closing Chase must be reduce-only")
+            positions = _checked_rows(ctx.get_positions(), "positions")
+            position = next((row for row in positions if str(row.get("symbol")) == symbol), None)
+            if not position or _dec(position.get("size") or 0) <= 0:
+                return {"type": kind, "ok": True, "outcome": "confirmed", "noOp": True,
+                        "note": f"{symbol} is already flat"}
+            position_side = str(position.get("side") or "").lower()
+            expected_side = "sell" if position_side == "long" else "buy" if position_side == "short" else ""
+            if not expected_side or side != expected_side:
+                raise ActionError(f"closing Chase side does not match current {symbol} position")
+            size = min(size, _dec(position.get("size")))
         if ctx.chase is None:
             raise ActionError("chase engine unavailable")
         spec = {
             "symbol": symbol, "side": side, "size": float(size),
+            "reduceOnly": bool(a.get("reduceOnly")),
             "timeoutSec": float(a.get("timeoutSec") or 300),
             "maxRepegs": int(a.get("maxRepegs") or 120),
             "repegSec": max(1.0, float(a.get("repegSec") or 5)),
@@ -889,12 +946,12 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
     raise ActionError(f"unknown action type {kind!r}")
 
 
-def normalize_actions(actions: Any) -> list[dict[str, Any]]:
+def normalize_actions(actions: Any, max_actions: int | None = 25) -> list[dict[str, Any]]:
     """Normalize the one safe model slip and reject a malformed batch before dispatch."""
     if not isinstance(actions, list) or not actions:
         raise ActionError("actions must be a non-empty list")
-    if len(actions) > 25:
-        raise ActionError("max 25 actions per request")
+    if max_actions is not None and len(actions) > max_actions:
+        raise ActionError(f"max {max_actions} actions per request")
 
     normalized = []
     for index, raw in enumerate(actions, 1):
@@ -911,8 +968,61 @@ def normalize_actions(actions: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def execute_actions(actions: list[dict[str, Any]], ctx: ActionContext, armed: bool) -> list[dict[str, Any]]:
-    normalized = normalize_actions(actions)  # structural preflight: no partial batch on bad envelopes
+def build_flatten_actions(mode: str, positions: Any, orders: Any = None) -> list[dict[str, Any]]:
+    """Build a server-authoritative all-position exit plan without side effects."""
+    if mode not in {"emergency", "chase"}:
+        raise ActionError("flatten mode must be emergency or chase")
+    if not isinstance(positions, list):
+        raise ActionError("position state unavailable; flatten rejected")
+    failed = next((str(row.get("error")) for row in positions if isinstance(row, dict) and row.get("error")), None)
+    if failed:
+        raise ActionError(f"position state unavailable; flatten rejected: {failed}")
+    live: list[tuple[dict[str, Any], Decimal]] = []
+    for row in positions:
+        if not isinstance(row, dict):
+            raise ActionError("position state unavailable; flatten rejected: malformed row")
+        size = _dec(row.get("size") or 0)
+        if size <= 0:
+            continue
+        symbol = str(row.get("symbol") or "")
+        side = str(row.get("side") or "").lower()
+        if not symbol.startswith("PF_"):
+            raise ActionError(f"cannot flatten unsupported position {symbol or '<missing>'}")
+        if side not in {"long", "short"}:
+            raise ActionError(f"cannot flatten {symbol}: position side is unavailable")
+        live.append((row, size))
+
+    actions = [{
+        "type": "close" if mode == "emergency" else "chase",
+        "symbol": str(row["symbol"]),
+        **({"side": "sell" if str(row["side"]).lower() == "long" else "buy",
+            "size": float(size), "reduceOnly": True, "closePosition": True}
+           if mode == "chase" else {"percent": 100, "allowFlat": True}),
+    } for row, size in live]
+    if mode == "chase":
+        return actions
+
+    if not isinstance(orders, list):
+        raise ActionError("order state unavailable; emergency flatten rejected")
+    failed = next((str(row.get("error")) for row in orders if isinstance(row, dict) and row.get("error")), None)
+    if failed:
+        raise ActionError(f"order state unavailable; emergency flatten rejected: {failed}")
+    if any(not isinstance(row, dict) for row in orders):
+        raise ActionError("order state unavailable; emergency flatten rejected: malformed row")
+    invalid = next(
+        (str(row.get("symbol") or "<missing>") for row in orders if not str(row.get("symbol") or "").startswith("PF_")),
+        None,
+    )
+    if invalid:
+        raise ActionError(f"cannot cancel unsupported order {invalid}")
+    actions.append({"type": "cancel_all_orders"})
+    return actions
+
+
+def execute_actions(
+    actions: list[dict[str, Any]], ctx: ActionContext, armed: bool, *, max_actions: int | None = 25,
+) -> list[dict[str, Any]]:
+    normalized = normalize_actions(actions, max_actions=max_actions)  # structural preflight: no partial batch on bad envelopes
     results = []
     for index, a in enumerate(normalized):
         try:
@@ -940,6 +1050,36 @@ def execute_actions(actions: list[dict[str, Any]], ctx: ActionContext, armed: bo
                 results.append({"type": pending["type"], "ok": False, "outcome": "rejected", "error": f"not executed: {reason}"})
             break
     return results
+
+
+def execute_emergency_flatten(
+    actions: list[dict[str, Any]], ctx: ActionContext, stop_chases: Callable[[], dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Close every position, then stop Chase workers and cancel the current global order set."""
+    close_actions = [action for action in actions if action["type"] == "close"]
+    cancel_action = next(action for action in actions if action["type"] == "cancel_all_orders")
+    results = execute_actions(close_actions, ctx, True, max_actions=None) if close_actions else []
+    failed_close = next(
+        (result for result in results if result.get("outcome") != "confirmed" or result.get("stateRefreshError")),
+        None,
+    )
+    aborting = {"requested": [], "completed": [], "pending": []}
+    if failed_close:
+        reason = failed_close.get("stateRefreshError") or failed_close.get("error") or "close was not confirmed"
+        results.append({"type": "cancel_all_orders", "ok": False, "outcome": "rejected",
+                        "error": f"not executed: {reason}"})
+        return results, aborting
+    try:
+        aborting = stop_chases()
+        unsafe = [item for item in aborting["completed"] if item.get("status") == "unknown"]
+        if aborting["pending"] or unsafe:
+            raise ActionError("existing Chase orders could not be reconciled")
+    except Exception as exc:
+        results.append({"type": "cancel_all_orders", "ok": False, "outcome": "unknown",
+                        "error": f"not executed: Chase shutdown failed: {type(exc).__name__}: {exc}"})
+        return results, aborting
+    results.extend(execute_actions([cancel_action], ctx, True, max_actions=None))
+    return results, aborting
 
 
 ACTIONS_PROMPT = """Trade actions use the schemas below.

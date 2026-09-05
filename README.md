@@ -10,6 +10,7 @@ A self-hosted Kraken Futures trading terminal with live market data, chart-based
 - Kraken Futures positions, orders, fills, margin, and account history
 - Binance USDT-M candles for charting, with Kraken as the trading authority
 - PF-only market, limit, post-only, stop, take-profit, ladder, and Chase orders with unique client IDs and explicit write outcomes
+- Global emergency flatten (confirmed market closes, then order cancellation) and soft flatten (reduce-only Chase exits)
 - Draggable TP/SL controls with confirmation, actual protection coverage, and persistent 1:1/1:2/1:3 mirrored loss lines
 - Exact-ID TP/SL edits with rollback and persistent `UNPROTECTED` alerts; managed full-position resizing after confirmed size changes
 - React 19 workspace with Vela 0.6.15 multi-chart layouts, active-chart routing, Zustand, and Markdown chat

@@ -44,7 +44,7 @@ Kraken credentials load from `terminal/.env` or process environment variables. A
 - **Chart workspace** — Vela candles (1m–1w), exact instrument tick formatting, persisted layouts, and independent symbols per cell. Click a chart to make it active; the header, sidebar, order book, ticket, scanner, and AI then follow that chart. The layout menu supports one chart, side-by-side charts, stacked charts, and larger grids. History comes from the terminal `/api/candles` endpoint; one shared `/api/stream` feed updates every visible cell from Binance USDT-M 1m klines (`PF_X` → `XUSDT`, XBT→BTC), while Kraken remains the sole trading authority. Terminal-owned overlays show position entry, liquidation estimate, TP/SL triggers, and open limits on every visible symbol. Every order has a chart-side × control with confirmation before cancellation. Drag a TP line to amend its exact order, or drag the `TP / SL` position handle to preview tick-snapped full-position protection with live estimated PnL; live drops require confirmation. Managed protection still auto-resizes by exact-ID `editorder`, partial ladders are never collapsed, and failed rollback raises the persistent audible `UNPROTECTED` alert. The RISK toggle shows display-only 1:1, 1:2, and 1:3 mirrored loss levels; FIT RISK adds them to Vela autoscale on demand. EMA 400/800 follows the active chart.
 - **Order book** — top levels with depth bars, ~2.5s refresh.
 - **Order ticket** — market / limit / post-only / stop / take-profit / **chase**; % of available margin quick-sizing with a **leverage selector** (1x–10x, persisted); reduce-only. Sizes and prices are rounded server-side to the instrument's contract precision / tick.
-- **Bottom tabs** — Positions (live mark + uPnL per tick, per-row close), Orders (per-row cancel, filtered cancel-all), Fills (newest first), **Scanner**.
+- **Bottom tabs** — Positions (live mark + uPnL per tick, per-row close), Orders (per-row cancel, filtered cancel-all), Fills (newest first), **Scanner**. The stop icon performs an emergency flatten: it confirms every market close before canceling the current global order set, then reports success only after a final account reread is flat with no open orders. The double-chevron icon performs a soft flatten with one reduce-only Chase exit per open position. Emergency flatten stops/reconciles active Chase workers only after every close is confirmed and before global cancellation; soft flatten refuses to stack over an existing active or unresolved Chase.
 - **Scanner** — perpetuals ranked by realized volatility from closed 1m mark candles; click a row to open its chart.
 - **AI assistant** — persistent chat (SQLite), direct ARM-gated execution, optional proposal cards, audited tool calls, execution reports.
 
@@ -62,7 +62,7 @@ Backed by OpenRouter (key from `~/.pi/agent/auth.json`) with **native tool calli
 
 ## Chase engine (`chase.py`)
 
-Live Chase uses unique client IDs, strict nested Kraken statuses, exact order-status and fill reconciliation, confirmed cancellation before replacement, disarm aborts, and startup orphan alerts. It places post-only limits at best bid (buy) / best ask (sell) and re-pegs until filled, timeout, or max re-pegs. Also available from the CLI: `python -m kraken_futures_cli chase SYMBOL buy|sell SIZE [--chase-timeout --repeg --max-repegs --offset --no-wait --json --terminal]`.
+Live Chase uses unique client IDs, strict nested Kraken statuses, exact order-status and fill reconciliation, confirmed cancellation before replacement, disarm aborts, and startup orphan alerts. It places post-only limits at best bid (buy) / best ask (sell) and re-pegs until filled, timeout, or max re-pegs. Soft-flatten workers set `reduceOnly` on every placement, re-check/cap size against the current position before startup, and refuse to stack over unresolved orphan/unknown Chase orders. Also available from the CLI: `python -m kraken_futures_cli chase SYMBOL buy|sell SIZE [--chase-timeout --repeg --max-repegs --offset --no-wait --json --terminal]`.
 
 ## Persistence (`db.py`, SQLite WAL — `terminal.db`)
 
@@ -106,6 +106,7 @@ Kraken's REST API does not expose it. The terminal computes it the way Kraken's 
 | POST | `/api/order` `{symbol, side, orderType, size, ...}` | simulated unless armed |
 | POST | `/api/cancel` `{cliOrdId}` or `{orderId}` | simulated unless armed |
 | POST | `/api/action` `{actions: [...]}` | execute action proposals; dry-run unless armed |
+| POST | `/api/flatten` `{mode:"emergency|chase", requestId}` | idempotent all-position emergency or soft flatten |
 | POST | `/api/chase` / `/api/chase/abort` / `GET /api/chase` | chase lifecycle |
 | POST | `/api/chat` → see above | AI reply + proposals |
 | GET | `/api/stream` | SSE: `ticker`, `trade`, `status`, `armed`, `chase` |

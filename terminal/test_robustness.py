@@ -17,8 +17,9 @@ import chat_compaction
 import market_hub
 import scanner
 from actions import (
-    MANAGED_TP_PREFIX, ActionContext, ActionError, _replace_protection_plan, cancel_one,
-    execute_actions, managed_protection_sync_actions, normalize_actions, submit_one,
+    MANAGED_TP_PREFIX, ActionContext, ActionError, _replace_protection_plan, build_flatten_actions,
+    cancel_one, execute_actions, execute_emergency_flatten, managed_protection_sync_actions,
+    normalize_actions, submit_one,
 )
 from chase import ChaseManager, ChaseRejected, ChaseTransient, ChaseUnknown, ChaseWorker
 from db import Database
@@ -171,6 +172,18 @@ class RobustnessTests(unittest.TestCase):
         with self.assertRaises(ChaseRejected):
             worker._place(Decimal("10"), Decimal("10"))
         self.assertIsNone(worker._active)
+
+    def test_reduce_only_chase_marks_every_exchange_order_reduce_only(self):
+        calls = []
+        client = SimpleNamespace(post=lambda path, params=None, **_kwargs: (
+            calls.append((path, params)) or {"result": "success", "sendStatus": {"status": "placed", "order_id": "close-1"}}
+        ))
+        worker = self._chase_worker(client)
+        worker.spec["reduceOnly"] = True
+        worker.pegs = 1
+        worker._place(Decimal("10"), Decimal("10"))
+        self.assertTrue(calls[0][1]["reduceOnly"])
+        self.assertTrue(worker.snapshot()["spec"]["reduceOnly"])
 
     def test_chase_placed_without_exchange_id_is_unknown_and_not_retried(self):
         client = SimpleNamespace(post=lambda *_args, **_kwargs: {"result": "success", "sendStatus": {"status": "placed"}})
@@ -535,6 +548,41 @@ class RobustnessTests(unittest.TestCase):
             ["confirmed", "unknown", "rejected", "rejected"],
         )
 
+    def test_cancel_all_with_nothing_open_is_confirmed(self):
+        ctx = SimpleNamespace(client=SimpleNamespace(), get_orders=lambda: [], refresh_orders=None, after_action=None)
+        result = execute_actions([{"type": "cancel_all", "symbol": "PF_TESTUSD"}], ctx, True)[0]
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertTrue(result["noOp"])
+
+    def test_global_cancel_reads_and_confirms_every_current_order(self):
+        calls = []
+        client = SimpleNamespace(post=lambda path, params=None, **_kwargs: (
+            calls.append((path, params)) or {
+                "result": "success", "cancelStatus": {"status": "cancelled", "order_id": params.get("order_id")},
+            }
+        ))
+        orders = [
+            {"symbol": "PF_XBTUSD", "order_id": "x1"},
+            {"symbol": "PF_SOLUSD", "order_id": "s1"},
+        ]
+        ctx = SimpleNamespace(client=client, get_orders=lambda: orders, refresh_orders=None, after_action=None)
+        plan = build_flatten_actions("emergency", [], [{"symbol": "PF_OLDUSD", "order_id": "old"}])
+        result = execute_actions(plan, ctx, True)[0]
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertEqual([params["order_id"] for _path, params in calls], ["x1", "s1"])
+
+    def test_global_cancel_rejects_unsupported_order_before_canceling_anything(self):
+        client = Mock()
+        ctx = SimpleNamespace(
+            client=client,
+            get_orders=lambda: [{"symbol": "FI_XBTUSD", "order_id": "x1"}],
+            refresh_orders=None,
+            after_action=None,
+        )
+        result = execute_actions([{"type": "cancel_all_orders"}], ctx, True)[0]
+        self.assertEqual(result["outcome"], "rejected")
+        client.post.assert_not_called()
+
     def test_cancel_all_reports_partial_nested_failures(self):
         orders = [
             {"symbol": "PF_TESTUSD", "cliOrdId": "c1"},
@@ -659,6 +707,125 @@ class RobustnessTests(unittest.TestCase):
                 import os
                 self.assertEqual(int(os.getenv("PORT", "8787")), 9123)
 
+    def test_flatten_plans_market_closes_before_global_cancellation(self):
+        positions = [
+            {"symbol": "PF_XBTUSD", "side": "long", "size": 2},
+            {"symbol": "PF_ETHUSD", "side": "short", "size": 3},
+        ]
+        orders = [
+            {"symbol": "PF_XBTUSD", "order_id": "x1"},
+            {"symbol": "PF_SOLUSD", "order_id": "s1"},
+        ]
+        emergency = build_flatten_actions("emergency", positions, orders)
+        self.assertEqual([action["type"] for action in emergency], ["close", "close", "cancel_all_orders"])
+        soft = build_flatten_actions("chase", positions)
+        self.assertEqual(soft, [
+            {"type": "chase", "symbol": "PF_XBTUSD", "side": "sell", "size": 2.0, "reduceOnly": True, "closePosition": True},
+            {"type": "chase", "symbol": "PF_ETHUSD", "side": "buy", "size": 3.0, "reduceOnly": True, "closePosition": True},
+        ])
+
+    def test_failed_emergency_close_keeps_all_orders_working(self):
+        calls = []
+        client = SimpleNamespace(post=lambda path, **_kwargs: (
+            calls.append(path) or {"result": "success", "sendStatus": {"status": "postWouldExecute"}}
+        ))
+        positions = [{"symbol": "PF_XBTUSD", "side": "long", "size": 2}]
+        orders = [{"symbol": "PF_XBTUSD", "cliOrdId": "protect-1"}]
+        ctx = SimpleNamespace(
+            client=client,
+            get_positions=lambda: positions,
+            get_orders=lambda: orders,
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0},
+            after_action=None,
+            refresh_orders=None,
+        )
+        stop_chases = Mock()
+        results, _aborting = execute_emergency_flatten(
+            build_flatten_actions("emergency", positions, orders), ctx, stop_chases,
+        )
+        self.assertEqual(calls, ["/sendorder"])
+        self.assertEqual([result["outcome"] for result in results], ["rejected", "rejected"])
+        self.assertIn("not executed", results[1]["error"])
+        stop_chases.assert_not_called()
+
+    def test_emergency_stops_chase_only_after_confirmed_closure_then_cancels(self):
+        events = []
+        positions = [{"symbol": "PF_XBTUSD", "side": "long", "size": 2}]
+        orders = [{"symbol": "PF_XBTUSD", "order_id": "protect-1"}]
+
+        def post(path, params=None, **_kwargs):
+            events.append(path)
+            if path == "/sendorder":
+                return {"result": "success", "sendStatus": {"status": "placed", "order_id": "close-1"}}
+            return {"result": "success", "cancelStatus": {"status": "cancelled", "order_id": params["order_id"]}}
+
+        def after_action(action, _result, _armed):
+            events.append(f"after:{action['type']}")
+            if action["type"] == "close":
+                positions.clear()
+
+        def stop_chases():
+            events.append("stop-chases")
+            return {"requested": [], "completed": [], "pending": []}
+
+        ctx = SimpleNamespace(
+            client=SimpleNamespace(post=post),
+            get_positions=lambda: positions,
+            get_orders=lambda: orders,
+            instrument=lambda _symbol: {"contractValueTradePrecision": 0},
+            after_action=after_action,
+            refresh_orders=None,
+        )
+        results, _aborting = execute_emergency_flatten(
+            build_flatten_actions("emergency", positions, orders), ctx, stop_chases,
+        )
+        self.assertEqual([result["outcome"] for result in results], ["confirmed", "confirmed"])
+        self.assertEqual(events, ["/sendorder", "after:close", "stop-chases", "/cancelorder", "after:cancel_all_orders"])
+
+    def test_emergency_continues_when_a_planned_position_is_already_flat(self):
+        positions = [{"symbol": "PF_XBTUSD", "side": "long", "size": 2}]
+        orders = [{"symbol": "PF_XBTUSD", "order_id": "protect-1"}]
+        plan = build_flatten_actions("emergency", positions, orders)
+        positions.clear()
+        client = SimpleNamespace(post=lambda _path, params=None, **_kwargs: {
+            "result": "success", "cancelStatus": {"status": "cancelled", "order_id": params["order_id"]},
+        })
+        ctx = SimpleNamespace(
+            client=client, get_positions=lambda: positions, get_orders=lambda: orders,
+            after_action=None, refresh_orders=None,
+        )
+        results, _aborting = execute_emergency_flatten(
+            plan, ctx, lambda: {"requested": [], "completed": [], "pending": []},
+        )
+        self.assertTrue(results[0]["noOp"])
+        self.assertEqual([result["outcome"] for result in results], ["confirmed", "confirmed"])
+
+    def test_emergency_does_not_cancel_orders_while_chase_shutdown_is_pending(self):
+        client = Mock()
+        orders = [{"symbol": "PF_XBTUSD", "order_id": "protect-1"}]
+        ctx = SimpleNamespace(client=client, get_orders=lambda: orders, after_action=None, refresh_orders=None)
+        pending = {"requested": ["chase-1"], "completed": [], "pending": [{"id": "chase-1"}]}
+        results, aborting = execute_emergency_flatten(
+            build_flatten_actions("emergency", [], orders), ctx, lambda: pending,
+        )
+        self.assertEqual(results[0]["outcome"], "unknown")
+        self.assertEqual(aborting, pending)
+        client.post.assert_not_called()
+
+    def test_flatten_rejects_unavailable_state_before_dispatch(self):
+        with self.assertRaisesRegex(ActionError, "position state unavailable"):
+            build_flatten_actions("chase", [{"error": "positions failed"}])
+        with self.assertRaisesRegex(ActionError, "order state unavailable"):
+            build_flatten_actions("emergency", [], [{"error": "orders failed"}])
+        with self.assertRaisesRegex(ActionError, "position side is unavailable"):
+            build_flatten_actions("chase", [{"symbol": "PF_XBTUSD", "side": "?", "size": 1}])
+
+    def test_internal_flatten_plan_can_exceed_public_batch_limit(self):
+        actions = [{"type": "close", "symbol": f"PF_TEST{i}USD"} for i in range(26)]
+        with self.assertRaisesRegex(ActionError, "max 25"):
+            normalize_actions(actions)
+        self.assertEqual(len(normalize_actions(actions, max_actions=None)), 26)
+
     def test_chase_simulates_disarmed_and_starts_reconciled_worker_armed(self):
         manager = Mock()
         manager.start.return_value = {"id": "chase-1", "status": "running"}
@@ -669,13 +836,32 @@ class RobustnessTests(unittest.TestCase):
             get_ticker_rest=lambda _symbol: None,
             after_action=None,
         )
-        action = {"type": "chase", "symbol": "PF_TESTUSD", "side": "buy", "size": 10}
+        action = {"type": "chase", "symbol": "PF_TESTUSD", "side": "buy", "size": 10, "reduceOnly": True}
         simulated = execute_actions([action], ctx, False)[0]
         live = execute_actions([action], ctx, True)[0]
         self.assertTrue(simulated["simulated"])
+        self.assertTrue(simulated["spec"]["reduceOnly"])
         self.assertTrue(live["ok"])
         self.assertEqual(live["chase"]["id"], "chase-1")
+        self.assertTrue(manager.start.call_args.args[0]["reduceOnly"])
         manager.start.assert_called_once()
+
+    def test_closing_chase_caps_to_current_position_and_noops_when_flat(self):
+        manager = Mock()
+        manager.start.return_value = {"id": "close-chase", "status": "running"}
+        positions = [{"symbol": "PF_TESTUSD", "side": "long", "size": 4}]
+        ctx = SimpleNamespace(chase=manager, start_chase=None, get_positions=lambda: positions, after_action=None)
+        action = {
+            "type": "chase", "symbol": "PF_TESTUSD", "side": "sell", "size": 10,
+            "reduceOnly": True, "closePosition": True,
+        }
+        result = execute_actions([action], ctx, True)[0]
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertEqual(manager.start.call_args.args[0]["size"], 4.0)
+        positions.clear()
+        result = execute_actions([action], ctx, True)[0]
+        self.assertTrue(result["noOp"])
+        self.assertEqual(manager.start.call_count, 1)
 
     def test_missing_action_type_is_repaired_for_order_payload(self):
         raw = [{"symbol": "PF_ETHUSD", "side": "buy", "orderType": "post", "size": 1, "limitPrice": 2000}]

@@ -36,6 +36,7 @@ const useStore = create((set, get) => ({
   orders: [],
   dataStatus: {},
   ticketBusy: false,
+  bulkBusy: false,
   fills: [],
   scannerRows: [],
   scannerMeta: "",
@@ -398,7 +399,7 @@ const useStore = create((set, get) => ({
     try {
       const r = await api("/api/chase", {
         method: "POST",
-        body: { symbol: body.symbol, side: body.side, size: body.size, requestId: newRequestId() },
+        body: { symbol: body.symbol, side: body.side, size: body.size, reduceOnly: !!body.reduceOnly, requestId: newRequestId() },
       });
       const chase = r.chase;
       get().onChaseEvent(chase);
@@ -454,6 +455,56 @@ const useStore = create((set, get) => ({
     } catch (e) {
       s.toast(`Cancel failed: ${e.message}`, "err");
       return false;
+    }
+  },
+
+  async flattenAll(mode) {
+    const s = get();
+    if (s.bulkBusy) return;
+    if (s.dataStatus.positions?.state !== "current") {
+      s.toast("Position state is not current; flatten rejected.", "err", 10000);
+      return;
+    }
+    if (mode === "emergency" && s.dataStatus.orders?.state !== "current") {
+      s.toast("Order state is not current; emergency flatten rejected.", "err", 10000);
+      return;
+    }
+    const positions = s.positions.filter(position => !position.error && Number(position.size) > 0);
+    const orders = s.orders.filter(order => !order.error);
+    if (mode === "chase" && !positions.length) { s.toast("No open positions to Chase-close."); return; }
+    if (mode === "emergency" && !positions.length && !orders.length) { s.toast("Already flat with no open orders."); return; }
+    const action = mode === "emergency"
+      ? `market-close ${positions.length} position(s), confirm each is flat, then cancel ${orders.length} order(s)`
+      : `start ${positions.length} reduce-only closing Chase order(s); existing non-Chase orders stay open`;
+    const chaseNote = !s.armed ? "" : mode === "emergency"
+      ? " After every position is confirmed flat, active Chase workers will be stopped before the remaining orders are canceled."
+      : " This will refuse if another Chase is active or unresolved.";
+    if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} ${mode === "emergency" ? "EMERGENCY FLATTEN" : "SOFT FLATTEN"}?\n\nThis will ${action}.${chaseNote}`)) return;
+    set({ bulkBusy: true });
+    try {
+      const result = await api("/api/flatten", { method: "POST", body: { mode, requestId: newRequestId() } });
+      for (const item of result.results || []) {
+        if (item.chase) get().onChaseEvent(item.chase);
+      }
+      if (result.simulated) {
+        get().toast(`${mode === "emergency" ? "Emergency" : "Soft"} flatten simulated. Nothing was sent.`, "warn", 9000);
+      } else if (result.outcome === "confirmed") {
+        get().toast(
+          mode === "emergency"
+            ? `Emergency flatten confirmed: ${result.closedPositionCount} position(s) closed, ${result.cancelledOrderCount} order(s) canceled.`
+            : result.startedChaseCount
+              ? `Started ${result.startedChaseCount} reduce-only closing Chase order(s).`
+              : "All positions were already flat.",
+          "ok", 10000,
+        );
+      } else {
+        get().toast(`Flatten ${result.outcome || "failed"}: ${result.error || "not fully confirmed"}`, "err", 12000);
+      }
+      await Promise.all([get().refreshTables(), get().refreshAccount()]);
+    } catch (error) {
+      get().toast(`Flatten failed: ${error.message}`, "err", 12000);
+    } finally {
+      set({ bulkBusy: false });
     }
   },
 
