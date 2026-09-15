@@ -1,6 +1,7 @@
 import { fmt } from "../api";
 import useStore from "../store";
 import { hyperliquidProtection } from "../hyperliquid-protection";
+import { isLastStale, valuationPrice } from "../pricing.js";
 
 export default function BottomTabs() {
   const tab = useStore(s => s.tab);
@@ -115,15 +116,18 @@ function PositionsTable() {
       {native && <caption className="muted">Stop snapshots only. Execution is not guaranteed; combined ladder coverage is not assessed.</caption>}
       <thead><tr>
         <th>Symbol</th><th>Side</th><th className="num">Size</th><th className="num">Entry</th>
-        <th className="num" title={`${exchangeName} last-trade price`}>Last</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`${exchangeName} last-trade price, excluding fees and funding`}>Unrealized PnL · last</th>
+        <th className="num" title={`${exchangeName} book mid (bid/ask). Falls back to the last trade only if the book is unavailable.`}>Mid</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`${exchangeName} book mid (bid/ask), excluding fees and funding`}>Unrealized PnL · book</th>
         <th className="num">{readOnly ? "Cum funding" : "Funding"}</th><th>Liq Δ</th>{native && <th>Stop observation</th>}<th></th>
       </tr></thead>
       <tbody>
         {positions.map(p => {
           if (p.error) return null;
           const t = tickers[p.symbol];
-          const last = Number(t?.last);
-          const displayLast = Number.isFinite(last) && last > 0 ? last : null;
+          // Show the same basis the PnL beside it is calculated on, so the two
+          // columns always reconcile.
+          const { price: quote, basis } = valuationPrice(t);
+          const displayQuote = Number.isFinite(quote) && quote > 0 ? quote : null;
+          const staleLast = isLastStale(t);
           const pnl = computeUpnl(p);
           const protection = native ? hyperliquidProtection(p, orders, status?.state, orderState) : null;
           return (
@@ -132,10 +136,11 @@ function PositionsTable() {
               <td className={p.side === "long" ? "up" : "down"}>{p.side}</td>
               <td className="num">{fmt(p.size)}</td>
               <td className="num">{fmt(p.price)}</td>
-              <td className="num" title={`Mark for risk: ${fmt(t?.markPrice)}`}>{fmt(displayLast)}</td>
+              <td className="num" title={`Mark for risk: ${fmt(t?.markPrice)}`}>{fmt(displayQuote)}</td>
               <td className="num" style={{ color: "var(--warn)" }}>{p.liqPriceEstimate ? fmt(p.liqPriceEstimate) : "–"}</td>
               <td className={"num " + (pnl === null ? "muted" : pnl >= 0 ? "up" : "down")}
-                title={pnl === null ? "Last-price PnL unavailable" : `${readOnly ? "Hyperliquid" : "Kraken"} last: ${fmt(t?.last)}`}>{pnl !== null && pnl >= 0 ? "+" : ""}{fmt(pnl, 2)}</td>
+                title={pnl === null ? "Book PnL unavailable"
+                  : `${readOnly ? "Hyperliquid" : "Kraken"} ${basis}: ${fmt(quote)} · last: ${fmt(t?.last)}${staleLast ? " (stale, outside book)" : ""} · mark: ${fmt(t?.markPrice)}`}>{pnl !== null && pnl >= 0 ? "+" : ""}{fmt(pnl, 2)}</td>
               <td className="num">{fmt(readOnly ? p.fundingSinceOpen : p.unrealizedFunding, 4)}</td>
               <LiqDistCell liq={p.liqPriceEstimate} mark={t && t.markPrice} atr={p.atr14d} />
               {protection && <td title={protection.detail} className={protection.state === "missing" ? "down" : "muted"}>

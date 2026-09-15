@@ -35,7 +35,9 @@ export default function RulesPanel() {
     positions, account, instruments, tickers,
     peaks: rulePeaks,
     realized,
-    upnlFor: computeUpnl,
+    // Rules are judged on the price you would actually close into, so a
+    // take-profit only fires on profit that could genuinely be banked.
+    upnlFor: p => computeUpnl(p, { mode: "exit" }),
     now: Date.now(),
   });
 

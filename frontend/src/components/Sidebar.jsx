@@ -155,9 +155,9 @@ export default function Sidebar() {
         {readOnly && !unified && <div className="acct-row"><span className="k" title="Separate spot balance; perp orders need funds moved to perp">Spot USDC</span><span className="v">{Number.isFinite(spot) ? "$" + fmt(spot) : "–"}</span></div>}
         {!(readOnly && avail === null) && <div className="acct-row"><span className="k">{readOnly ? "Perp withdrawable" : "Avail margin"}</span><span className="v">{avail === null ? "–" : "$" + fmt(avail)}</span></div>}
         <div className="acct-row">
-          <span className="k" title={`${exchangeName} last-trade price, excluding fees and funding`}>Unrealized PnL · last</span>
+          <span className="k" title={`${exchangeName} book mid (bid/ask), excluding fees and funding. Falls back to the last trade only if the book is unavailable.`}>Unrealized PnL · book</span>
           {totalUpnl === null
-            ? <span className="v muted" title="Last-price PnL unavailable until valid position and last-trade data arrive">{fmt(null)}</span>
+            ? <span className="v muted" title="Book PnL unavailable until valid position and quote data arrive">{fmt(null)}</span>
             : <span className={"v " + (totalUpnl >= 0 ? "up" : "down")}>{(totalUpnl >= 0 ? "+$" : "-$") + fmt(Math.abs(totalUpnl), 2)}</span>}
         </div>
         {!readOnly && <RulesPanel />}

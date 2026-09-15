@@ -8,6 +8,7 @@ import { formatContractSize, normalizeContractSize, compareContractSizes } from 
 import { buildProtectionAction } from "./protection-action";
 import { buildChartOverlays } from "./chart-overlays";
 import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
+import { valuationPrice } from "./pricing.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
@@ -477,22 +478,28 @@ const useStore = create((set, get) => ({
     }
   },
 
-  computeUpnl(p) {
+  // mode "mid" values against the middle of the book (display default).
+  // mode "exit" values against the side you would actually close into, which is
+  // what the discipline rules are judged on.
+  computeUpnl(p, { mode = "mid" } = {}) {
     const s = get();
     if (!p?.symbol || p.error) return null;
     const inst = s.instruments.find(i => i.symbol === p.symbol);
     if (!inst) return null;
-    // Display only: never substitute mark-based exchange PnL for missing last-trade data.
-    const last = Number(s.tickers[p.symbol]?.last);
+    const side = String(p.side).toLowerCase();
+    // Value against the live book, not the tape. On thin pairs the last trade
+    // drifts outside the bid/ask and invents PnL that could never be realised;
+    // the book keeps updating even when nothing trades. Falls back to last only
+    // when the book is unusable, never to mark, which is not a tradeable price.
+    const { price } = valuationPrice(s.tickers[p.symbol], { mode, side });
     const mult = Number(inst.contractSize ?? 1);
     const size = Number(p.size), entry = Number(p.price);
-    const side = String(p.side).toLowerCase();
-    if (![last, mult, size, entry].every(v => Number.isFinite(v) && v > 0)
+    if (![price, mult, size, entry].every(v => Number.isFinite(v) && v > 0)
       || !["long", "short"].includes(side)) return null;
     const dir = side === "short" ? -1 : 1;
     const pnl = inst.type === "futures_inverse"
-      ? dir * size * mult * (1 / entry - 1 / last)
-      : dir * size * mult * (last - entry);
+      ? dir * size * mult * (1 / entry - 1 / price)
+      : dir * size * mult * (price - entry);
     return Number.isFinite(pnl) ? pnl : null;
   },
 
@@ -550,7 +557,9 @@ const useStore = create((set, get) => ({
     if (s.dataStatus.positions?.state !== "current") return;
     const entries = s.positions
       .filter(p => p && !p.error && Number(p.size) > 0)
-      .map(p => ({ key: peakKey(p), upnl: s.computeUpnl(p) }));
+      // Peaks must use the same basis the rules are judged on, or the giveback
+      // calculation would compare a mid-priced peak against an exit-priced now.
+      .map(p => ({ key: peakKey(p), upnl: s.computeUpnl(p, { mode: "exit" }) }));
     const peaks = nextPeaks(s.rulePeaks, entries);
     set({ rulePeaks: peaks });
     try { localStorage.setItem("kt.rulePeaks", JSON.stringify(peaks)); } catch { /* private mode or quota */ }
