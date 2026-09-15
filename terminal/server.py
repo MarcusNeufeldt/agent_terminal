@@ -1203,6 +1203,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                         "armed": armed,
                         "env": "demo" if client.is_demo else "live",
                         "hub": hub.status(),
+                        "binanceKlines": binance_klines.status(),
                         "hasKeys": bool(client.api_key and client.api_secret),
                         "aiModel": os.getenv("AI_CHAT_MODEL", ai_chat.DEFAULT_MODEL),
                     })

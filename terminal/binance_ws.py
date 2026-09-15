@@ -23,6 +23,10 @@ from ws_vendored import WebSocketEndpoint, open_websocket
 HOST = "fstream.binance.com"
 PATH = "/market/ws"
 THROTTLE = 0.5  # seconds between updates per symbol (closed bars always pass)
+# A half-open socket raises nothing and delivers nothing, so elapsed time since the
+# last kline is the only reliable liveness signal. Subscribed symbols push on every
+# trade and close a bar every 60s, so silence this long means the session is dead.
+STALE_AFTER = 90.0
 
 
 def _to_kraken_symbol(binance_symbol: str) -> str:
@@ -37,6 +41,22 @@ class BinanceKlineStream:
         self.hub = hub
         self.publish = publish
         self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._connected = False
+        self._last_message_ts: float | None = None
+        self._last_error: str | None = None
+
+    def status(self) -> dict:
+        """Reported by /api/health. Without this a stalled feed is invisible: the
+        socket looks healthy and the only symptom is a chart that stops moving."""
+        with self._lock:
+            age = None if self._last_message_ts is None else time.time() - self._last_message_ts
+            return {
+                "connected": self._connected,
+                "lastMessageAge": None if age is None else round(age, 1),
+                "stale": bool(age is not None and age > STALE_AFTER),
+                "error": self._last_error,
+            }
 
     def start(self) -> None:
         threading.Thread(target=self._run, name="binance-klines", daemon=True).start()
@@ -48,8 +68,12 @@ class BinanceKlineStream:
         while not self._stop.is_set():
             try:
                 self._session()
-            except Exception:
-                pass
+            except Exception as exc:  # keep reconnecting, but stop hiding why
+                with self._lock:
+                    self._last_error = repr(exc)
+            finally:
+                with self._lock:
+                    self._connected = False
             self._stop.wait(3.0)
 
     def _session(self) -> None:
@@ -58,6 +82,11 @@ class BinanceKlineStream:
         subscribed: set[str] = set()
         last_sent: dict[str, float] = {}
         req_id = 0
+        last_kline = time.monotonic()
+        with self._lock:
+            self._connected = True
+            self._last_message_ts = time.time()
+            self._last_error = None
         try:
             while not self._stop.is_set():
                 wanted = set()
@@ -77,7 +106,14 @@ class BinanceKlineStream:
                 try:
                     msg = conn.recv_json()
                 except (socket.timeout, TimeoutError):
-                    continue  # periodic wakeup: re-sync subscriptions; pongs keep us alive
+                    # Periodic wakeup: re-sync subscriptions; pongs keep us alive.
+                    # But a dead connection times out forever without ever raising,
+                    # so bail out and let _run reconnect instead of spinning silently.
+                    if time.monotonic() - last_kline > STALE_AFTER:
+                        with self._lock:
+                            self._last_error = "no kline data for %.0fs" % STALE_AFTER
+                        return
+                    continue
                 # /market/ws pushes raw events; tolerate a combined wrapper too
                 if isinstance(msg, dict) and msg.get("e") == "kline":
                     data = msg
@@ -92,6 +128,11 @@ class BinanceKlineStream:
                 ts = int(k.get("t") or 0) // 1000
                 if not bsym or not ts:
                     continue
+                # Liveness is recorded before the throttle, so suppressed updates
+                # still prove the connection is delivering.
+                last_kline = time.monotonic()
+                with self._lock:
+                    self._last_message_ts = time.time()
                 closed = bool(k.get("x"))
                 now = time.monotonic()
                 if not closed and now - last_sent.get(bsym, 0.0) < THROTTLE:
@@ -108,6 +149,10 @@ class BinanceKlineStream:
                     "closed": closed,
                 })
         finally:
+            # The session owns the connection, so it clears the flag too: returning
+            # on staleness must not leave the feed reported as connected.
+            with self._lock:
+                self._connected = False
             try:
                 conn.close()
             except Exception:
