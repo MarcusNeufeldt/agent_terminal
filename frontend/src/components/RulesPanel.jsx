@@ -24,7 +24,7 @@ export default function RulesPanel() {
   const instruments = useStore(s => s.instruments);
   const tickers = useStore(s => s.tickers);
   const rulePeaks = useStore(s => s.rulePeaks);
-  const statsRows = useStore(s => s.statsRows);
+  const realized = useStore(s => s.realizedRecent);
   const statsState = useStore(s => s.statsState);
   const computeUpnl = useStore(s => s.computeUpnl);
   const positionsState = useStore(s => s.dataStatus.positions?.state);
@@ -34,7 +34,7 @@ export default function RulesPanel() {
   const result = evaluateRules({
     positions, account, instruments, tickers,
     peaks: rulePeaks,
-    statsRows,
+    realized,
     upnlFor: computeUpnl,
     now: Date.now(),
   });

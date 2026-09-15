@@ -104,12 +104,16 @@ export function evaluateSize({ notional, equity, config = RULES }) {
 // close produces several, so lines for the same contract inside `windowSeconds` are
 // summed into a single realized event. `fee` is a positive cost (verified against
 // the executions endpoint), and contracts arrive lowercase.
-export function realizedEvents(rows, { windowSeconds = 60 } = {}) {
+// `sinceMs` bounds the scan: this ledger runs to tens of thousands of rows, and only
+// the last couple of hours can ever matter to the cooldown.
+export function realizedEvents(rows, { windowSeconds = 60, sinceMs = null } = {}) {
   if (!Array.isArray(rows) || windowSeconds <= 0) return [];
+  const sinceSeconds = Number.isFinite(sinceMs) ? sinceMs / 1000 : null;
   const buckets = new Map();
   for (const row of rows) {
     const t = Number(row?.t);
     if (!Number.isFinite(t)) continue;
+    if (sinceSeconds !== null && t < sinceSeconds) continue;
     const contract = String(row?.contract ?? "").toUpperCase();
     if (!contract || contract === "NULL") continue;
     const pnl = Number(row?.pnl);
@@ -167,16 +171,19 @@ export function evaluateRules({
   instruments = [],
   tickers = {},
   peaks = {},
-  statsRows = [],
+  realized = [],
   upnlFor,
   now = Date.now(),
   config = RULES,
 } = {}) {
   const equity = accountEquity(account);
   const live = positions.filter(p => p && !p.error && Number(p.size) > 0);
+  // This runs on every ticker tick, so the instrument lookup is indexed once rather
+  // than scanned per position.
+  const bySymbol = new Map(instruments.map(i => [i?.symbol, i]));
 
   const rows = live.map(position => {
-    const instrument = instruments.find(i => i.symbol === position.symbol) || null;
+    const instrument = bySymbol.get(position.symbol) || null;
     const last = Number(tickers?.[position.symbol]?.last);
     const upnl = typeof upnlFor === "function" ? upnlFor(position) : null;
     const key = peakKey(position);
@@ -203,9 +210,7 @@ export function evaluateRules({
   return {
     equity,
     rows,
-    cooldown: evaluateCooldown({
-      events: realizedEvents(statsRows), equity, now, config,
-    }),
+    cooldown: evaluateCooldown({ events: realized, equity, now, config }),
     // Warning only. The basket take-profit variant was tested and lost to the
     // per-position rule at every threshold, so this never produces a "close" signal.
     basket: {

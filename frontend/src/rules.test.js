@@ -133,6 +133,36 @@ test("realized events ignore unusable and non-contract ledger lines", () => {
   assert.deepEqual(realizedEvents([], { windowSeconds: 0 }), []);
 });
 
+test("realized events can be bounded to a recent window", () => {
+  const now = 10_000_000;
+  const rows = [
+    { t: (now - 10 * 24 * 3600 * 1000) / 1000, contract: "pf_old", pnl: -500, funding: 0, fee: 0 },
+    { t: (now - 60_000) / 1000, contract: "pf_new", pnl: -500, funding: 0, fee: 0 },
+  ];
+  const all = realizedEvents(rows);
+  assert.equal(all.length, 2);
+  // The cooldown only ever looks at the last couple of hours, so older ledger
+  // lines must be dropped before they reach the render path.
+  const recent = realizedEvents(rows, { sinceMs: now - 2 * 3600 * 1000 });
+  assert.deepEqual(recent.map(e => e.contract), ["PF_NEW"]);
+  assert.deepEqual(realizedEvents(rows, { sinceMs: now + 1000 }), []);
+});
+
+test("evaluateRules takes pre-computed realized events, not the raw ledger", () => {
+  const now = 10_000_000;
+  const realized = [{ t: (now - 60_000) / 1000, contract: "PF_XBTUSD", net: -400 }];
+  const result = evaluateRules({
+    positions: [],
+    account: { portfolioValue: EQUITY },
+    realized,
+    now,
+  });
+  assert.equal(result.cooldown.active, true);
+  assert.equal(result.cooldown.trigger.contract, "PF_XBTUSD");
+  // No events supplied means no cooldown, never a crash.
+  assert.equal(evaluateRules({ account: { portfolioValue: EQUITY }, now }).cooldown.active, false);
+});
+
 test("cooldown activates on a loss over 3% of equity and expires after two hours", () => {
   const now = 10_000_000;
   const loss = { t: (now - 60_000) / 1000, contract: "PF_XBTUSD", net: -200 };

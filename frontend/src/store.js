@@ -7,7 +7,7 @@ import { api, newRequestId, RES_SECONDS, setSignedTrading } from "./api";
 import { formatContractSize, normalizeContractSize, compareContractSizes } from "./size-precision";
 import { buildProtectionAction } from "./protection-action";
 import { buildChartOverlays } from "./chart-overlays";
-import { nextPeaks, peakKey } from "./rules.js";
+import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
@@ -67,7 +67,7 @@ const useStore = create((set, get) => ({
   gridRequest: null,
   gridResult: null,
   fills: [],
-  statsRows: [],
+  realizedRecent: [],
   statsState: "loading",
   rulePeaks: (() => {
     try {
@@ -556,14 +556,21 @@ const useStore = create((set, get) => ({
     try { localStorage.setItem("kt.rulePeaks", JSON.stringify(peaks)); } catch { /* private mode or quota */ }
   },
 
-  // Realized ledger lines drive the post-loss cooldown. On failure the previous rows
-  // are kept and the state is marked unavailable, so the panel says "unknown" rather
-  // than reporting "no cooldown" when it simply could not look.
+  // Realized ledger lines drive the post-loss cooldown. The ledger is tens of
+  // thousands of rows, so it is reduced to the handful of recent events here, once
+  // per poll -- never in render, which runs on every ticker tick. The raw rows are
+  // deliberately not stored.
+  //
+  // On failure the previous events are kept and the state is marked unavailable, so
+  // the panel says "unknown" rather than reporting "no cooldown" when it could not look.
   async refreshStats() {
     try {
       const r = await api("/api/stats");
       if (r.error) { set({ statsState: "unavailable" }); return; }
-      set({ statsRows: Array.isArray(r.rows) ? r.rows : [], statsState: "current" });
+      const events = realizedEvents(Array.isArray(r.rows) ? r.rows : [], {
+        sinceMs: Date.now() - RULES.cooldownMs * 2,
+      });
+      set({ realizedRecent: events, statsState: "current" });
     } catch {
       set({ statsState: "unavailable" });
     }
