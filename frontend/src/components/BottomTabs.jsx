@@ -116,16 +116,15 @@ function PositionsTable() {
       {native && <caption className="muted">Stop snapshots only. Execution is not guaranteed; combined ladder coverage is not assessed.</caption>}
       <thead><tr>
         <th>Symbol</th><th>Side</th><th className="num">Size</th><th className="num">Entry</th>
-        <th className="num" title={`${exchangeName} book mid (bid/ask). Falls back to the last trade only if the book is unavailable.`}>Mid</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`${exchangeName} book mid (bid/ask), excluding fees and funding`}>Unrealized PnL · book</th>
+        <th className="num" title={`${exchangeName} price this position closes into: the bid for a long, the ask for a short. Falls back to the last trade only if the book is unavailable.`}>Exit</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`${exchangeName} price this position closes into, excluding fees and funding`}>Unrealized PnL · exit</th>
         <th className="num">{readOnly ? "Cum funding" : "Funding"}</th><th>Liq Δ</th>{native && <th>Stop observation</th>}<th></th>
       </tr></thead>
       <tbody>
         {positions.map(p => {
           if (p.error) return null;
           const t = tickers[p.symbol];
-          // Show the same basis the PnL beside it is calculated on, so the two
-          // columns always reconcile.
-          const { price: quote, basis } = valuationPrice(t);
+          // Same basis as the PnL beside it: the side this position closes into.
+          const { price: quote, basis } = valuationPrice(t, { mode: "exit", side: p.side });
           const displayQuote = Number.isFinite(quote) && quote > 0 ? quote : null;
           const staleLast = isLastStale(t);
           const pnl = computeUpnl(p);

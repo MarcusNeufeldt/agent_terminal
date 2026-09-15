@@ -478,10 +478,10 @@ const useStore = create((set, get) => ({
     }
   },
 
-  // mode "mid" values against the middle of the book (display default).
-  // mode "exit" values against the side you would actually close into, which is
-  // what the discipline rules are judged on.
-  computeUpnl(p, { mode = "mid" } = {}) {
+  // One basis everywhere: the side of the book this position closes into, so the
+  // number on screen is what closing right now would actually realise. "mid" stays
+  // available for callers that want the untraded middle.
+  computeUpnl(p, { mode = "exit" } = {}) {
     const s = get();
     if (!p?.symbol || p.error) return null;
     const inst = s.instruments.find(i => i.symbol === p.symbol);
@@ -557,9 +557,7 @@ const useStore = create((set, get) => ({
     if (s.dataStatus.positions?.state !== "current") return;
     const entries = s.positions
       .filter(p => p && !p.error && Number(p.size) > 0)
-      // Peaks must use the same basis the rules are judged on, or the giveback
-      // calculation would compare a mid-priced peak against an exit-priced now.
-      .map(p => ({ key: peakKey(p), upnl: s.computeUpnl(p, { mode: "exit" }) }));
+      .map(p => ({ key: peakKey(p), upnl: s.computeUpnl(p) }));
     const peaks = nextPeaks(s.rulePeaks, entries);
     set({ rulePeaks: peaks });
     try { localStorage.setItem("kt.rulePeaks", JSON.stringify(peaks)); } catch { /* private mode or quota */ }

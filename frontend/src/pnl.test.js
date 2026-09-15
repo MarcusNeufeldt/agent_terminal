@@ -6,7 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 globalThis.localStorage = { getItem: () => null, setItem: () => {} };
 
-test("display PnL uses the live book, never mark or account PnL, without changing risk state", async t => {
+test("display PnL uses the exit side of the book, never mark or account PnL, without changing risk state", async t => {
   const vite = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
   t.after(() => vite.close());
   const oldFetch = globalThis.fetch;
@@ -36,16 +36,16 @@ test("display PnL uses the live book, never mark or account PnL, without changin
   assert.equal(total(), 20);
   const sidebar = render(Sidebar);
   const table = render(BottomTabs);
-  assert.ok(sidebar.includes("Unrealized PnL · book"));
+  assert.ok(sidebar.includes("Unrealized PnL · exit"));
   assert.ok(sidebar.includes(">+$20.00<"));
-  assert.ok(table.includes("Unrealized PnL · book"));
+  assert.ok(table.includes("Unrealized PnL · exit"));
   assert.ok(table.includes(">+20.00<"));
   assert.ok(table.includes("Kraken last: 110"));
-  assert.ok(table.includes(">Mid</th>"), "quote column is labelled by the basis it shows");
+  assert.ok(table.includes(">Exit</th>"), "quote column is labelled by the basis it shows");
   assert.ok(table.includes('title="Mark for risk: 150">110</td>'), "quote column must match the PnL price basis");
   assert.ok(table.includes("66.7% · 50.0×ATR"), "liquidation distance must still use mark, not last");
   store.setState({ pro: true, tickers: { [symbol]: { ...ticker, markPrice: 1000 } } });
-  assert.equal(pnl(position), 20, "mark changes and Pro Mode must not alter last-price PnL");
+  assert.equal(pnl(position), 20, "mark changes and Pro Mode must not alter book-based PnL");
   assert.equal(store.getState().proAdj(0), 3800);
   assert.equal(store.getState().proAdj(1000), 4800);
   const proSidebar = render(Sidebar);
@@ -87,7 +87,7 @@ test("display PnL uses the live book, never mark or account PnL, without changin
   const unavailableSidebar = render(Sidebar);
   const unavailableTable = render(BottomTabs);
   assert.ok(unavailableSidebar.includes("Book PnL unavailable"));
-  assert.ok(!unavailableSidebar.includes("+$555"), "never label account PnL as last-based PnL");
+  assert.ok(!unavailableSidebar.includes("+$555"), "never label account PnL as position PnL");
   assert.ok(unavailableTable.includes('title="Book PnL unavailable">–</td>'));
   assert.ok(unavailableTable.includes('title="Mark for risk: 150">–</td>'), "invalid last price is not displayed as a quote");
   assert.ok(!unavailableTable.includes("+999"), "never substitute exchange-reported PnL");
@@ -96,14 +96,15 @@ test("display PnL uses the live book, never mark or account PnL, without changin
   // outside the bid/ask and invents PnL that could never be realised.
   store.setState({ positions: [position], instruments: [instrument],
     tickers: { [symbol]: { symbol, last: 130, bid: 109, ask: 111, markPrice: 150 } } });
-  assert.equal(pnl(position), 20, "mid (110) is used, not the stale last (130) or mark (150)");
-  assert.equal(store.getState().computeUpnl(position, { mode: "exit" }), 18,
-    "rules value a long at the bid it would actually sell into");
-  assert.equal(store.getState().computeUpnl({ ...position, side: "short" }, { mode: "exit" }), -22,
+  assert.equal(pnl(position), 18,
+    "a long is valued at the bid it would sell into, not the stale last (130) or mark (150)");
+  assert.equal(store.getState().computeUpnl({ ...position, side: "short" }), -22,
     "a short is valued at the ask it would buy back at");
+  assert.equal(store.getState().computeUpnl(position, { mode: "mid" }), 20,
+    "mid stays available for callers that explicitly want the untraded middle");
   const bookTable = render(BottomTabs);
-  assert.ok(bookTable.includes(">110.00<") || bookTable.includes(">110<"),
-    "quote column shows the book mid, not the stale last");
+  assert.ok(bookTable.includes(">109.00<") || bookTable.includes(">109<"),
+    "quote column shows the exit price, not the stale last");
   assert.ok(bookTable.includes("stale, outside book"), "a last outside the book is flagged");
   assert.ok(!bookTable.includes("+60.00"), "the stale last must never reach displayed PnL");
 
