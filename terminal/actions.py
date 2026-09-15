@@ -26,6 +26,7 @@ from typing import Any, Callable
 
 from exchange_ops import ensure_client_id, parse_operation, unique_client_id
 from kraken_client import KrakenFuturesError
+from grid import GridError, build_grid_plan, validate_grid
 
 ACTION_TYPES = {"order", "ladder", "close", "replace_tp", "replace_sl", "cancel_all", "cancel_all_orders", "cancel", "chase"}
 ORDER_TYPES = {"mkt", "lmt", "post", "ioc", "stp", "take_profit"}
@@ -197,6 +198,11 @@ def _validate_order(a: dict[str, Any], ctx: ActionContext) -> dict[str, Any]:
 
 
 def _ladder_plan(a: dict[str, Any], ctx: ActionContext) -> dict[str, Any]:
+    if "startPrice" in a or "endPrice" in a:
+        try:
+            return build_grid_plan(a, ctx.instrument(str(a.get("symbol") or "").upper()))
+        except GridError as exc:
+            raise ActionError(str(exc)) from exc
     symbol = str(a.get("symbol") or "").strip().upper()
     side = str(a.get("side") or "").strip().lower()
     if not symbol.startswith("PF_"):
@@ -801,13 +807,29 @@ def _dispatch(a: dict[str, Any], ctx: ActionContext, armed: bool) -> dict[str, A
 
     if kind == "ladder":
         plan = _ladder_plan(a, ctx)
+        if "previewHash" in plan:
+            if a.get("previewHash") and a["previewHash"] != plan["previewHash"]:
+                raise ActionError("Grid changed since preview. Preview again before submitting.")
+            try:
+                plan["warnings"] += validate_grid(plan, ctx)
+            except GridError as exc:
+                raise ActionError(str(exc)) from exc
         if not armed:
             return {"type": kind, "ok": True, "outcome": "simulated", "simulated": True, **plan}
         if not a.get("reduceOnly"):
             ctx.require_new_exposure(plan["symbol"])
         responses = []
         for index, order in enumerate(plan["orders"], 1):
-            submitted = submit_one(ctx, order, f"kt-ladder-{plan['symbol']}-{index}")
+            try:
+                if "previewHash" in plan:
+                    if order.get("reduceOnly"):
+                        ctx.fresh_ticker(plan["symbol"])
+                    else:
+                        ctx.require_new_exposure(plan["symbol"])
+                submitted = submit_one(ctx, order, f"kt-ladder-{plan['symbol']}-{index}")
+            except Exception as exc:
+                submitted = {"params": order, "outcome": "rejected" if isinstance(exc, ActionError) else "unknown",
+                             "error": f"Grid stopped: {exc}"}
             responses.append({"order": submitted["params"], **submitted})
             if submitted["outcome"] != "confirmed":
                 responses.extend({
@@ -968,10 +990,13 @@ def normalize_actions(actions: Any, max_actions: int | None = 25) -> list[dict[s
     return normalized
 
 
-def build_flatten_actions(mode: str, positions: Any, orders: Any = None) -> list[dict[str, Any]]:
+def build_flatten_actions(mode: str, positions: Any, orders: Any = None, *, symbol: str = "",
+                          defer_order_validation: bool = False) -> list[dict[str, Any]]:
     """Build a server-authoritative all-position exit plan without side effects."""
     if mode not in {"emergency", "chase"}:
         raise ActionError("flatten mode must be emergency or chase")
+    if symbol and (mode != "chase" or not symbol.startswith("PF_")):
+        raise ActionError("symbol-scoped flatten requires chase mode and a PF_ symbol")
     if not isinstance(positions, list):
         raise ActionError("position state unavailable; flatten rejected")
     failed = next((str(row.get("error")) for row in positions if isinstance(row, dict) and row.get("error")), None)
@@ -984,12 +1009,12 @@ def build_flatten_actions(mode: str, positions: Any, orders: Any = None) -> list
         size = _dec(row.get("size") or 0)
         if size <= 0:
             continue
-        symbol = str(row.get("symbol") or "")
+        position_symbol = str(row.get("symbol") or "")
         side = str(row.get("side") or "").lower()
-        if not symbol.startswith("PF_"):
-            raise ActionError(f"cannot flatten unsupported position {symbol or '<missing>'}")
+        if not position_symbol.startswith("PF_"):
+            raise ActionError(f"cannot flatten unsupported position {position_symbol or '<missing>'}")
         if side not in {"long", "short"}:
-            raise ActionError(f"cannot flatten {symbol}: position side is unavailable")
+            raise ActionError(f"cannot flatten {position_symbol}: position side is unavailable")
         live.append((row, size))
 
     actions = [{
@@ -998,9 +1023,12 @@ def build_flatten_actions(mode: str, positions: Any, orders: Any = None) -> list
         **({"side": "sell" if str(row["side"]).lower() == "long" else "buy",
             "size": float(size), "reduceOnly": True, "closePosition": True}
            if mode == "chase" else {"percent": 100, "allowFlat": True}),
-    } for row, size in live]
+    } for row, size in live if not symbol or row["symbol"] == symbol]
     if mode == "chase":
         return actions
+    if defer_order_validation:
+        # Live emergency closes need positions, not pending-order data. Validate orders at cancellation.
+        return actions + [{"type": "cancel_all_orders"}]
 
     if not isinstance(orders, list):
         raise ActionError("order state unavailable; emergency flatten rejected")

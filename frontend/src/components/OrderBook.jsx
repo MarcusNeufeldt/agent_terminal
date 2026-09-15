@@ -8,6 +8,7 @@ export default function OrderBook() {
 
   useEffect(() => {
     let alive = true;
+    setBook({ asks: [], bids: [] });
     const poll = async () => {
       try {
         const data = await api(`/api/orderbook?symbol=${encodeURIComponent(symbol)}`);
@@ -16,7 +17,7 @@ export default function OrderBook() {
     };
     poll();
     const id = setInterval(poll, 2500);
-    return () => clearInterval(id);
+    return () => { alive = false; clearInterval(id); };
   }, [symbol]);
 
   const asks = (book.asks || []).slice(0, 9);

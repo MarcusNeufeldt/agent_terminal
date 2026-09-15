@@ -1,12 +1,21 @@
 import { useState } from "react";
 import { api, fmt } from "../api";
 import useStore from "../store";
+import RulesPanel from "./RulesPanel";
 
 export default function Sidebar() {
   const symbol = useStore(s => s.symbol);
+  const exchange = useStore(s => s.exchange);
+  const exchangeName = useStore(s => s.exchangeName);
+  const exchangeRouting = useStore(s => s.exchangeRouting);
+  const exchangeBusy = useStore(s => s.exchangeBusy);
+  const switchExchange = useStore(s => s.switchExchange);
+  const readOnly = useStore(s => s.readOnly);
+  const canTrade = useStore(s => s.canTrade);
   const armed = useStore(s => s.armed);
   const env = useStore(s => s.env);
   const pro = useStore(s => s.pro);
+  const proAdj = useStore(s => s.proAdj);
   const feed = useStore(s => s.feed);
   const account = useStore(s => s.account);
   const selectSymbol = useStore(s => s.selectSymbol);
@@ -23,14 +32,14 @@ export default function Sidebar() {
   const setSortBy = useStore(s => s.setSortBy);
   const rankByVol = useStore(s => s.rankByVol);
 
-  const totalUpnl = useStore(s => {
-    const live = s.positions.filter(p => p.symbol && !p.error);
-    if (!live.length) return null;
-    return live.reduce((acc, p) => acc + s.computeUpnl(p), 0);
-  });
-  const balance = pro ? Number(account.balanceValue || 0) + 4400 : Number(account.balanceValue || 0);
-  const availRaw = Number(account.availableMargin ?? account.collateralValue ?? 0);
-  const avail = pro ? availRaw + 4400 : availRaw;
+  const totalUpnl = useStore(s => s.totalUpnl());
+  const balanceRaw = account.balanceValue == null ? null : Number(account.balanceValue);
+  const available = readOnly ? account.withdrawable : account.availableMargin ?? account.collateralValue;
+  const availRaw = available == null ? null : Number(available);
+  const balance = Number.isFinite(balanceRaw) ? proAdj(balanceRaw) : null;
+  const avail = Number.isFinite(availRaw) ? proAdj(availRaw) : null;
+  const spot = account.spotUsdc == null ? null : Number(account.spotUsdc);
+  const unified = account.unified === true;
 
   const search = async (sym) => {
     setQuery("");
@@ -47,8 +56,18 @@ export default function Sidebar() {
   return (
     <aside id="sidebar">
       <div className="brand">
-        <h1>KF <span>Terminal</span></h1>
+        <h1>{readOnly ? "HL" : "KF"} <span>Terminal</span></h1>
+        <label className="exchange-picker" htmlFor="exchange-select">
+          Exchange
+          <select id="exchange-select" value={exchange} disabled={!exchangeRouting || exchangeBusy}
+            title={exchangeRouting ? "Switch venue and disarm the terminal" : "Restart the updated backend to enable exchange switching"}
+            onChange={e => switchExchange(e.target.value)}>
+            <option value="kraken">Kraken Futures</option>
+            <option value="hyperliquid">Hyperliquid · Read-only</option>
+          </select>
+        </label>
         <div className="badges">
+          {readOnly && !canTrade && <span className="badge">READ-ONLY</span>}
           <span className={"badge" + (env === "live" ? " live" : "")}>{env.toUpperCase()}</span>
           {armed && <span className="badge armed">ARMED</span>}
           <span className="badge" title="market data feed">
@@ -79,12 +98,12 @@ export default function Sidebar() {
 
       <div className="list-tools">
         <button className="tool-btn" title="Pair filters" onClick={() => setFiltersOpen(true)}>⚙ Filters</button>
-        <button className="tool-btn" title="Rank markets by realized volatility" onClick={() => rankByVol()}>
+        <button className="tool-btn" disabled={readOnly} title="Rank markets by realized volatility" onClick={() => rankByVol()}>
           {volLoading ? "Scanning…" : "⚡ Vol rank"}
         </button>
         <select className="tool-select" value={sortBy} onChange={e => setSortBy(e.target.value)} title="Sort pairs">
           <option value="vol24">24h volume</option>
-          <option value="realized">Realized vol</option>
+          <option value="realized" disabled={readOnly}>Realized vol</option>
           <option value="change">|24h change|</option>
           <option value="symbol">Symbol</option>
         </select>
@@ -110,7 +129,7 @@ export default function Sidebar() {
                   <div className="wl-sub">{rv !== undefined ? `vol ${rv.toFixed(2)}%` : `$${fmtK(r.vol24h)} vol`}</div>
                 </div>
                 <div>
-                  <div className="wl-price">{r.last !== null && r.last !== undefined ? fmt(r.last) : "–"}</div>
+                  <div className="wl-price" title={readOnly ? "Hyperliquid mark price; header and position PnL use actual last trades" : "Last trade"}>{fmt(readOnly ? r.markPrice : r.last)}</div>
                   <div className={"wl-change " + ((r.change24h ?? 0) >= 0 ? "up" : "down")}>
                     {r.change24h !== null && r.change24h !== undefined ? (r.change24h >= 0 ? "+" : "") + r.change24h.toFixed(2) + "%" : ""}
                   </div>
@@ -132,22 +151,21 @@ export default function Sidebar() {
       )}
 
       <div className="sidebar-footer">
-        <div className="acct-row"><span className="k">Balance</span><span className="v">{"$" + fmt(balance)}</span></div>
-        <div className="acct-row"><span className="k">Avail margin</span><span className="v">{"$" + fmt(avail)}</span></div>
+        <div className="acct-row"><span className="k" title={unified ? "Unified account: one USDC balance collateralises both spot and perps, so no transfer is needed" : undefined}>{readOnly ? (unified ? "USDC balance" : "Perp balance") : "Balance"}</span><span className="v">{balance === null ? "–" : "$" + fmt(balance)}</span></div>
+        {readOnly && !unified && <div className="acct-row"><span className="k" title="Separate spot balance; perp orders need funds moved to perp">Spot USDC</span><span className="v">{Number.isFinite(spot) ? "$" + fmt(spot) : "–"}</span></div>}
+        {!(readOnly && avail === null) && <div className="acct-row"><span className="k">{readOnly ? "Perp withdrawable" : "Avail margin"}</span><span className="v">{avail === null ? "–" : "$" + fmt(avail)}</span></div>}
         <div className="acct-row">
-          <span className="k">Unrealized PnL</span>
+          <span className="k" title={`${exchangeName} last-trade price, excluding fees and funding`}>Unrealized PnL · last</span>
           {totalUpnl === null
-            ? (() => {
-                const pnl = Number(account.pnl ?? account.totalUnrealized ?? 0);
-                return <span className={"v " + (pnl >= 0 ? "up" : "down")}>{(pnl >= 0 ? "+$" : "-$") + fmt(Math.abs(pnl))}</span>;
-              })()
+            ? <span className="v muted" title="Last-price PnL unavailable until valid position and last-trade data arrive">{fmt(null)}</span>
             : <span className={"v " + (totalUpnl >= 0 ? "up" : "down")}>{(totalUpnl >= 0 ? "+$" : "-$") + fmt(Math.abs(totalUpnl), 2)}</span>}
         </div>
-        <button id="arm-btn" className={armed ? "armed" : ""} onClick={armToggle}>
-          {armed ? "ARMED — click to disarm" : "DISARMED — click to arm"}
+        {!readOnly && <RulesPanel />}
+        <button id="arm-btn" disabled={(!canTrade && !armed) || exchangeBusy} className={armed ? "armed" : ""} onClick={armToggle}>
+          {!canTrade && !armed ? "READ-ONLY · Trading unavailable" : armed ? "ARMED — click to disarm" : "DISARMED — click to arm"}
         </button>
         <div className="check-row pro-mode-row">
-          <input id="pro-toggle" type="checkbox" checked={pro} onChange={togglePro} />
+          <input id="pro-toggle" type="checkbox" disabled={readOnly} checked={pro} onChange={togglePro} />
           <label htmlFor="pro-toggle">Pro-Mode</label>
         </div>
       </div>

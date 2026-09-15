@@ -9,13 +9,14 @@ forever; compaction state rides on the session row.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).resolve().parent / "terminal.db"
+DB_PATH = Path(os.environ.get("TERMINAL_DB_PATH") or Path(__file__).resolve().parent / "terminal.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -61,6 +62,45 @@ CREATE TABLE IF NOT EXISTS write_requests (
     result_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS write_reconciliations (
+    request_id TEXT PRIMARY KEY REFERENCES write_requests(request_id),
+    evidence_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hyperliquid_prepared_orders (
+    request_id TEXT PRIMARY KEY REFERENCES write_requests(request_id),
+    action_json TEXT NOT NULL,
+    prepared_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hyperliquid_fills (
+    network TEXT NOT NULL,
+    account TEXT NOT NULL,
+    tid TEXT NOT NULL,
+    oid TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    PRIMARY KEY (network, account, tid, oid)
+);
+CREATE INDEX IF NOT EXISTS idx_hyperliquid_fills_order ON hyperliquid_fills(network, account, oid);
+CREATE TABLE IF NOT EXISTS hyperliquid_fill_scans (
+    network TEXT NOT NULL,
+    account TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    scanned_at TEXT NOT NULL,
+    PRIMARY KEY (network, account, start_ms, end_ms)
+);
+CREATE TABLE IF NOT EXISTS tp_cleanup (
+    symbol TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS grid_moves (
+    operation_id TEXT PRIMARY KEY,
+    grid_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    payload_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts INTEGER PRIMARY KEY,
@@ -346,6 +386,10 @@ class Database:
                         return {"state": "pending"}
                     return {"state": "replay", "status": int(row["response_status"] or 200), "result": result}
                 return {"state": "pending"}
+            if endpoint in {"/api/order", "/api/grid", "/api/leverage", "/api/chart-order"} and payload.get("venue") == "hyperliquid":
+                unresolved = self._venue_unresolved(payload["network"], payload["account"], limit=1)
+                if unresolved:
+                    return {"state": "blocked", "requestId": unresolved[0]["requestId"]}
             now = _now()
             self._conn.execute(
                 "INSERT INTO write_requests (request_id, endpoint, payload_json, state, created_at, updated_at) "
@@ -355,6 +399,162 @@ class Database:
             self._conn.commit()
             return {"state": "new"}
 
+    def _venue_unresolved(self, network: str, account: str, limit: int = 101) -> list[dict[str, Any]]:
+        """Caller holds the database lock. Reconciliation never overwrites the original receipt."""
+        rows = self._conn.execute(
+            "SELECT w.request_id, w.endpoint, w.payload_json, w.state, w.result_json, w.created_at "
+            "FROM write_requests w LEFT JOIN write_reconciliations r ON r.request_id=w.request_id "
+            "WHERE w.endpoint IN ('/api/order','/api/grid','/api/leverage','/api/chart-order') "
+            "AND (r.request_id IS NULL OR COALESCE(json_extract(CASE WHEN json_valid(r.evidence_json) "
+            "THEN r.evidence_json ELSE '{}' END, '$.outcome'), '')!='reconciled') "
+            "AND json_extract(w.payload_json, '$.venue')='hyperliquid' "
+            "AND json_extract(w.payload_json, '$.network')=? "
+            "AND json_extract(w.payload_json, '$.account')=? "
+            "AND (w.state!='completed' OR w.result_json IS NULL OR NOT json_valid(w.result_json) "
+            "OR COALESCE(json_extract(CASE WHEN json_valid(w.result_json) THEN w.result_json ELSE '{}' END, '$.outcome'), '') "
+            "NOT IN ('confirmed','rejected','simulated')) ORDER BY w.rowid ASC LIMIT ?",
+            (network, account.lower(), limit),
+        ).fetchall()
+        result = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            result.append({"requestId": row["request_id"], "endpoint": row["endpoint"], "body": payload["body"],
+                           "cloid": payload["body"].get("cloid"), "outcome": "unknown",
+                           "uncertain": True, "createdAt": row["created_at"]})
+        return result
+
+    def venue_unresolved(self, network: str, account: str) -> dict[str, Any]:
+        with self._lock:
+            items = self._venue_unresolved(network, account)
+        return {"items": items[:100], "hasMore": len(items) > 100}
+
+    def venue_write_request(self, request_id: str, network: str, account: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM write_requests WHERE request_id=? AND endpoint IN ('/api/order','/api/grid','/api/leverage','/api/chart-order')",
+                (request_id,),
+            ).fetchone()
+        payload = json.loads(row["payload_json"]) if row else {}
+        if (payload.get("venue"), payload.get("network"), payload.get("account")) != (
+                "hyperliquid", network, account.lower()):
+            return None
+        return payload["body"]
+
+    def prepare_hyperliquid_order(self, request_id: str, action: dict[str, Any]) -> None:
+        encoded = json.dumps(action, separators=(",", ":"), allow_nan=False)
+        with self._lock, self._conn:
+            request = self._conn.execute(
+                "SELECT state, payload_json FROM write_requests WHERE request_id=? AND endpoint IN ('/api/order','/api/grid','/api/leverage','/api/chart-order')",
+                (request_id,),
+            ).fetchone()
+            if not request or request["state"] != "pending" or json.loads(request["payload_json"]).get("venue") != "hyperliquid":
+                raise ValueError("No pending Hyperliquid request for prepared order")
+            previous = self._conn.execute(
+                "SELECT action_json FROM hyperliquid_prepared_orders WHERE request_id=?", (request_id,),
+            ).fetchone()
+            if previous:
+                if previous[0] != encoded:
+                    raise ValueError("Prepared order identity changed")
+                return
+            self._conn.execute("INSERT INTO hyperliquid_prepared_orders VALUES (?, ?, ?)",
+                               (request_id, encoded, _now()))
+
+    def venue_prepared_order(self, request_id: str, network: str, account: str) -> dict[str, Any] | None:
+        if self.venue_write_request(request_id, network, account) is None:
+            return None
+        with self._lock:
+            row = self._conn.execute("SELECT action_json FROM hyperliquid_prepared_orders WHERE request_id=?", (request_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def venue_recovery_state(self, request_id, network, account):
+        if self.venue_write_request(request_id, network, account) is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT w.result_json, r.evidence_json FROM write_requests w "
+                "LEFT JOIN write_reconciliations r ON r.request_id=w.request_id WHERE w.request_id=?", (request_id,),
+            ).fetchone()
+        result = {}
+        for key, value in zip(("result", "evidence"), row):
+            try:
+                decoded = json.loads(value or '{}')
+                result[key] = decoded if isinstance(decoded, dict) else {}
+            except json.JSONDecodeError:
+                result[key] = {}
+        return result
+
+    def save_batch_observation(self, request_id, cloid, observation):
+        """Merge one validated readback without releasing a partially known batch."""
+        with self._lock:
+            prepared = self._conn.execute("SELECT action_json FROM hyperliquid_prepared_orders WHERE request_id=?", (request_id,)).fetchone()
+            orders = json.loads(prepared[0]).get("orders") if prepared else None
+            if not isinstance(orders, list) or not 2 <= len(orders) <= 20 or any(not isinstance(order, dict) for order in orders):
+                raise ValueError("No prepared batch for reconciliation")
+            expected = [order.get("c") for order in orders]
+            if any(not isinstance(value, str) for value in expected) or len(set(expected)) != len(expected) or cloid not in expected:
+                raise ValueError("Invalid prepared batch identities")
+            previous = self._conn.execute("SELECT evidence_json FROM write_reconciliations WHERE request_id=?", (request_id,)).fetchone()
+            previous = json.loads(previous[0]) if previous else {}
+            targets = previous.get("targets", {})
+            if not isinstance(targets, dict) or any(key not in expected or not isinstance(value, dict) for key, value in targets.items()):
+                raise ValueError("Invalid existing batch reconciliation evidence")
+            if observation.get("state") == "observed":
+                def identity(value):
+                    return str(value.get("status", {}).get("order_id", value.get("row", {}).get("oid")))
+                oid = identity(observation)
+                if not oid.isascii() or not oid.isdigit() or len(oid) > 20 or not 0 < int(oid) < 2**64:
+                    raise ValueError("Observed batch target requires an exact exchange order id")
+                if any(key != cloid and value.get("state") == "observed" and identity(value) == oid for key, value in targets.items()):
+                    observation = {**observation, "state": "unknown", "error": "Duplicate exchange order identity across batch targets"}
+            # A delayed failed read must not erase an already verified submission identity.
+            if targets.get(cloid, {}).get("state") not in {"observed", "rejected"}:
+                targets[cloid] = observation
+            complete = all(targets.get(key, {}).get("state") in {"observed", "rejected"} for key in expected)
+            evidence = {"requestId": request_id, "kind": "batch", "batch": True, "targets": targets,
+                        "outcome": "reconciled" if complete else "unknown", "canReplace": False,
+                        "remaining": sum(targets.get(key, {}).get("state") not in {"observed", "rejected"} for key in expected)}
+            self._conn.execute(
+                "INSERT INTO write_reconciliations VALUES (?, ?, ?) ON CONFLICT(request_id) DO UPDATE SET "
+                "evidence_json=excluded.evidence_json, updated_at=excluded.updated_at",
+                (request_id, json.dumps(evidence, allow_nan=False), _now()),
+            )
+            self._conn.commit()
+            return evidence
+
+    def venue_cancellations(self, network: str, account: str, request_id=None) -> dict[str, Any]:
+        with self._lock:
+            records = self._conn.execute(
+                "SELECT w.request_id, w.payload_json, w.result_json, w.created_at, r.evidence_json "
+                "FROM write_requests w LEFT JOIN write_reconciliations r ON r.request_id=w.request_id "
+                "WHERE w.endpoint='/api/cancel' AND json_extract(w.payload_json, '$.venue')='hyperliquid' "
+                "AND json_extract(w.payload_json, '$.network')=? AND json_extract(w.payload_json, '$.account')=? "
+                "AND (? IS NULL OR w.request_id=?) ORDER BY w.rowid DESC LIMIT 21",
+                (network, account.lower(), request_id, request_id),
+            ).fetchall()
+        items = []
+        for row in records[:20]:
+            try:
+                result = json.loads(row['result_json'] or '{}')
+            except json.JSONDecodeError:
+                result = {}
+            items.append({"requestId": row['request_id'], "body": json.loads(row['payload_json'])["body"],
+                          "result": result, "createdAt": row['created_at'],
+                          "evidence": json.loads(row['evidence_json'] or '{}')})
+        return {"items": items, "hasMore": len(records) > 20}
+
+    def save_write_reconciliation(self, request_id: str, evidence: dict[str, Any], *, target=None) -> None:
+        with self._lock:
+            if target is not None:
+                row = self._conn.execute("SELECT evidence_json FROM write_reconciliations WHERE request_id=?", (request_id,)).fetchone()
+                previous = json.loads(row[0]) if row else {}
+                evidence = {"kind": "cancel", "targets": {**previous.get("targets", {}), target: evidence}}
+            self._conn.execute(
+                "INSERT INTO write_reconciliations VALUES (?, ?, ?) "
+                "ON CONFLICT(request_id) DO UPDATE SET evidence_json=excluded.evidence_json, updated_at=excluded.updated_at",
+                (request_id, json.dumps(evidence, allow_nan=False), _now()),
+            )
+            self._conn.commit()
+
     def complete_write_request(self, request_id: str, status: int, result: Any) -> None:
         with self._lock:
             self._conn.execute(
@@ -363,6 +563,39 @@ class Database:
                 (status, json.dumps(result, default=str), _now(), request_id),
             )
             self._conn.commit()
+
+    def save_hyperliquid_fill_page(self, network, account, fills, start, end, state) -> int:
+        account = account.lower()
+        inserted = 0
+        with self._lock, self._conn:
+            for fill in fills:
+                identity = (network, account, fill["id"], fill["orderId"])
+                encoded = json.dumps(fill, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                previous = self._conn.execute(
+                    "SELECT payload_json FROM hyperliquid_fills WHERE network=? AND account=? AND tid=? AND oid=?",
+                    identity,
+                ).fetchone()
+                if previous:
+                    if previous[0] != encoded:
+                        raise ValueError("Conflicting persisted Hyperliquid fill; page rolled back")
+                    continue
+                self._conn.execute("INSERT INTO hyperliquid_fills VALUES (?, ?, ?, ?, ?, ?)",
+                                   (*identity, encoded, fill["time"]))
+                inserted += 1
+            self._conn.execute(
+                "INSERT INTO hyperliquid_fill_scans VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(network, account, start_ms, end_ms) DO UPDATE SET state=excluded.state, scanned_at=excluded.scanned_at",
+                (network, account, start, end, state, _now()),
+            )
+        return inserted
+
+    def hyperliquid_order_fills(self, network, account, order_id):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM hyperliquid_fills WHERE network=? AND account=? AND oid=? ORDER BY timestamp_ms, tid",
+                (network, account.lower(), order_id),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     # ---- actions log ----
 
@@ -394,6 +627,54 @@ class Database:
                 "INSERT INTO actions_log (ts, mode, armed, actions_json, results_json) VALUES (?, ?, ?, ?, ?)",
                 (_now(), mode, 1 if armed else 0,
                  json.dumps(actions, default=str), json.dumps(results, default=str)),
+            )
+            self._conn.commit()
+
+    def tp_cleanup_states(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT payload_json FROM tp_cleanup").fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def save_tp_cleanup(self, state: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO tp_cleanup VALUES (?, ?) ON CONFLICT(symbol) DO UPDATE SET payload_json=excluded.payload_json",
+                (state["symbol"], json.dumps(state)),
+            )
+            self._conn.commit()
+
+    def recorded_grids(self, symbol: str, side: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, actions_json, results_json FROM actions_log WHERE armed = 1 ORDER BY id DESC LIMIT 500"
+            ).fetchall()
+        grids = []
+        for row in rows:
+            for index, (action, result) in enumerate(zip(json.loads(row["actions_json"]), json.loads(row["results_json"]))):
+                if action.get("type") != "ladder" or result.get("symbol") != symbol or result.get("side") != side:
+                    continue
+                orders = [{**r["order"], "orderId": r["exchangeId"]} for r in result.get("responses", [])
+                          if r.get("outcome") == "confirmed" and r.get("exchangeId") and r.get("order")]
+                if orders:
+                    grids.append({"gridId": f"{row['id']}:{index}", "symbol": symbol, "side": side,
+                                  "settings": action, "orders": orders})
+        return grids
+
+    def grid_move(self, operation_id: str = "", grid_id: str = "") -> dict[str, Any] | None:
+        with self._lock:
+            if operation_id:
+                row = self._conn.execute("SELECT payload_json FROM grid_moves WHERE operation_id = ?", (operation_id,)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT payload_json FROM grid_moves WHERE grid_id = ? AND state != 'confirmed' ORDER BY rowid DESC LIMIT 1", (grid_id,)
+                ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_grid_move(self, move: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO grid_moves VALUES (?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET state=excluded.state, payload_json=excluded.payload_json",
+                (move["operationId"], move["gridId"], move["outcome"], json.dumps(move)),
             )
             self._conn.commit()
 

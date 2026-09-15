@@ -178,6 +178,8 @@ class RobustnessTests(unittest.TestCase):
         client = SimpleNamespace(post=lambda path, params=None, **_kwargs: (
             calls.append((path, params)) or {"result": "success", "sendStatus": {"status": "placed", "order_id": "close-1"}}
         ))
+        client.get = lambda *_args, **_kwargs: {"result": "success", "openPositions": [
+            {"symbol": "PF_TESTUSD", "side": "short", "size": 10}]}
         worker = self._chase_worker(client)
         worker.spec["reduceOnly"] = True
         worker.pegs = 1
@@ -194,16 +196,19 @@ class RobustnessTests(unittest.TestCase):
         self.assertIsNotNone(worker._active)
         self.assertIsNone(worker._active["orderId"])
 
-    def test_chase_missing_order_without_full_fill_is_unknown(self):
+    def test_chase_verified_external_cancellation_stops_without_replacement(self):
         def get(path, **_kwargs):
             return {"result": "success", "openOrders": []} if path == "/openorders" else {"result": "success", "fills": []}
 
-        worker = self._chase_worker(SimpleNamespace(get=get))
+        client = SimpleNamespace(get=get, post=lambda *_args, **_kwargs: {
+            "result": "success", "orders": [{"status": "CANCELLED", "order": {"orderId": "order-1", "filled": 0}}],
+        })
+        worker = self._chase_worker(client)
         worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
-        with self.assertRaises(ChaseUnknown):
-            worker._reconcile_resting()
+        self.assertFalse(worker._reconcile_resting())
+        self.assertEqual(worker.status, "cancelled")
         self.assertEqual(worker.filled, 0)
-        self.assertIsNotNone(worker._active)
+        self.assertIsNone(worker._active)
 
     def test_chase_open_order_read_failure_leaves_order_untouched(self):
         def get(*_args, **_kwargs):
@@ -723,6 +728,24 @@ class RobustnessTests(unittest.TestCase):
             {"type": "chase", "symbol": "PF_XBTUSD", "side": "sell", "size": 2.0, "reduceOnly": True, "closePosition": True},
             {"type": "chase", "symbol": "PF_ETHUSD", "side": "buy", "size": 3.0, "reduceOnly": True, "closePosition": True},
         ])
+
+    def test_symbol_soft_close_only_targets_selected_position(self):
+        positions = [
+            {"symbol": "PF_XBTUSD", "side": "long", "size": 1},
+            {"symbol": "PF_ETHUSD", "side": "short", "size": 2},
+        ]
+        plan = build_flatten_actions("chase", positions, symbol="PF_ETHUSD")
+        self.assertEqual(plan, [{"type": "chase", "symbol": "PF_ETHUSD", "side": "buy",
+                                 "size": 2.0, "reduceOnly": True, "closePosition": True}])
+        long_plan = build_flatten_actions("chase", positions, symbol="PF_XBTUSD")
+        self.assertEqual([(action["symbol"], action["side"]) for action in long_plan], [("PF_XBTUSD", "sell")])
+        self.assertEqual(build_flatten_actions("chase", positions, symbol="PF_SOLUSD"), [])
+        with self.assertRaises(ActionError):
+            build_flatten_actions("chase", [{"error": "unavailable"}], symbol="PF_ETHUSD")
+        with self.assertRaises(ActionError):
+            build_flatten_actions("emergency", positions, [], symbol="PF_ETHUSD")
+        with self.assertRaises(ActionError):
+            build_flatten_actions("chase", positions, symbol="PI_XBTUSD")
 
     def test_failed_emergency_close_keeps_all_orders_working(self):
         calls = []
@@ -1266,7 +1289,8 @@ class RobustnessTests(unittest.TestCase):
         self.assertIn("explicitly asks for a draft", tools["propose_actions"]["description"])
         self.assertIn("matching direct write tool", ai_chat.SYSTEM_PROMPT)
         ladder = tools["place_ladder"]["parameters"]
-        self.assertIn("depthPercent", ladder["required"])
+        self.assertEqual(ladder["required"], ["symbol", "side", "orders"])
+        self.assertTrue({"depthPercent", "startPrice", "endPrice", "size", "notional", "reduceOnly"} <= ladder["properties"].keys())
         self.assertNotIn("rangePercent", ladder["properties"])
 
     def test_market_scan_is_pf_only_and_parameter_cached(self):

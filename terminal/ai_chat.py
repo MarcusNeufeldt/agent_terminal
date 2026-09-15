@@ -137,6 +137,11 @@ def build_context_snapshot(
 
 SYSTEM_PROMPT = """You are the AI assistant inside a Kraken Futures trading terminal.
 You help with market questions, position math, risk sanity checks, and drafting trades.
+For requests to cancel a symbol's buy or sell orders, call cancel_all_for_symbol ONCE with symbol and side. Do not cancel those orders one at a time. Never omit side for a side-specific request, because that could cancel opposite-side protection.
+For grid moves, use move_grid, never cancel_all_for_symbol followed by place_ladder.
+Use get_grids for saved grid settings and pending operation IDs. Current remaining orders are not the original grid definition.
+On retry, resume the saved operationId. Do not replenish filled/cancelled rungs or increase size unless explicitly requested.
+Always explain partial/unknown execution and your own cancellations. Execution records in prior replies are authoritative evidence of those actions.
 
 MEMORY:
 You maintain a persistent memory file via the `update_memory` tool. It is injected back into
@@ -426,7 +431,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "place_ladder",
-            "description": "Place a grid of limit orders splitting a USD notional across a price range. IMMEDIATE like place_order.",
+            "description": "Place a whole grid in ONE call, not separate place_order calls. For an exact range use startPrice, endPrice and either size (total contracts) OR notional (USD), with 2-20 orders. Buy steps down, sell steps up. For position multiples, read the current position then pass its multiplied total size. Legacy percentage grids use notional plus depthPercent. IMMEDIATE like place_order.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -434,10 +439,14 @@ TOOLS: list[dict[str, Any]] = [
                     "side": {"type": "string", "enum": ["buy", "sell"]},
                     "notional": {"type": "number", "description": "Total USD notional"},
                     "orders": {"type": "integer", "description": "Number of rungs, 1-20"},
-                    "depthPercent": {"type": "number", "description": "Total price span of the grid from current price, percent"},
+                    "depthPercent": {"type": "number", "description": "Legacy span from current price, percent"},
+                    "startPrice": {"type": "number"},
+                    "endPrice": {"type": "number"},
+                    "size": {"type": "number", "description": "Total contracts, not per rung. Use instead of notional."},
+                    "reduceOnly": {"type": "boolean"},
                     "orderType": {"type": "string", "enum": ["lmt", "post"]},
                 },
-                "required": ["symbol", "side", "notional", "orders", "depthPercent"],
+                "required": ["symbol", "side", "orders"],
             },
         },
     },
@@ -506,18 +515,51 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "cancel_all_for_symbol",
-            "description": "Cancel every working order for one symbol. IMMEDIATE.",
+            "description": "Cancel matching working orders in ONE call. For 'cancel ZRO buy orders', supply symbol PF_ZROUSD and side buy. Omitting side cancels both sides, including protection; do that only when explicitly requested. IMMEDIATE.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string"},
-                    "reduceOnly": {"type": "boolean", "description": "Only cancel reduce-only orders"},
+                    "side": {"type": "string", "enum": ["buy", "sell"], "description": "Required for side-specific cancellation; preserves all orders on the opposite side."},
+                    "reduceOnly": {"type": "boolean", "description": "Optional filter: true selects exits, false selects non-reduce-only orders. Omit to include both."},
                 },
                 "required": ["symbol"],
             },
         },
     },
 ]
+
+
+TOOLS.extend([
+    {"type": "function", "function": {
+        "name": "get_grids", "description": "Read saved grid identity, original settings, working-order counts and pending move IDs. Use this instead of guessing the original grid from remaining orders.",
+        "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["buy", "sell"]}}, "required": ["symbol", "side"]},
+    }},
+    {"type": "function", "function": {
+        "name": "move_grid", "description": "Move a recorded entry grid in ONE ARM-gated call using exact-ID price amendments. Preserves working quantities and absolute spacing. NEVER cancel/recreate a grid to move it, and NEVER replenish filled or cancelled rungs. Resolves one unambiguous grid automatically; otherwise use get_grids. Defaults to last price, rejects crossing prices before editing. Resume interrupted moves with the returned operationId, keeping the original target. Partial failures must be reported, not hidden.",
+        "parameters": {"type": "object", "properties": {
+            "symbol": {"type": "string"}, "side": {"type": "string", "enum": ["buy", "sell"]},
+            "gridId": {"type": "string"}, "operationId": {"type": "string"},
+            "anchor": {"type": "string", "enum": ["last", "best_bid", "best_ask"]},
+        }, "required": ["symbol", "side"]},
+    }},
+])
+
+WRITE_TOOLS = {"place_order", "place_ladder", "close_position", "replace_tp", "replace_sl", "cancel_order", "cancel_all_for_symbol", "move_grid"}
+
+
+def execution_receipt(name, args, result):
+    rows = result.get("results") or result.get("responses") or []
+    counts = {}
+    for row in rows:
+        status = row.get("outcome", "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    if name == "move_grid":
+        counts = result.get("counts", {})
+    detail = ", ".join(f"{n} {status}" for status, n in counts.items())
+    error = result.get("error") or next((r.get("error") for r in rows if r.get("error")), "")
+    identity = f"; operationId={result['operationId']}" if result.get("operationId") else ""
+    return f"{name} {args.get('symbol', '')}: {result.get('outcome', 'unknown')}. {detail}{identity}" + (f". {error}" if error else "")
 
 
 def _compaction_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -671,6 +713,8 @@ def respond(
     action_blocks: list[list[dict[str, Any]]] = []
     memory_update: str | None = None
     final_text = ""
+    receipts = []
+    writes_blocked = False
     usage: dict[str, Any] = {
         "prompt_tokens": 0,
         "billed_prompt_tokens": 0,
@@ -679,7 +723,13 @@ def respond(
     }
 
     for _round in range(max_rounds):
-        data = _openrouter_completion(key, model, payload_messages)
+        try:
+            data = _openrouter_completion(key, model, payload_messages)
+        except Exception:
+            if not receipts:
+                raise
+            final_text = "The assistant response failed after tool execution. The execution record below is preserved; do not blindly retry."
+            break
         u = data.get("usage") or {}
         prompt_tokens = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
         completion_tokens = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
@@ -726,9 +776,15 @@ def respond(
                     content = "memory file updated"
             elif tool_executor is not None:
                 try:
-                    result = tool_executor(name, args)
+                    result = {"outcome": "blocked", "error": "A previous write was not confirmed. Inspect state and report before retrying in a new user request."} if writes_blocked and name in WRITE_TOOLS else tool_executor(name, args)
                 except Exception as exc:  # tool errors feed back to the model, never crash the chat
                     result = {"error": str(exc)}
+                if name in WRITE_TOOLS:
+                    summary = execution_receipt(name, args, result)
+                    receipts.append(summary)
+                    writes_blocked = writes_blocked or result.get("outcome") in {"unknown", "partial", "rejected", "blocked"} or bool(result.get("error"))
+                    # Put complete counts before verbose acknowledgments can exhaust the tool budget.
+                    result = {"executionSummary": summary, **result}
                 content = json.dumps(result, default=str)[:6000]
             else:
                 content = f"tool {name} unavailable"
@@ -742,8 +798,7 @@ def respond(
         payload_messages.append({"role": "assistant", "content": final_text or None, "tool_calls": tool_calls})
         payload_messages.extend(tool_msgs)
     else:
-        if not final_text:
-            final_text = "(stopped after several tool rounds without a final answer)"
+        final_text = "Stopped at the tool-round limit. No further actions were executed."
 
     # fallback path: fenced blocks for models that ignore tools
     fence_blocks = extract_action_blocks(final_text)
@@ -759,6 +814,8 @@ def respond(
     clean_text = ORDER_BLOCK_RE.sub("", final_text)
     clean_text = ACTIONS_BLOCK_RE.sub("", clean_text)
     clean_text = re.sub(r"\n{3,}", "\n\n", clean_text).strip()
+    if receipts:
+        clean_text += "\n\nExecution record:\n" + "\n".join(f"- {line}" for line in receipts)
 
     return {
         "text": clean_text,

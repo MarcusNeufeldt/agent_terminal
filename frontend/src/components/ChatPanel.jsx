@@ -66,14 +66,14 @@ export default function ChatPanel() {
   const busy = useStore(s => s.chatBusy);
   const executeActions = useStore(s => s.executeActions);
   const actionBusy = useStore(s => s.actionBusy);
-  const toggleRight = useStore(s => s.toggleRight);
+  const rightView = useStore(s => s.rightView);
   const sendChat = useStore(s => s.sendChat);
   const [input, setInput] = useState("");
   const boxRef = useRef(null);
 
   useEffect(() => {
     if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
-  }, [chat]);
+  }, [chat, rightView]);
 
   const submit = () => {
     const text = input.trim();
@@ -86,7 +86,6 @@ export default function ChatPanel() {
     <div className="panel" id="chat">
       <h3 className="chat-head">AI assistant
         <span className="chat-head-actions">
-          <button className="chat-collapse" aria-label="Collapse order ticket and AI assistant" title="Collapse right panel" onClick={toggleRight}>›</button>
           <button className="chat-reset" title="Wipe conversation — memory file is kept" onClick={() => useStore.getState().resetChat()}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />

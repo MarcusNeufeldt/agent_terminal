@@ -1,5 +1,6 @@
 import { api, RES_SECONDS } from "./api.js";
 import { subscribeBinanceCandles } from "./market-events.js";
+import { EXCHANGE_NAME, READ_ONLY, isVenueSymbol } from "./exchange.js";
 
 const TO_TERMINAL = {
   "1": "1m",
@@ -78,7 +79,7 @@ export class TerminalVelaProvider {
   info() {
     return {
       name: "terminal",
-      displayName: "Kraken Futures / Binance charts",
+      displayName: `${EXCHANGE_NAME} / ${READ_ONLY ? "Hyperliquid" : "Binance"} charts`,
       supportedTimeframes: VELA_TIMEFRAMES,
       capabilities: { enumerate: true, stream: true, symbolInfo: true },
     };
@@ -93,7 +94,7 @@ export class TerminalVelaProvider {
 
   async listSymbols() {
     return (await this.instruments())
-      .filter(instrument => instrument.tradeable !== false && String(instrument.symbol || "").startsWith("PF_"))
+      .filter(instrument => instrument.tradeable !== false && isVenueSymbol(instrument.symbol))
       .map(instrument => ({
         ticker: String(instrument.symbol),
         description: String(instrument.pair || instrument.underlying || instrument.symbol),

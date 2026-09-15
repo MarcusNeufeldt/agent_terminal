@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { VelaWorkspace } from "@luxalgo/vela/workspace";
 import { api, fmt } from "../api";
+import { READ_ONLY, venueKey, isVenueSymbol } from "../exchange.js";
 import useStore from "../store";
 import { VelaChartController } from "../vela-overlays";
 import { TerminalVelaProvider, toTerminalTimeframe, toVelaTimeframe, VELA_TIMEFRAMES } from "../vela-provider";
@@ -13,7 +14,7 @@ export default function ChartPanel() {
   const symbol = useStore(state => state.symbol);
   const [signal, setSignal] = useState(null);
   const [note, setNote] = useState("");
-  const [riskEnabled, setRiskEnabled] = useState(() => localStorage.getItem("kt.riskEnabled") === "1");
+  const [riskEnabled, setRiskEnabled] = useState(() => localStorage.getItem(venueKey("kt.riskEnabled")) === "1");
 
   useEffect(() => {
     const initial = useStore.getState();
@@ -28,7 +29,7 @@ export default function ChartPanel() {
       timeframes: VELA_TIMEFRAMES,
       live: true,
       theme: "dark",
-      persist: "terminal-vela-workspace",
+      persist: venueKey("terminal-vela-workspace"),
       drawings: false,
       drawingToolbar: false,
       bottombar: false,
@@ -40,18 +41,18 @@ export default function ChartPanel() {
     const controller = new VelaChartController(workspace);
     controllerRef.current = controller;
     bindChart(controller);
-    controller.setRiskEnabled(localStorage.getItem("kt.riskEnabled") === "1");
+    controller.setRiskEnabled(localStorage.getItem(venueKey("kt.riskEnabled")) === "1");
     window.__velaWorkspace = workspace;
 
     const syncActiveMarket = () => {
       const market = workspace.chart.market;
       const nextSymbol = String(market.symbol || "").toUpperCase();
-      if (!nextSymbol) return;
+      if (!isVenueSymbol(nextSymbol)) return;
       const res = toTerminalTimeframe(market.timeframe);
       const current = useStore.getState();
       useStore.setState({ symbol: nextSymbol, res, prevPrice: null });
-      localStorage.setItem("kt.symbol", nextSymbol);
-      localStorage.setItem("kt.res", res);
+      localStorage.setItem(venueKey("kt.symbol"), nextSymbol);
+      localStorage.setItem(venueKey("kt.res"), res);
       api(`/api/tickers?symbols=${encodeURIComponent(nextSymbol)}`).catch(() => {});
       current.applyOverlayLines();
       current.refreshBook?.();
@@ -91,6 +92,7 @@ export default function ChartPanel() {
   }, [bindChart, unbindChart]);
 
   useEffect(() => {
+    if (READ_ONLY) return;
     api(`/api/signal?symbol=${encodeURIComponent(symbol)}`)
       .then(result => setSignal(result.error ? null : result))
       .catch(() => setSignal(null));
@@ -100,7 +102,7 @@ export default function ChartPanel() {
 
   const toggleRisk = () => {
     const enabled = !riskEnabled;
-    localStorage.setItem("kt.riskEnabled", enabled ? "1" : "0");
+    localStorage.setItem(venueKey("kt.riskEnabled"), enabled ? "1" : "0");
     setRiskEnabled(enabled);
     setNote("");
   };

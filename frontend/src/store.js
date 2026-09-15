@@ -2,11 +2,14 @@
    the chart controller registers itself here so live data can drive it imperatively. */
 
 import { create } from "zustand";
-import { api, newRequestId, RES_SECONDS } from "./api";
-import { formatContractSize, normalizeContractSize } from "./size-precision";
+import { receiptKey, readReceipt, writeReceipt, unresolvedReceipt, newCloid, hasRecoveryIdentity } from "./hyperliquid-receipt.js";
+import { api, newRequestId, RES_SECONDS, setSignedTrading } from "./api";
+import { formatContractSize, normalizeContractSize, compareContractSizes } from "./size-precision";
 import { buildProtectionAction } from "./protection-action";
 import { buildChartOverlays } from "./chart-overlays";
+import { nextPeaks, peakKey } from "./rules.js";
 import { toVelaTimeframe } from "./vela-provider";
+import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
 let chart = null; // chart controller (set by ChartPanel on mount)
 let audioCtx = null;
@@ -15,20 +18,42 @@ const chartCancelPending = new Set();
 
 const useStore = create((set, get) => ({
   // ---- state ----
-  symbol: localStorage.getItem("kt.symbol") || "PF_XBTUSD",
-  res: localStorage.getItem("kt.res") || "1m",
+  exchange: EXCHANGE,
+  exchangeName: EXCHANGE_NAME,
+  exchangeRouting: false,
+  exchangeBusy: false,
+  readOnly: READ_ONLY,
+  signedTrading: "off",
+  canTrade: !READ_ONLY,
+  hlReceipt: null,
+  hlCloseDraft: null,
+  hlCancelReceipt: null,
+  hlCancelHistory: [],
+  hlCancelHistoryMore: false,
+  hlCancelHistoryNote: null,
+  hlCancelChecking: false,
+  hlReceiptKey: null,
+  hlRecoveryError: null,
+  hlReconciling: false,
+  hlFillBusy: false,
+  hlRecoveryLoaded: false,
+  hlServerUnresolved: [],
+  hlRecoveryHasMore: false,
+  accountConfigured: false,
+  symbol: localStorage.getItem(venueKey("kt.symbol")) || (READ_ONLY ? "HL_BTC" : "PF_XBTUSD"),
+  res: localStorage.getItem(venueKey("kt.res")) || "1m",
   instruments: [],
   tickers: {},
   watchlist: [],
   armed: false,
   env: "live",
   hasKeys: true,
-  pro: localStorage.getItem("kt.pro") === "1",
-  lev: Number(localStorage.getItem("kt.lev")) || 10,
+  pro: !READ_ONLY && localStorage.getItem("kt.pro") === "1",
+  lev: Number(localStorage.getItem(venueKey("kt.lev"))) || 10,
   soundOn: localStorage.getItem("kt.sound") !== "0",
   feed: "connecting",
   tab: "positions",
-  otype: "mkt",
+  otype: READ_ONLY ? "lmt" : "mkt",
   candles: [],
   prevPrice: null,
   account: {},
@@ -37,7 +62,19 @@ const useStore = create((set, get) => ({
   dataStatus: {},
   ticketBusy: false,
   bulkBusy: false,
+  gridPreview: null,
+  gridSeed: null,
+  gridRequest: null,
+  gridResult: null,
   fills: [],
+  statsRows: [],
+  statsState: "loading",
+  rulePeaks: (() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem("kt.rulePeaks") || "{}");
+      return stored && typeof stored === "object" ? stored : {};
+    } catch { return {}; }
+  })(),
   scannerRows: [],
   scannerMeta: "",
   scannerLoading: false,
@@ -45,6 +82,7 @@ const useStore = create((set, get) => ({
   chatBusy: false,
   actionBusy: false,
   rightCollapsed: localStorage.getItem("kt.rightCollapsed") === "1",
+  rightView: "ticket",
   marketRows: [],
   volRank: {},
   minVol: Number(localStorage.getItem("kt.minvol")) || 0,
@@ -54,7 +92,38 @@ const useStore = create((set, get) => ({
   protectionAlerts: {},
   toasts: [],
   lastExecution: null,
-  chartSource: "",
+  chartSource: READ_ONLY ? "hyperliquid" : "",
+
+  // Single writer for the trading gate: the request layer and the UI must never
+  // disagree about whether this venue can be written to.
+  setSignedTradingMode(mode) {
+    const resolved = setSignedTrading(mode);
+    set({ signedTrading: resolved, canTrade: !READ_ONLY || resolved !== "off" });
+    return resolved;
+  },
+
+  async switchExchange(exchange) {
+    const s = get();
+    if (!s.exchangeRouting || s.exchangeBusy || exchange === s.exchange) return;
+    if (s.ticketBusy || s.bulkBusy || s.chatBusy || s.actionBusy || s.hlFillBusy || s.hlReconciling) {
+      s.toast("Wait for the current request to finish before switching exchanges.", "warn");
+      return;
+    }
+    const name = exchange === "kraken" ? "Kraken Futures" : "Hyperliquid";
+    if (!confirm(`Switch to ${name}?\n\nThe terminal will be DISARMED and ticket drafts cleared. Open ${s.exchangeName} orders and positions stay live. Automatic protection resizing and TP cleanup pause while disarmed. Active Chase workers must finish first.`)) return;
+    set({ exchangeBusy: true });
+    try {
+      const result = await api("/api/exchange", { method: "POST", body: { exchange } });
+      if (result.exchange !== exchange || result.armed !== false || result.exchangeRouting !== 1) {
+        throw new Error("Exchange switch was not confirmed. Reload to reconcile the current selection.");
+      }
+      reloadExchange(exchange);
+    } catch (error) {
+      s.toast(`Exchange switch failed: ${error.message}`, "err", 12000);
+    } finally {
+      set({ exchangeBusy: false });
+    }
+  },
 
   // ---- chart binding ----
   bindChart(controller) {
@@ -62,11 +131,16 @@ const useStore = create((set, get) => ({
     window.__chart = controller; // debug handle
     if (controller) {
       controller.onTpDrop = ({ symbol, price, order }) => get().adjustProtection(symbol, "tp", price, null, order).then(() => get().applyOverlayLines());
-      controller.onProtectionDrop = ({ symbol, kind, price, pnl }) => get().adjustProtection(symbol, kind, price, pnl).then(() => get().applyOverlayLines());
+      controller.onProtectionDrop = ({ symbol, kind, price, pnl, order, positionSnapshot }) => get().adjustProtection(symbol, kind, price, pnl, order, positionSnapshot).then(() => get().applyOverlayLines());
       controller.onOrderCancel = order => get().cancelChartOrder(order);
     }
   },
   unbindChart() { chart = null; },
+
+  showRight(rightView) {
+    localStorage.setItem("kt.rightCollapsed", "0");
+    set({ rightView, rightCollapsed: false });
+  },
 
   toggleRight() {
     const rightCollapsed = !get().rightCollapsed;
@@ -83,15 +157,17 @@ const useStore = create((set, get) => ({
 
   // ---- market data ----
   onTicker(t) {
+    if (!isVenueSymbol(t?.symbol) || t.exchange && t.exchange !== EXCHANGE) return;
     set(s => ({ tickers: { ...s.tickers, [t.symbol]: t } }));
     get().updatePositionCells();
     const prev = get().prevPrice;
-    if (t.symbol === get().symbol && chart) chart.onPrice(Number(t.last), prev);
+    const price = Number(t.last);
+    if (t.symbol === get().symbol && chart && Number.isFinite(price) && price > 0) chart.onPrice(price, prev);
   },
 
   onTrade(trade) {
     if (trade.symbol !== get().symbol) return;
-    if (get().chartSource === "binance") return; // Binance klines own the bars; Kraken prints only feed the price line
+    if (["binance", "hyperliquid"].includes(get().chartSource)) return; // Source candles own bars; trades must not double-count volume.
     const sec = RES_SECONDS[get().res] || 60;
     const bucket = Math.floor(trade.time / sec) * sec;
     const candles = get().candles;
@@ -136,9 +212,9 @@ const useStore = create((set, get) => ({
   },
 
   selectSymbol(sym) {
-    if (!sym) return;
-    set({ symbol: sym, prevPrice: null });
-    localStorage.setItem("kt.symbol", sym);
+    if (!isVenueSymbol(sym)) return;
+    set({ symbol: sym, prevPrice: null, hlCloseDraft: sym === get().symbol ? get().hlCloseDraft : null });
+    localStorage.setItem(venueKey("kt.symbol"), sym);
     api(`/api/tickers?symbols=${encodeURIComponent(sym)}`).catch(() => {});
     if (chart?.ownsData) chart.setMarket({ symbol: sym }).catch(e => get().toast(`Chart error: ${e.message}`, "err"));
     else get().loadChart();
@@ -146,7 +222,8 @@ const useStore = create((set, get) => ({
     get().refreshSignal();
   },
 
-  async adjustProtection(symbol, kind, stopPrice, previewPnl = null, order = null) {
+  async adjustProtection(symbol, kind, stopPrice, previewPnl = null, order = null, positionSnapshot = null) {
+    if (get().exchange === "hyperliquid") return get().submitHyperliquidProtection(symbol, kind, stopPrice, order, positionSnapshot);
     const label = kind === "sl" ? "Stop loss" : "Take profit";
     let pnl = Number(previewPnl);
     if (!Number.isFinite(pnl)) {
@@ -172,6 +249,78 @@ const useStore = create((set, get) => ({
     } catch (e) {
       get().toast(`${label} failed: ${e.message}`, "err");
       return false;
+    }
+  },
+
+  canHyperliquidChart() {
+    const s = get();
+    return s.exchange === "hyperliquid" && s.canTrade && !s.ticketBusy && !s.bulkBusy && !s.hlReconciling &&
+      !s.hlFillBusy && s.dataStatus.orders?.state === "current" && s.dataStatus.positions?.state === "current" &&
+      s.hlRecoveryLoaded && !s.hlRecoveryError && !!s.hlReceiptKey && !s.hlRecoveryHasMore &&
+      !s.hlServerUnresolved.length && !unresolvedReceipt(s.hlReceipt);
+  },
+
+  async submitHyperliquidProtection(symbol, kind, price, order = null, positionSnapshot = null,
+    fullPosition = !order || order.snapshot?.positionTpsl === true) {
+    const s = get();
+    if (!s.canHyperliquidChart() || !isVenueSymbol(symbol) || !["tp", "sl"].includes(kind) || !(price > 0) || !Number.isFinite(price)) {
+      s.toast("Chart protection needs current data, an enabled trading gate and no unresolved request.", "warn"); return false;
+    }
+    const matches = s.positions.filter(p => p.symbol === symbol && !p.error);
+    if (matches.length !== 1) { s.toast("A current unambiguous position is required.", "warn"); return false; }
+    const position = positionSnapshot || order?.positionSnapshot || matches[0];
+    if (position.symbol !== symbol) return false;
+    const target = order ? order.snapshot : null;
+    if (order && (!target || String(target.order_id) !== String(order.orderId) || target.symbol !== symbol ||
+        target.reduceOnly !== true || target.triggerKind !== kind || typeof target.triggerMarket !== "boolean")) {
+      s.toast("Refresh the chart before moving this exact trigger.", "warn"); return false;
+    }
+    const existing = s.orders.filter(o => o.symbol === symbol && o.reduceOnly === true && o.orderType === (kind === "sl" ? "stp" : "take_profit"));
+    if (!target && existing.length) {
+      s.toast("Protection already exists. Drag its individual TP/SL line; partial ladders are not replaced together.", "warn"); return false;
+    }
+    if (fullPosition && target && !target.positionTpsl && existing.length !== 1) {
+      s.toast("Multiple same-kind exits exist. Partial ladders are not converted automatically.", "warn"); return false;
+    }
+    const quantity = fullPosition ? position.sizeExact : target?.unfilledSizeExact || position.sizeExact;
+    if (!(Number(quantity) > 0)) return false;
+    const risk = target ? `Hyperliquid ALWAYS places the replacement even if the original fills or disappears during this request. Prior fills may therefore leave an additional reduce-only exit ${fullPosition ? "covering the position at trigger time" : "for this quantity"}. It cannot open/increase a position.`
+      : "Creates a full-size reduce-only market trigger. Fills are not guaranteed.";
+    const sizing = fullPosition ? " Entire-position mode: Hyperliquid follows future position increases and decreases, even while this terminal is closed. The displayed quantity and profit are current estimates, not a fixed exit size." : " Fixed-size protection; future position increases are not covered.";
+    const limit = (target && !target.triggerMarket ? ` Stop-limit price stays ${target.limitPrice}.` : "") + sizing;
+    if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} ${kind.toUpperCase()} ${symbol}: ${quantity} contracts at ${price}. ${target ? `Move exact order ${target.order_id}.` : "Create protection."}\n\n${risk}${limit}\n\nContinue?`)) return false;
+    const requestId = newRequestId(), cloid = newCloid();
+    const body = { requestId, cloid, symbol, kind, price, expectedArmed: s.armed,
+      position: { side: position.side, sizeExact: position.sizeExact, price: position.price },
+      target: target ? { ...target } : null, acknowledgeReplacement: !!target,
+      fullPosition, acknowledgeFullPosition: fullPosition };
+    const pending = { version: 1, kind: "chart", requestId, cloid, body, outcome: "pending", uncertain: true, createdAt: new Date().toISOString() };
+    try { writeReceipt(s.hlReceiptKey, pending); }
+    catch (error) { set({ hlRecoveryError: error.message }); s.toast("Cannot save chart recovery identity. Nothing sent.", "err"); return false; }
+    set({ ticketBusy: true, hlReceipt: pending });
+    get().applyOverlayLines();
+    try {
+      const result = await api("/api/chart-order", { method: "POST", body });
+      const receipt = { ...pending, ...result, uncertain: !["confirmed", "rejected", "simulated"].includes(result.outcome) };
+      writeReceipt(s.hlReceiptKey, receipt);
+      set({ hlReceipt: receipt });
+      s.toast(result.simulated ? "Chart protection simulated; no exchange change."
+        : result.outcome === "confirmed" ? "Chart protection accepted. Refreshing authoritative orders."
+        : `Chart result ${result.outcome || "unknown"}. ${result.error || "Check the saved client ID after the request expires; do not retry."}`,
+        result.outcome === "confirmed" ? "ok" : "warn", 12000);
+      return result.outcome === "confirmed";
+    } catch (error) {
+      const rejected = error.data?.outcome === "rejected";
+      const receipt = { ...pending, outcome: rejected ? "rejected" : "unknown", uncertain: !rejected, error: error.message };
+      set({ hlReceipt: receipt });
+      try { writeReceipt(s.hlReceiptKey, receipt); } catch {}
+      s.toast(`Chart ${receipt.outcome}: ${error.message}. No automatic retry.`, "err", 12000);
+      return false;
+    } finally {
+      set({ ticketBusy: false });
+      await get().refreshHyperliquidRecovery();
+      await get().refreshTables();
+      get().applyOverlayLines();
     }
   },
 
@@ -216,9 +365,54 @@ const useStore = create((set, get) => ({
   },
   setOtype(otype) { set({ otype }); },
 
+  openGrid(symbol) {
+    if (get().ticketBusy) return;
+    const position = get().positions.find(p => !p.error && p.symbol === symbol);
+    get().selectSymbol(symbol);
+    get().showRight("ticket");
+    set({ otype: "grid", hlCloseDraft: null, gridSeed: position ? {
+      id: Date.now(), symbol, side: position.side === "short" ? "sell" : "buy", size: position.size,
+    } : null });
+  },
+
+  setGridPreview(plan) {
+    set({ gridPreview: plan });
+    get().applyOverlayLines();
+  },
+
+  async submitGrid(action, preview) {
+    const s = get();
+    if (s.readOnly) { s.toast("Hyperliquid Grid is preview-only. No orders were sent.", "warn"); return; }
+    if (s.ticketBusy || s.bulkBusy || s.symbol !== action.symbol) return;
+    const prior = s.gridRequest;
+    const replay = prior?.previewHash === preview.plan.previewHash && prior.expectedArmed === preview.armed;
+    if (!replay && s.armed !== preview.armed) { s.toast("ARM state changed. Refresh the grid preview.", "warn"); return; }
+    const body = prior?.previewHash === preview.plan.previewHash && prior.expectedArmed === preview.armed
+      ? prior
+      : { ...action, previewHash: preview.plan.previewHash, expectedArmed: preview.armed, requestId: newRequestId() };
+    set({ ticketBusy: true, gridRequest: body, gridResult: null });
+    try {
+      const response = await api("/api/grid", { method: "POST", body });
+      const result = response.results?.[0] || { outcome: "unknown", error: response.error || "No execution result returned." };
+      set({ gridResult: { ...result, previewHash: body.previewHash, symbol: body.symbol } });
+      get().setGridPreview(null);
+      get().toast(result.simulated ? "Grid simulated. No orders sent."
+        : result.outcome === "confirmed" ? `${result.responses?.length || 0} grid placements confirmed.`
+          : `Grid ${result.outcome}: ${result.error || "Check the rung results before another submission."}`,
+      result.simulated ? "warn" : result.outcome === "confirmed" ? "ok" : "err", 10000);
+      await Promise.all([get().refreshTables(), get().refreshAccount()]);
+    } catch (error) {
+      set({ gridResult: { outcome: "unknown", error: error.message, transportError: true,
+        previewHash: body.previewHash, symbol: body.symbol } });
+      get().toast("Grid response unavailable. Check submission to reuse the same request ID; do not blindly place again.", "err", 12000);
+    } finally {
+      set({ ticketBusy: false });
+    }
+  },
+
   setRes(res) {
     set({ res });
-    localStorage.setItem("kt.res", res);
+    localStorage.setItem(venueKey("kt.res"), res);
     if (chart?.ownsData) chart.setMarket({ timeframe: toVelaTimeframe(res) }).catch(e => get().toast(`Chart error: ${e.message}`, "err"));
     else get().loadChart();
   },
@@ -249,11 +443,18 @@ const useStore = create((set, get) => ({
   },
 
   applyOverlayLines() {
-    const { positions, orders, instruments, symbol } = get();
+    const { positions, orders, instruments, symbol, readOnly, canTrade, dataStatus, bulkBusy } = get();
     const symbols = new Set([symbol, ...(chart?.symbols?.() || [])]);
     const bySymbol = Object.fromEntries(
-      [...symbols].map(current => [current, buildChartOverlays(current, positions, orders, instruments)]),
+      [...symbols].map(current => [current, buildChartOverlays(current, positions, orders, instruments, readOnly, canTrade && dataStatus.orders?.state === "current" && !bulkBusy, get().canHyperliquidChart())]),
     );
+    const preview = get().gridPreview;
+    if (preview && bySymbol[preview.symbol]) {
+      bySymbol[preview.symbol].push(...preview.orders.map((order, i) => ({
+        key: `grid-preview:${i}`, price: order.limitPrice, color: "#f0b90b", dashed: true,
+        title: `PREVIEW ${i + 1} · ${order.side} ${order.size} @ ${order.limitPrice}`,
+      })));
+    }
     const overlays = bySymbol[symbol] || [];
     set({ overlayPrices: overlays.map(line => line.price) });
     if (chart?.setOverlayMap) chart.setOverlayMap(bySymbol);
@@ -261,7 +462,7 @@ const useStore = create((set, get) => ({
   },
 
   // ---- account / tables ----
-  proAdj(v) { return get().pro ? Number(v || 0) + 4400 : Number(v || 0); },
+  proAdj(v) { return get().pro ? Number(v || 0) + 3800 : Number(v || 0); },
 
   async refreshAccount() {
     try {
@@ -278,22 +479,29 @@ const useStore = create((set, get) => ({
 
   computeUpnl(p) {
     const s = get();
-    const t = s.tickers[p.symbol];
-    const mark = t && Number(t.markPrice);
-    const inst = s.instruments.find(i => i.symbol === p.symbol) || {};
-    const mult = Number(inst.contractSize || 1);
+    if (!p?.symbol || p.error) return null;
+    const inst = s.instruments.find(i => i.symbol === p.symbol);
+    if (!inst) return null;
+    // Display only: never substitute mark-based exchange PnL for missing last-trade data.
+    const last = Number(s.tickers[p.symbol]?.last);
+    const mult = Number(inst.contractSize ?? 1);
     const size = Number(p.size), entry = Number(p.price);
-    if (!size || !entry || !mark) return Number(p.unrealizedPnl || 0);
-    const dir = String(p.side).toLowerCase() === "short" ? -1 : 1;
-    return inst.type === "futures_inverse"
-      ? dir * size * mult * (1 / entry - 1 / mark)
-      : dir * size * mult * (mark - entry);
+    const side = String(p.side).toLowerCase();
+    if (![last, mult, size, entry].every(v => Number.isFinite(v) && v > 0)
+      || !["long", "short"].includes(side)) return null;
+    const dir = side === "short" ? -1 : 1;
+    const pnl = inst.type === "futures_inverse"
+      ? dir * size * mult * (1 / entry - 1 / last)
+      : dir * size * mult * (last - entry);
+    return Number.isFinite(pnl) ? pnl : null;
   },
 
   totalUpnl() {
-    const live = get().positions.filter(p => p.symbol && !p.error);
-    if (!live.length) return null;
-    return live.reduce((acc, p) => acc + get().computeUpnl(p), 0);
+    const s = get();
+    if (s.dataStatus.positions?.state !== "current") return null;
+    const values = s.positions.map(p => s.computeUpnl(p));
+    const total = values.every(Number.isFinite) ? values.reduce((sum, pnl) => sum + pnl, 0) : null;
+    return Number.isFinite(total) ? total : null;
   },
 
   async refreshTables() {
@@ -314,14 +522,51 @@ const useStore = create((set, get) => ({
       if (posSymbols.length) api(`/api/tickers?symbols=${encodeURIComponent(posSymbols.join(","))}`).catch(() => {});
       get().updatePositionCells();
       if (!(chart && chart._drag)) get().applyOverlayLines(); // keep TP/LIQ lines in sync (skip mid-drag)
-    } catch (e) {}
+    } catch (e) {
+      set(s => ({ dataStatus: { ...s.dataStatus,
+        positions: { state: "unavailable", error: e.message },
+        orders: { state: "unavailable", error: e.message },
+      } }));
+    }
   },
 
   async refreshFills() {
     try {
       const f = await api("/api/fills");
-      set({ fills: (f.fills || []).slice().sort((a, b) => new Date(b.fillTime) - new Date(a.fillTime)) });
-    } catch (e) {}
+      set(s => ({ fills: (f.fills || []).slice().sort((a, b) => new Date(b.fillTime) - new Date(a.fillTime)),
+        dataStatus: { ...s.dataStatus, fills: { state: f.state || "current", error: f.error, ageSeconds: f.ageSeconds } },
+      }));
+    } catch (e) {
+      set(s => ({ dataStatus: { ...s.dataStatus, fills: { state: "unavailable", error: e.message } } }));
+    }
+  },
+
+  // ---- discipline rules (display only: never places or cancels an order) ----
+
+  // Peaks ratchet per position and persist, so a page reload does not reset a trail
+  // that is already armed. Keyed on entry price, so scaling in starts a fresh peak.
+  updateRulePeaks() {
+    const s = get();
+    if (s.dataStatus.positions?.state !== "current") return;
+    const entries = s.positions
+      .filter(p => p && !p.error && Number(p.size) > 0)
+      .map(p => ({ key: peakKey(p), upnl: s.computeUpnl(p) }));
+    const peaks = nextPeaks(s.rulePeaks, entries);
+    set({ rulePeaks: peaks });
+    try { localStorage.setItem("kt.rulePeaks", JSON.stringify(peaks)); } catch { /* private mode or quota */ }
+  },
+
+  // Realized ledger lines drive the post-loss cooldown. On failure the previous rows
+  // are kept and the state is marked unavailable, so the panel says "unknown" rather
+  // than reporting "no cooldown" when it simply could not look.
+  async refreshStats() {
+    try {
+      const r = await api("/api/stats");
+      if (r.error) { set({ statsState: "unavailable" }); return; }
+      set({ statsRows: Array.isArray(r.rows) ? r.rows : [], statsState: "current" });
+    } catch {
+      set({ statsState: "unavailable" });
+    }
   },
 
   // ---- scanner ----
@@ -367,6 +612,317 @@ const useStore = create((set, get) => ({
     }
   },
 
+  loadHyperliquidRecovery(network, account) {
+    try {
+      const key = receiptKey(network, account);
+      set({ hlReceiptKey: key, hlReceipt: readReceipt(key), hlRecoveryError: null });
+    } catch (error) {
+      set({ hlReceiptKey: null, hlRecoveryError: error.message });
+    }
+  },
+
+  async refreshHyperliquidRecovery() {
+    try {
+      const result = await api("/api/execution-recovery");
+      if (result.state !== "current" || !Array.isArray(result.items)) throw new Error("Recovery journal unavailable");
+      set({ hlRecoveryLoaded: true, hlServerUnresolved: result.items, hlRecoveryHasMore: !!result.hasMore });
+    } catch (error) {
+      set({ hlRecoveryLoaded: false });
+      get().toast(`Recovery journal unavailable: ${error.message}`, "warn");
+    }
+  },
+
+  restoreHyperliquidRequest(item) {
+    const s = get();
+    if (s.hlFillBusy || s.hlReconciling || s.ticketBusy) return;
+    if (!hasRecoveryIdentity(item) || !s.hlReceiptKey) {
+      s.toast("This older submission has no recoverable client ID; manual investigation is required.", "err");
+      return;
+    }
+    if (unresolvedReceipt(s.hlReceipt) && s.hlReceipt.requestId !== item.requestId) {
+      s.toast("Resolve the current saved submission first.", "warn");
+      return;
+    }
+    try {
+      const receipt = { ...item, version: 1 };
+      writeReceipt(s.hlReceiptKey, receipt);
+      set({ hlReceipt: receipt });
+    } catch (error) {
+      set({ hlRecoveryError: error.message });
+    }
+  },
+
+  async checkHyperliquidLifecycle() {
+    const s = get();
+    const receipt = s.hlReceipt;
+    if (s.hlReconciling || s.hlFillBusy || s.ticketBusy || !receipt?.requestId) return;
+    set({ hlReconciling: true });
+    try {
+      const report = await api(`/api/order-lifecycle?requestId=${encodeURIComponent(receipt.requestId)}`);
+      if (report.state !== "current" || report.requestId !== receipt.requestId) {
+        throw new Error("Lifecycle response does not match the submission");
+      }
+      const updated = { ...receipt, lifecycleReport: report };
+      writeReceipt(s.hlReceiptKey, updated);
+      set({ hlReceipt: updated });
+    } catch (error) {
+      const updated = { ...receipt, lifecycleReport: { state: "unavailable", reason: error.message } };
+      set({ hlReceipt: updated });
+      try { writeReceipt(s.hlReceiptKey, updated); } catch {}
+      s.toast(`Lifecycle unavailable: ${error.message}`, "err");
+    } finally {
+      set({ hlReconciling: false });
+    }
+  },
+
+  async loadHyperliquidOrderFills() {
+    const s = get();
+    const receipt = s.hlReceipt;
+    if (s.hlFillBusy || s.hlReconciling || s.ticketBusy || !receipt?.status?.order_id) return;
+    const startTime = Math.max(0, Date.parse(receipt.createdAt) - 5000);
+    const endTime = Date.now();
+    if (!Number.isSafeInteger(startTime) || startTime > endTime) {
+      s.toast("Submission timestamp is unavailable; cannot choose a safe fill-history window.", "err");
+      return;
+    }
+    set({ hlFillBusy: true });
+    try {
+      const scan = await api("/api/fill-history/sync", { method: "POST", body: { startTime, endTime } });
+      const totals = await api(`/api/fill-history?orderId=${encodeURIComponent(receipt.status.order_id)}`);
+      if (totals.state !== "current" || totals.orderId !== receipt.status.order_id ||
+          (totals.fillCount > 0 && (totals.symbol !== receipt.body.symbol || totals.side !== receipt.body.side))) {
+        throw new Error("Stored fill identity does not match this order");
+      }
+      const updated = { ...receipt, fillSummary: { ...totals, scan }, lifecycleReport: null };
+      writeReceipt(s.hlReceiptKey, updated);
+      set({ hlReceipt: updated });
+      s.toast(scan.scanComplete ? "Available fills loaded. Exchange retention limits still apply."
+        : "Fill scan is incomplete. Stored totals contain observed fills only.", "warn", 10000);
+    } catch (error) {
+      s.toast(`Fill history unavailable: ${error.message}`, "err");
+    } finally {
+      set({ hlFillBusy: false });
+    }
+  },
+
+  async reconcileHyperliquidOrder() {
+    const s = get();
+    if (s.ticketBusy || s.hlReconciling || s.hlFillBusy || !hasRecoveryIdentity(s.hlReceipt) || !s.hlReceiptKey) return;
+    set({ hlReconciling: true });
+    try {
+      const response = await api("/api/order-reconcile", { method: "POST", body: { requestId: s.hlReceipt.requestId } });
+      if (s.hlReceipt.kind === "leverage") {
+        const capacity = response.capacity;
+        if (response.kind !== "leverage" || response.requestId !== s.hlReceipt.requestId || response.outcome !== "reconciled" ||
+            response.state !== "current" || capacity?.symbol !== s.hlReceipt.body.symbol ||
+            !Number.isSafeInteger(response.expiresAfter) || !Number.isFinite(response.exchangeTime) ||
+            response.exchangeTime <= response.expiresAfter + 2000 || response.canReplace !== false ||
+            receiptKey(capacity.network, capacity.accountAddress) !== s.hlReceiptKey ||
+            capacity.leverage?.value !== s.hlReceipt.body.leverage ||
+            capacity.leverage?.type !== (s.hlReceipt.body.cross ? "cross" : "isolated")) {
+          throw new Error("Requested leverage has not been confirmed by readback. Do not retry it.");
+        }
+        const receipt = { ...s.hlReceipt, outcome: "reconciled", uncertain: false, error: null, leverageEvidence: response };
+        writeReceipt(s.hlReceiptKey, receipt);
+        set({ hlReceipt: receipt });
+        await get().refreshHyperliquidRecovery();
+        await get().refreshHyperliquidCapacity();
+        s.toast("Requested leverage observed after the request expired. No request was retried.", "ok");
+        return;
+      }
+      if (s.hlReceipt.batch) {
+        const ids = s.hlReceipt.cloids.map(id => id.toLowerCase());
+        if (!response.batch || response.requestId !== s.hlReceipt.requestId || !Array.isArray(response.cloids) ||
+            response.cloids.length !== ids.length || !response.cloids.every((id, i) => typeof id === "string" && id.toLowerCase() === ids[i]) ||
+            !response.targets || typeof response.targets !== "object" || Array.isArray(response.targets) ||
+            Object.keys(response.targets).some(id => !ids.includes(id))) throw new Error("Batch recovery identity mismatch");
+        const remaining = ids.filter(id => !["observed", "rejected"].includes(response.targets[id]?.state)).length;
+        const outcome = remaining ? "unknown" : "reconciled";
+        if (response.remaining !== remaining || response.outcome !== outcome) throw new Error("Incomplete batch recovery evidence");
+        const receipt = { ...s.hlReceipt, outcome, uncertain: !!remaining, error: null, batchEvidence: response };
+        writeReceipt(s.hlReceiptKey, receipt);
+        set({ hlReceipt: receipt });
+        s.toast(remaining ? `${remaining} batch order(s) still unresolved. Check the next identity.`
+          : "Batch submission identities reconciled. No orders were replaced.", remaining ? "warn" : "ok");
+        await get().refreshHyperliquidRecovery();
+        return;
+      }
+      if (s.hlReceipt.kind === "chart" && (response.kind !== "chart" || response.requestId !== s.hlReceipt.requestId ||
+          response.canReplace !== false || !Number.isSafeInteger(response.expiresAfter) ||
+          !Number.isFinite(response.exchangeTime) || response.exchangeTime <= response.expiresAfter + 2000)) {
+        throw new Error("Chart request expiry and replacement identity are not confirmed. Do not retry.");
+      }
+      const status = response.status;
+      if (response.state !== "current" || response.outcome !== "reconciled" || !status?.found ||
+          status.cliOrdId?.toLowerCase() !== s.hlReceipt.cloid.toLowerCase() ||
+          status.symbol !== s.hlReceipt.body.symbol) {
+        throw new Error("Order identity not confirmed. Submission remains unresolved; do not resubmit.");
+      }
+      const receipt = { ...s.hlReceipt, outcome: "reconciled", uncertain: false, error: null, status, lifecycleReport: null };
+      writeReceipt(s.hlReceiptKey, receipt);
+      set({ hlReceipt: receipt });
+      s.toast(`Hyperliquid order ${status.order_id}: ${status.orderStatus}.`, "ok");
+      await get().refreshHyperliquidRecovery();
+      if (receipt.body.closePosition) await get().observeHyperliquidClose(receipt, s.hlReceiptKey);
+      get().refreshTables(); get().refreshFills();
+    } catch (error) {
+      s.toast(error.message, "warn", 12000);
+    } finally {
+      set({ hlReconciling: false });
+    }
+  },
+
+  hlCapacity: null,
+  hlCapacityError: "",
+  hlCapacitySeq: 0,
+  async refreshHyperliquidCapacity() {
+    const s = get(), symbol = s.symbol, key = s.hlReceiptKey, seq = s.hlCapacitySeq + 1;
+    if (s.exchange !== "hyperliquid" || !key) return;
+    set({ hlCapacity: null, hlCapacityError: "", hlCapacitySeq: seq });
+    try {
+      const data = await api(`/api/trading-capacity?symbol=${encodeURIComponent(symbol)}`);
+      if (get().symbol !== symbol || get().hlReceiptKey !== key || get().hlCapacitySeq !== seq) return;
+      if (data.state !== "current" || data.symbol !== symbol || data.exchange !== "hyperliquid" ||
+          receiptKey(data.network, data.accountAddress) !== key || !Number.isInteger(data.leverage?.value) ||
+          data.leverage.value < 1 || !["cross", "isolated"].includes(data.leverage.type) ||
+          !["buy", "sell"].every(side => typeof data.maxTradeSizes?.[side] === "string" && /^\d+(?:\.\d+)?$/.test(data.maxTradeSizes[side]))) {
+        throw new Error("Exchange trading capacity is invalid or belongs to another account");
+      }
+      set({ hlCapacity: { ...data, scopeKey: key, fetchedAt: Date.now() } });
+    } catch (error) {
+      if (get().symbol === symbol && get().hlReceiptKey === key && get().hlCapacitySeq === seq)
+        set({ hlCapacity: null, hlCapacityError: error.message });
+    }
+  },
+
+  async submitHyperliquidLeverage(leverage) {
+    const s = get(), capacity = s.hlCapacity;
+    if (!capacity || capacity.scopeKey !== s.hlReceiptKey || capacity.symbol !== s.symbol || !Number.isFinite(capacity.fetchedAt) ||
+        Date.now() - capacity.fetchedAt < 0 || Date.now() - capacity.fetchedAt > 15000) {
+      s.toast("Refresh exchange capacity before changing leverage.", "err"); return;
+    }
+    if (leverage === capacity.leverage.value) return;
+    await s.submitHyperliquidOrder(null, { kind: "leverage", leverage,
+      expectedLeverage: capacity.leverage.value, cross: capacity.leverage.type === "cross" });
+  },
+
+  async submitHyperliquidOrder(side, order) {
+    const s = get(), symbol = order.symbol || s.symbol, orderType = order.orderType || s.otype;
+    if (s.exchange !== "hyperliquid" || s.exchangeBusy || s.bulkBusy || s.ticketBusy || s.hlFillBusy || s.hlReconciling) return;
+    if (!isVenueSymbol(symbol)) return;
+    if (!s.canTrade) { s.toast("Hyperliquid trading is disabled by the backend gate.", "err", 9000); return; }
+    if (!s.hlReceiptKey || s.hlRecoveryError || !s.hlRecoveryLoaded ||
+        s.hlServerUnresolved.length || s.hlRecoveryHasMore || unresolvedReceipt(s.hlReceipt)) {
+      s.toast(s.hlRecoveryError || "Resolve the saved Hyperliquid submission before placing another order.", "err", 12000);
+      return;
+    }
+    const instrument = s.instruments.find(i => i.symbol === symbol) || {};
+    const setting = order.kind === "leverage";
+    const size = setting ? 0 : normalizeContractSize(order.size, instrument.contractValueTradePrecision ?? 0);
+    if (!setting && (!Number.isFinite(size) || size <= 0)) {
+      s.toast("Enter a size that meets this market's lot size.", "err");
+      return;
+    }
+    const close = order.closePosition === true ? { symbol, side, size: order.position?.sizeExact } : s.hlCloseDraft;
+    if (close && (close.symbol !== symbol || close.side !== side || size > Number(close.size))) {
+      s.toast("Close draft changed or size exceeds the selected position. Open a fresh close ticket.", "err");
+      return;
+    }
+    const trigger = !setting && !close && ["stp", "take_profit"].includes(orderType);
+    const market = !setting && orderType === "mkt";
+    const body = setting ? { symbol, leverage: order.leverage, cross: order.cross, expectedLeverage: order.expectedLeverage, expectedArmed: s.armed }
+      : { symbol, side, orderType: close && !market ? "ioc" : orderType, size };
+    if (setting) {
+      if (!Number.isFinite(instrument.maxLeverage) || !Number.isInteger(order.leverage) || order.leverage < 1 || order.leverage > instrument.maxLeverage ||
+          !Number.isInteger(order.expectedLeverage) || typeof order.cross !== "boolean") {
+        s.toast("Invalid exchange leverage setting.", "err"); return;
+      }
+      if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} exchange leverage change for ${s.symbol}: ${order.expectedLeverage}x to ${order.leverage}x, keeping ${order.cross ? "cross" : "isolated"} margin. This affects margin requirements and existing position risk. Continue?`)) return;
+    } else if (trigger) {
+      if (!Number.isFinite(order.stopPrice) || order.stopPrice <= 0) { s.toast("Enter a trigger price.", "err"); return; }
+      body.stopPrice = order.stopPrice;
+      body.reduceOnly = true;
+    } else if (market) {
+      if (!Number.isFinite(order.slippagePercent) || order.slippagePercent < 0.01 || order.slippagePercent > 5) {
+        s.toast("Enter a slippage limit between 0.01% and 5%.", "err"); return;
+      }
+      body.slippagePercent = order.slippagePercent;
+      body.reduceOnly = close ? true : order.reduceOnly === true;
+    } else {
+      if (!Number.isFinite(order.limitPrice) || order.limitPrice <= 0) { s.toast("Enter a limit price.", "err"); return; }
+      body.limitPrice = order.limitPrice;
+      body.reduceOnly = close ? true : order.reduceOnly === true;
+    }
+    if (order.quickPercent !== undefined && !setting) {
+      if (!Number.isInteger(order.quickPercent) || order.quickPercent < 1 || order.quickPercent > 100) return;
+      body.quickPercent = order.quickPercent;
+      body.expectedLeverage = order.expectedLeverage;
+      body.expectedMarginMode = order.expectedMarginMode;
+    }
+    if (close) {
+      body.closePosition = true;
+      if (market) {
+        body.expectedArmed = s.armed;
+        body.position = order.position;
+      }
+      if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} reduce-only ${market ? "MARKET" : "IOC"} close: ${side} ${size} ${symbol}, ${market ? `slippage limit ${body.slippagePercent}%` : `limit ${body.limitPrice}`}. Unfilled quantity may remain. Existing orders will not be cancelled. Continue?`)) return;
+    }
+    if (order.maxNotional !== undefined) {
+      if (!["string", "number"].includes(typeof order.maxNotional) ||
+          !Number.isFinite(Number(order.maxNotional)) || Number(order.maxNotional) <= 0) {
+        s.toast("Enter a positive finite USD notional budget.", "err");
+        return;
+      }
+      body.maxNotional = order.maxNotional;
+    }
+    if (market && !close && !confirm(`${s.armed ? "LIVE" : "SIMULATED"} MARKET ${side.toUpperCase()} ${symbol}: ${body.maxNotional !== undefined ? `$${body.maxNotional} maximum notional` : `${size} contracts`}, slippage limit ${body.slippagePercent}%. Partial or no fill is possible. Continue?`)) return;
+    const requestId = newRequestId();
+    const identity = setting ? { kind: "leverage" } : { cloid: newCloid() };
+    const pending = { version: 1, requestId, ...identity, body: { ...body, requestId, ...(setting ? {} : identity) },
+      outcome: "pending", uncertain: true, createdAt: new Date().toISOString() };
+    try {
+      writeReceipt(s.hlReceiptKey, pending);
+    } catch (error) {
+      set({ hlRecoveryError: error.message });
+      s.toast("Cannot save recovery receipt. Nothing was submitted.", "err");
+      return;
+    }
+    set({ ticketBusy: true, hlReceipt: pending });
+    try {
+      const response = await api(setting ? "/api/leverage" : "/api/order", { method: "POST", body: pending.body });
+      const receipt = { ...pending, ...response };
+      writeReceipt(s.hlReceiptKey, receipt);
+      set({ hlReceipt: receipt });
+      if (response.simulated) {
+        s.toast(`<b>Not sent.</b> ${response.message || "The order was validated but not signed."}`, "warn", 12000);
+      } else if (response.outcome === "unknown") {
+        s.toast(`<b>Order UNKNOWN:</b> ${response.error || "no response"}. Verify on Hyperliquid before retrying — do not re-place blindly.`, "err", 15000);
+      } else if (response.outcome !== "confirmed") {
+        s.toast(`<b>Order ${response.outcome}:</b> ${response.error || "not confirmed"}`, "err", 12000);
+      } else {
+        s.toast(setting ? "Exchange leverage updated. Refreshing trading capacity."
+          : close ? "Reduce-only IOC accepted. Check positions: this does not confirm the position is flat."
+          : market ? "Market IOC accepted. Check fills and positions; acceptance does not guarantee a full fill."
+          : `Hyperliquid order confirmed: ${body.side} ${fmt(body.size)} ${body.symbol}.`, "ok");
+      }
+      if (close && response.outcome === "confirmed" && !response.simulated)
+        await get().observeHyperliquidClose(receipt, s.hlReceiptKey);
+      get().refreshTables(); get().refreshAccount();
+    } catch (error) {
+      const rejected = error.data?.outcome === "rejected";
+      const receipt = { ...pending, outcome: rejected ? "rejected" : "unknown", uncertain: !rejected, error: error.message };
+      set({ hlReceipt: receipt });
+      // The durable pending receipt already blocks resubmission if this update fails.
+      try { writeReceipt(s.hlReceiptKey, receipt); } catch {}
+      s.toast(rejected ? `Submission rejected: ${error.message}`
+        : `Submission unresolved: ${error.message}. Check order status before another order.`, "err", 12000);
+      await get().refreshHyperliquidRecovery();
+    } finally {
+      set({ ticketBusy: false });
+      get().refreshHyperliquidCapacity();
+    }
+  },
+
   ticketPayload(side) {
     const s = get();
     const sizeEl = document.getElementById("in-size");
@@ -409,8 +965,53 @@ const useStore = create((set, get) => ({
     }
   },
 
+  clearHyperliquidClose() { set({ hlCloseDraft: null, otype: "lmt" }); },
+
+  async observeHyperliquidClose(receipt, scopeKey) {
+    const symbol = receipt.body.symbol;
+    try {
+      const data = await api("/api/positions?fresh=1");
+      if (get().exchange !== "hyperliquid" || get().hlReceiptKey !== scopeKey ||
+          get().hlReceipt?.requestId !== receipt.requestId) return;
+      if (data.state !== "current" || data.exchange !== "hyperliquid" || !Array.isArray(data.positions) ||
+          data.positions.some(p => !p || p.error || typeof p.symbol !== "string" || !p.symbol.startsWith("HL_") ||
+            !["long", "short"].includes(p.side) || compareContractSizes(p.sizeExact, p.sizeExact) === null) ||
+          new Set(data.positions.map(p => p.symbol)).size !== data.positions.length) {
+        throw new Error("Fresh position readback is unavailable or invalid");
+      }
+      const remaining = data.positions.find(p => p.symbol === symbol);
+      const observation = { state: remaining ? "remaining" : "flat", symbol,
+        side: remaining?.side, sizeExact: remaining?.sizeExact, checkedAt: new Date().toISOString() };
+      const updated = { ...get().hlReceipt, closeObservation: observation };
+      writeReceipt(scopeKey, updated);
+      set({ hlReceipt: updated });
+      get().toast(remaining ? `Close did not leave ${symbol} flat: ${remaining.side} ${remaining.sizeExact} contracts remain. No automatic retry.`
+        : `${symbol}: flat on fresh exchange readback. Existing orders were not cancelled.`, remaining ? "warn" : "ok", 12000);
+    } catch (error) {
+      if (get().exchange === "hyperliquid" && get().hlReceiptKey === scopeKey)
+        get().toast(`Close order accepted, but position verification failed: ${error.message}. Do not assume it is closed.`, "warn", 12000);
+    }
+  },
+
   async closePosition(symbol) {
     const s = get();
+    if (s.exchange === "hyperliquid") {
+      const position = s.positions.find(p => p.symbol === symbol && !p.error);
+      if (s.ticketBusy || !s.canTrade || s.dataStatus.positions?.state !== "current" || !position ||
+          !["long", "short"].includes(position.side) || !Number.isFinite(Number(position.size)) || !(Number(position.size) > 0)) {
+        s.toast("Current position data and an idle trading ticket are required.", "err");
+        return;
+      }
+      if (s.positions.filter(p => p.symbol === symbol).length !== 1 ||
+          compareContractSizes(position.sizeExact, position.sizeExact) === null ||
+          !Number.isFinite(Number(position.price)) || !(Number(position.price) > 0)) {
+        s.toast("Refresh the position before closing.", "err"); return;
+      }
+      return get().submitHyperliquidOrder(position.side === "long" ? "sell" : "buy", {
+        symbol, orderType: "mkt", closePosition: true, size: position.sizeExact, reduceOnly: true,
+        slippagePercent: 0.5, position: { side: position.side, sizeExact: position.sizeExact, price: position.price },
+      });
+    }
     const p = s.positions.find(x => x.symbol === symbol);
     if (!p) return;
     if (!confirm(`Close ${p.side} position on ${symbol} (${fmt(p.size)} contracts) with a reduce-only market order?`)) return;
@@ -434,14 +1035,27 @@ const useStore = create((set, get) => ({
     const live = s.armed ? " LIVE" : "";
     if (!confirm(`Cancel${live} ${order.orderType || "order"} ${order.side || ""} on ${order.symbol} at ${fmt(order.price)}?`)) return false;
     chartCancelPending.add(key);
-    try { return await s.cancelOrder(target); }
+    try { return await s.cancelOrder(s.readOnly ? { ...target, symbol: order.symbol } : target); }
     finally { chartCancelPending.delete(key); }
   },
 
   async cancelOrder(payload) {
     const s = get();
+    if (!s.canTrade) { s.toast("Trading is disabled for this venue.", "err"); return false; }
     try {
-      const body = { ...(payload.cliOrdId ? { cliOrdId: payload.cliOrdId } : { orderId: payload.orderId }), requestId: newRequestId() };
+      if (s.readOnly && (s.bulkBusy || s.dataStatus.orders?.state !== "current" || !isVenueSymbol(payload.symbol))) {
+        throw new Error("Current Hyperliquid order data and a venue symbol are required.");
+      }
+      // Hyperliquid order ids are 64-bit, so send them as a decimal string; JSON numbers
+      // would be rounded and could cancel the wrong order.
+      if (s.readOnly && !payload.cliOrdId &&
+          !(typeof payload.orderId === "string" && /^[0-9]{1,20}$/.test(payload.orderId))) {
+        throw new Error("Hyperliquid cancellation requires an exact decimal order id.");
+      }
+      const target = payload.cliOrdId
+        ? { ...(s.readOnly ? { symbol: payload.symbol } : {}), cliOrdId: payload.cliOrdId }
+        : s.readOnly ? { symbol: payload.symbol, orderId: payload.orderId } : { orderId: payload.orderId };
+      const body = { ...target, requestId: newRequestId() };
       const r = await api("/api/cancel", { method: "POST", body });
       let ok = false;
       if (r.simulated) s.toast("Cancel simulated — terminal is disarmed.", "warn");
@@ -458,7 +1072,7 @@ const useStore = create((set, get) => ({
     }
   },
 
-  async flattenAll(mode) {
+  async flattenAll(mode, symbol) {
     const s = get();
     if (s.bulkBusy) return;
     if (s.dataStatus.positions?.state !== "current") {
@@ -469,20 +1083,20 @@ const useStore = create((set, get) => ({
       s.toast("Order state is not current; emergency flatten rejected.", "err", 10000);
       return;
     }
-    const positions = s.positions.filter(position => !position.error && Number(position.size) > 0);
+    const positions = s.positions.filter(position => !position.error && Number(position.size) > 0 && (!symbol || position.symbol === symbol));
     const orders = s.orders.filter(order => !order.error);
     if (mode === "chase" && !positions.length) { s.toast("No open positions to Chase-close."); return; }
     if (mode === "emergency" && !positions.length && !orders.length) { s.toast("Already flat with no open orders."); return; }
     const action = mode === "emergency"
       ? `market-close ${positions.length} position(s), confirm each is flat, then cancel ${orders.length} order(s)`
-      : `start ${positions.length} reduce-only closing Chase order(s); existing non-Chase orders stay open`;
+      : `start ${positions.length} reduce-only closing Chase order(s)${symbol ? ` on ${symbol}` : ""}; existing non-Chase orders stay open`;
     const chaseNote = !s.armed ? "" : mode === "emergency"
       ? " After every position is confirmed flat, active Chase workers will be stopped before the remaining orders are canceled."
-      : " This will refuse if another Chase is active or unresolved.";
+      : ` This will refuse if another Chase is active or unresolved${symbol ? ` on ${symbol}` : ""}.`;
     if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} ${mode === "emergency" ? "EMERGENCY FLATTEN" : "SOFT FLATTEN"}?\n\nThis will ${action}.${chaseNote}`)) return;
     set({ bulkBusy: true });
     try {
-      const result = await api("/api/flatten", { method: "POST", body: { mode, requestId: newRequestId() } });
+      const result = await api("/api/flatten", { method: "POST", body: { mode, ...(symbol ? { symbol } : {}), requestId: newRequestId() } });
       for (const item of result.results || []) {
         if (item.chase) get().onChaseEvent(item.chase);
       }
@@ -508,8 +1122,107 @@ const useStore = create((set, get) => ({
     }
   },
 
+  async loadHyperliquidCancellations(requestId = "") {
+    if (get().hlCancelChecking || get().bulkBusy) return;
+    if (typeof requestId !== "string" || (requestId.trim() && !/^[A-Za-z0-9._:-]{8,100}$/.test(requestId.trim()))) {
+      get().toast("Enter a valid cancellation request ID.", "err");
+      return;
+    }
+    const id = requestId.trim();
+    set({ hlCancelChecking: true, hlCancelHistoryNote: null });
+    try {
+      const result = await api(`/api/cancel-recovery${id ? `?requestId=${encodeURIComponent(id)}` : ""}`);
+      if (result.state !== "current" || !Array.isArray(result.items) || (id && result.items.some(item => item.requestId !== id))) {
+        throw new Error("Cancellation history unavailable or request identity mismatched");
+      }
+      set({ hlCancelHistory: result.items, hlCancelHistoryMore: !!result.hasMore,
+        hlCancelHistoryNote: result.items.length ? null : "No matching receipt in this network/account journal. This does not prove no cancellation was submitted." });
+    } catch (error) {
+      set({ hlCancelHistoryNote: "History refresh failed. Previously listed receipts have not been refreshed." });
+      get().toast(error.message, "err");
+    }
+    finally { set({ hlCancelChecking: false }); }
+  },
+
+  inspectHyperliquidCancellation(item) {
+    if (get().hlCancelChecking || get().bulkBusy) return;
+    const result = item.result || {};
+    set({ hlCancelReceipt: { requestId: item.requestId, symbol: item.body.symbol || "Multi-symbol batch", symbols: item.symbols, orderIds: item.targets,
+      outcome: result.outcome || "unknown", recoveryError: item.recoveryError,
+      results: item.targets.map(orderId => {
+        const row = Array.isArray(result.cancelResults) ? result.cancelResults.find(value => value?.orderId === orderId) : null;
+        return { orderId, error: row?.error || result.error,
+          outcome: row?.outcome || (["confirmed", "rejected", "simulated"].includes(result.outcome) ? result.outcome : "unknown") };
+      }),
+      readbacks: item.evidence?.targets || {} } });
+  },
+
+  async reconcileHyperliquidCancel(target) {
+    const s = get(), receipt = s.hlCancelReceipt;
+    if (s.hlCancelChecking || s.bulkBusy || !receipt?.orderIds.includes(target) || receipt.outcome === "simulated") return;
+    set({ hlCancelChecking: true });
+    try {
+      const evidence = await api("/api/cancel-reconcile", { method: "POST", body: { requestId: receipt.requestId, target } });
+      if (evidence.requestId !== receipt.requestId || evidence.target !== target) throw new Error("Cancellation evidence identity mismatch");
+      set(current => current.hlCancelReceipt?.requestId === receipt.requestId
+        ? { hlCancelReceipt: { ...current.hlCancelReceipt, readbacks: { ...current.hlCancelReceipt.readbacks, [target]: evidence } } } : {});
+    } catch (error) { get().toast(`Cancellation readback: ${error.message}`, "err"); }
+    finally { set({ hlCancelChecking: false }); }
+  },
+
+  cancelHyperliquidForSymbol() { return get().cancelHyperliquidOrders(false); },
+
+  async cancelHyperliquidOrders(allSymbols = false) {
+    const s = get();
+    if (s.exchange !== "hyperliquid" || typeof allSymbols !== "boolean" || s.bulkBusy || s.ticketBusy) return;
+    if (!s.canTrade || s.dataStatus.orders?.state !== "current") {
+      s.toast("Cancellation requires enabled trading and current order data.", "err");
+      return;
+    }
+    const symbol = allSymbols ? "all supported native-perp symbols in this Hyperliquid account" : s.symbol;
+    const selected = s.orders.filter(o => allSymbols || o?.symbol === symbol);
+    if (selected.some(o => !o || o.error || !isVenueSymbol(o.symbol))) {
+      s.toast("Order snapshot contains unavailable or foreign-venue rows. Refresh before cancellation.", "err");
+      return;
+    }
+    const targets = selected.map(o => ({ symbol: o.symbol, orderId: o.order_id }));
+    const orderIds = targets.map(o => o.orderId);
+    const symbols = Object.fromEntries(targets.map(o => [o.orderId, o.symbol]));
+    if (!orderIds.length) { s.toast(`No open orders on ${symbol}.`); return; }
+    if (orderIds.length > 100 || orderIds.some(id => typeof id !== "string" || !/^[0-9]{1,20}$/.test(id)) ||
+        new Set(orderIds).size !== orderIds.length) {
+      s.toast("Bulk cancellation requires at most 100 distinct, exact order IDs.", "err");
+      return;
+    }
+    if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"}: cancel these ${orderIds.length} orders on ${symbol}?${allSymbols ? " This includes TP/SL orders; positions will remain open." : ""} Orders created afterward will not be included.`)) return;
+    const requestId = newRequestId();
+    const receipt = { requestId, symbol, orderIds, symbols, outcome: "pending", results: [] };
+    set({ bulkBusy: true, hlCancelReceipt: receipt });
+    try {
+      const result = await api("/api/cancel", { method: "POST", body: allSymbols ? { targets, requestId } : { symbol, orderIds, requestId } });
+      const matched = Array.isArray(result.cancelResults) && result.cancelResults.length === orderIds.length &&
+        result.cancelResults.every((row, index) => row.orderId === orderIds[index]);
+      const results = matched ? result.cancelResults : orderIds.map(orderId => ({ orderId, outcome: "unknown" }));
+      const outcome = matched ? result.outcome : "unknown";
+      set({ hlCancelReceipt: { ...receipt, outcome, results, error: result.error } });
+      const confirmed = results.filter(row => row.outcome === "confirmed").length;
+      if (result.simulated) s.toast(`Cancellation simulated for ${orderIds.length} orders on ${symbol}. Nothing was sent.`, "warn");
+      else if (confirmed === orderIds.length) s.toast(`Canceled ${confirmed} orders on ${symbol}.`, "ok");
+      else s.toast(`Cancellation incomplete: ${confirmed}/${orderIds.length} confirmed. Inspect the per-order results.`, "warn", 12000);
+    } catch (error) {
+      const outcome = error.data?.outcome === "rejected" ? "rejected" : "unknown";
+      set({ hlCancelReceipt: { ...receipt, outcome, error: error.message,
+        results: orderIds.map(orderId => ({ orderId, outcome, error: error.message })) } });
+      s.toast(`Cancellation ${outcome}: ${error.message}. No automatic retry.`, "err", 12000);
+    } finally {
+      set({ bulkBusy: false });
+      await get().refreshTables();
+    }
+  },
+
   async cancelAllForSymbol() {
     const s = get();
+    if (s.readOnly) { await s.cancelHyperliquidForSymbol(); return; }
     const mine = s.orders.filter(o => o.symbol === s.symbol);
     if (!mine.length) { s.toast(`No open orders on ${s.symbol}.`); return; }
     if (!confirm(`Cancel ${mine.length} open order(s) on ${s.symbol}?`)) return;
@@ -785,13 +1498,19 @@ const useStore = create((set, get) => ({
   // ---- arm / sound / pro ----
   async armToggle() {
     const s = get();
+    // Arming a venue that cannot trade is pointless, but disarming must always work.
+    if (!s.canTrade && !s.armed) { s.toast("Trading is disabled for this venue. Enable the backend gate first.", "warn"); return; }
     if (s.armed) {
       const r = await api("/api/arm", { method: "POST", body: { armed: false } }).catch(() => null);
       if (r) { set({ armed: !!r.armed }); s.toast("Disarmed — orders are simulated again.", ""); }
       return;
     }
     if (s.env === "live") {
-      const answer = prompt(`This enables LIVE order entry on your ${s.env.toUpperCase()} Kraken Futures account.\nOrders you place will be real.\n\nType ARM to continue:`);
+      // ARM is one process-wide gate, so say so rather than implying it is venue-local.
+      const venue = s.readOnly ? `Hyperliquid (${s.signedTrading})` : `${s.env.toUpperCase()} Kraken Futures`;
+      const answer = prompt(
+        `This enables LIVE order entry for the whole terminal, both exchanges.\n` +
+        `You are on ${venue}.\nOrders you place will be real.\n\nType ARM to continue:`);
       if (answer !== "ARM") { s.toast("Arm cancelled.", ""); return; }
     }
     try {
@@ -807,7 +1526,7 @@ const useStore = create((set, get) => ({
     set({ pro });
     localStorage.setItem("kt.pro", pro ? "1" : "0");
     get().refreshAccount();
-    get().toast(pro ? "Pro-Mode on: Balance and Avail margin shown +$4,400 (display only — orders use real margin)." : "Pro-Mode off: balances are real.", "warn", 6000);
+    get().toast(pro ? `Pro-Mode on: Balance and Avail margin shown +$${get().proAdj(0).toLocaleString("en-US")} (display only; orders use real margin).` : "Pro-Mode off: balances are real.", "warn", 6000);
   },
 
   toggleSound() {
@@ -819,7 +1538,7 @@ const useStore = create((set, get) => ({
 
   setLev(lev) {
     set({ lev });
-    localStorage.setItem("kt.lev", String(lev));
+    localStorage.setItem(venueKey("kt.lev"), String(lev));
   },
 
   sizeFromPct(pct) {

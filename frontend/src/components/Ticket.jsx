@@ -1,7 +1,8 @@
 import { useEffect } from "react";
 import { fmt } from "../api";
-import { formatContractSize } from "../size-precision";
+import { contractsForNotional } from "../size-precision";
 import useStore from "../store";
+import GridTicket from "./GridTicket";
 
 export default function Ticket() {
   const symbol = useStore(s => s.symbol);
@@ -12,6 +13,7 @@ export default function Ticket() {
   const setLev = useStore(s => s.setLev);
   const tickers = useStore(s => s.tickers);
   const ticketBusy = useStore(s => s.ticketBusy);
+  const gridSeed = useStore(s => s.gridSeed);
   const submitOrder = useStore(s => s.submitOrder);
   const sizeFromPct = useStore(s => s.sizeFromPct);
   const t = tickers[symbol] || {};
@@ -48,52 +50,58 @@ export default function Ticket() {
     const syncSize = () => {
       const usd = Number(usdEl.value || 0);
       const m = mult();
-      if (usd > 0 && m > 0) sizeEl.value = formatContractSize(usd / m, prec());
+      if (usd > 0 && m > 0) sizeEl.value = contractsForNotional(usdEl.value, m, prec());
       syncEquiv();
     };
     usdEl.addEventListener("input", syncSize);
     const iv = setInterval(syncEquiv, 1000); // keep ≈ label fresh as price moves
     return () => { sizeEl.removeEventListener("input", syncEquiv); usdEl.removeEventListener("input", syncSize); clearInterval(iv); };
-  }, [symbol, t]);
+  }, [symbol, t, otype]);
 
   const isLimit = ["lmt", "post", "ioc"].includes(otype);
   const isTrigger = ["stp", "take_profit"].includes(otype);
   const isChase = otype === "chase";
 
   return (
-    <div className="panel" id="ticket">
-      <h3>Order ticket <span style={{ color: "var(--text)", textTransform: "none" }}>{symbol}</span></h3>
+    <div className={`panel${otype === "grid" ? " grid-active" : ""}`} id="ticket">
+      <div className="ticket-header">
+        <div><h3>Order ticket</h3><span className="ticket-market">{symbol}</span></div>
+        <span className={`ticket-mode${armed ? " live" : ""}`}>{armed ? "Live trading" : "Simulation"}</span>
+      </div>
       <div className="ticket-body">
         <div className="ord-tabs">
-          {[["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["stp", "Stop"], ["take_profit", "Take profit"], ["chase", "Chase"]].map(([v, label]) => (
-            <button key={v} className={"ord-tab" + (otype === v ? " active" : "")} data-otype={v} onClick={() => setOtype(v)}>{label}</button>
+          {[["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["stp", "Stop"], ["take_profit", "Take profit"], ["chase", "Chase"], ["grid", "Grid"]].map(([v, label]) => (
+            <button key={v} disabled={ticketBusy} className={"ord-tab" + (otype === v ? " active" : "")} aria-pressed={otype === v} data-otype={v} onClick={() => setOtype(v)}>{label}</button>
           ))}
         </div>
+        {otype === "grid" ? <GridTicket key={`${symbol}:${gridSeed?.id || ""}`} symbol={symbol} /> : <>
         {isLimit && (
           <div className="field" id="f-limit">
-            <label>Limit price</label>
+            <label htmlFor="in-limit">Limit price</label>
             <input id="in-limit" type="number" step="any" placeholder="0.00" />
           </div>
         )}
         {isTrigger && (
           <div className="field" id="f-stop">
-            <label>Trigger price <span id="trigger-signal-note">(mark)</span></label>
+            <label htmlFor="in-stop">Trigger price <span id="trigger-signal-note">(mark)</span></label>
             <input id="in-stop" type="number" step="any" placeholder="0.00" />
           </div>
         )}
-        <div className="field">
-          <label>Size <span style={{ color: "var(--muted)", textTransform: "none" }}>(contracts or $)</span></label>
+        <div className="field ticket-sizing">
+          <label htmlFor="in-size">Order size <span className="ticket-unit">Contracts</span></label>
           <input id="in-size" type="number" step="any" placeholder="0.0" />
           <div className="size-quick">
             {[25, 50, 75, 100].map(p => (
               <button key={p} data-pct={p} onClick={() => sizeFromPct(p)}>{p}%</button>
             ))}
           </div>
+          <label htmlFor="in-usd" className="ticket-sub-label">Or enter USD notional</label>
           <div className="size-usd-row" title="Type a dollar notional — converts to contracts at the current mark">
             <span className="usd-prefix">$</span>
             <input id="in-usd" type="number" step="any" placeholder="size in USD" />
             <span id="usd-equiv" className="usd-equiv">–</span>
           </div>
+          <div className="ticket-sub-label">Quick-size leverage <span>For the % buttons</span></div>
           <div className="size-quick" id="lev-quick" title="Leverage applied to the % size buttons">
             {[1, 2, 3, 5, 10].map(l => (
               <button key={l} data-lev={l} className={lev === l ? "active" : ""} onClick={() => setLev(l)}>{l}x</button>
@@ -113,6 +121,7 @@ export default function Ticket() {
             ? (armed ? "CHASE: reconciled post-only orders at best bid/ask, re-pegged only after confirmed cancellation." : "CHASE requires an armed terminal.")
             : (armed ? `LIVE: orders go straight to Kraken (${window.__env || "live"}).` : "SIMULATION: arm the terminal to send real orders.")}
         </div>
+        </>}
       </div>
     </div>
   );

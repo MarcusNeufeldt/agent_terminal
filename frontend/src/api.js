@@ -1,15 +1,55 @@
-let terminalToken = typeof document === "undefined"
-  ? ""
-  : document.querySelector('meta[name="terminal-token"]')?.content || "";
-if (terminalToken.includes("__TERMINAL_TOKEN__")) terminalToken = "";
+import { EXCHANGE, READ_ONLY, reloadExchange } from "./exchange.js";
+
+// Hyperliquid signed trading is gated by the backend. Until the gate is on, this venue
+// accepts reads only, so a stale page cannot send a write the server would honour.
+const HL_WRITE_PATHS = new Set(["/api/order", "/api/cancel", "/api/leverage", "/api/chart-order"]);
+// Venue-neutral writes: switching venue, and the ARM gate itself. Disarming must always
+// be possible, including when signed trading is off, or the terminal could be stuck live.
+const VENUE_NEUTRAL_WRITES = new Set(["/api/exchange", "/api/arm"]);
+const HL_NONTRADING_POSTS = new Set(["/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview"]);
+let signedTrading = "off";
+
+export function setSignedTrading(mode) {
+  signedTrading = ["mainnet", "testnet"].includes(mode) ? mode : "off";
+  return signedTrading;
+}
+
+let exchangeEpoch = 0;
+let exchangeRouting = 0;
+let sessionPromise = null;
 
 async function getTerminalToken() {
-  if (terminalToken) return terminalToken;
-  const res = await fetch("/api/session", { cache: "no-store" });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.token) throw new Error(data.error || "Could not start terminal session");
-  terminalToken = data.token;
-  return terminalToken;
+  sessionPromise ||= fetch("/api/session", { cache: "no-store" }).then(async res => {
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.token) throw new Error(data.error || "Could not start terminal session");
+    if (READ_ONLY && data.exchangeRouting !== 1) throw new Error("Restart the updated backend before using Hyperliquid.");
+    exchangeRouting = data.exchangeRouting === 1 ? 1 : 0;
+    if (exchangeRouting) {
+      if (!Number.isSafeInteger(data.exchangeEpoch) || data.exchangeEpoch < 0) throw new Error("Invalid exchange session");
+      exchangeEpoch = data.exchangeEpoch;
+      checkExchangeSession(data);
+    }
+    return data.token;
+  }).catch(error => { sessionPromise = null; throw error; });
+  return sessionPromise;
+}
+
+export function checkExchangeSession(data) {
+  if (data.exchangeRouting !== 1) return;
+  if (data.exchange !== EXCHANGE || data.exchangeEpoch !== exchangeEpoch) {
+    reloadExchange(data.exchange);
+    throw new Error("Exchange changed. Reloading the terminal; no request was retried.");
+  }
+}
+
+export function apiUrl(path) {
+  if (!path.startsWith("/api/")) throw new Error("Expected a local terminal API path");
+  const url = new URL(path, "http://terminal.local");
+  const targets = url.searchParams.getAll("exchange");
+  if (targets.length > 1 || targets.length && targets[0] !== EXCHANGE) throw new Error("Cross-exchange request blocked");
+  if (!exchangeRouting && EXCHANGE === "kraken") return path; // Existing Kraken backend during rollout.
+  url.searchParams.set("exchange", EXCHANGE);
+  return url.pathname + url.search;
 }
 
 export function newRequestId() {
@@ -17,15 +57,27 @@ export function newRequestId() {
 }
 
 export async function api(path, opts = {}) {
+  const method = (opts.method || "GET").toUpperCase();
+  if (!["GET", "HEAD"].includes(method) && !VENUE_NEUTRAL_WRITES.has(path) && READ_ONLY
+      && !HL_NONTRADING_POSTS.has(path) && !(signedTrading !== "off" && HL_WRITE_PATHS.has(path))) {
+    throw new Error("Hyperliquid trading is disabled by the backend gate.");
+  }
   const token = await getTerminalToken();
   const { body, headers, ...rest } = opts;
-  const res = await fetch(path, {
+  const res = await fetch(apiUrl(path), {
     ...rest,
-    headers: { "Content-Type": "application/json", "X-Terminal-Token": token, ...headers },
+    headers: { "Content-Type": "application/json", ...headers, "X-Terminal-Token": token,
+      ...(exchangeRouting ? { "X-Terminal-Exchange-Epoch": String(exchangeEpoch) } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok || path === "/api/health") checkExchangeSession(data);
+  if (!res.ok) {
+    const error = new Error(data.error || `HTTP ${res.status}`);
+    error.data = data;
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 

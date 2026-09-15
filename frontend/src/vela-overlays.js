@@ -40,12 +40,20 @@ function money(value) {
   return Math.abs(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+export function overlayIntent(line) {
+  const source = line?.protection || line?.tp || line?.position || {};
+  const order = source.order || line?.order || {};
+  return JSON.stringify([line?.key, line?.price, source.symbol, source.entry, source.size, source.dir,
+    order.orderId, order.cliOrdId, order.snapshot?.unfilledSizeExact, order.snapshot?.stopPrice,
+    order.snapshot?.limitPrice, order.snapshot?.triggerKind, order.snapshot?.triggerMarket, order.snapshot?.reduceOnly, order.snapshot?.positionTpsl]);
+}
+
 export function previewProtection(line, rawPrice) {
-  const source = line.tp || line.position;
+  const source = line.protection || line.tp || line.position;
   if (!source) return null;
   const price = snapOverlayPrice(rawPrice, source.tick);
   const pnl = source.dir * (price - source.entry) * source.size * (source.mult || 1);
-  const kind = line.tp ? "tp" : Math.abs(pnl) < 0.005 ? "be" : pnl > 0 ? "tp" : "sl";
+  const kind = line.protection?.kind || (line.tp ? "tp" : price === source.entry ? "be" : pnl > 0 ? "tp" : "sl");
   const type = kind === "sl" ? "SL" : kind === "tp" ? "TP" : "BE";
   const color = kind === "sl" ? "#ef5350" : kind === "tp" ? "#26a69a" : "#f0b90b";
   return {
@@ -54,7 +62,7 @@ export function previewProtection(line, rawPrice) {
     color,
     dashed: true,
     title: `${type} ${price.toFixed(decimals(source.tick))} (${pnl >= 0 ? "+" : "-"}$${money(pnl)})`,
-    drop: { symbol: source.symbol, kind, price, pnl, order: source.order || line.order || null },
+    drop: { symbol: source.symbol, kind, price, pnl, order: source.order || line.order || null, positionSnapshot: source.snapshot },
   };
 }
 
@@ -131,7 +139,7 @@ registerNativeIndicator({
   create: () => new TerminalOverlayIndicator(),
 });
 
-class TerminalOverlayLayer {
+export class TerminalOverlayLayer {
   mount(canvas) {
     this.canvas = canvas;
     this.plot = canvas.parentElement;
@@ -179,7 +187,7 @@ class TerminalOverlayLayer {
     }
 
     const hit = this.rowAt(point, "protection") || this.rowAt(point, "drag");
-    if (!hit) return;
+    if (!hit || this.pending?.size) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     this.drag = { line: hit.line, price: hit.line.price };
@@ -205,7 +213,7 @@ class TerminalOverlayLayer {
     event.stopImmediatePropagation();
     const point = this.point(event);
     const price = this.args.coords.yToPrice(point.y, this.args.scale, this.args.bounds);
-    this.drag.price = snapOverlayPrice(price, (this.drag.line.tp || this.drag.line.position)?.tick);
+    this.drag.price = snapOverlayPrice(price, (this.drag.line.protection || this.drag.line.tp || this.drag.line.position)?.tick);
     this.render(this.args);
   }
 
@@ -214,10 +222,18 @@ class TerminalOverlayLayer {
     event.preventDefault();
     event.stopImmediatePropagation();
     const drag = this.drag;
+    const targetId = this.dragTargetId;
+    const current = this.data?.lines?.find(line => line.key === drag.line.key);
+    if (event.type === "pointercancel" || targetId !== this.data?.targetId || !current ||
+        overlayIntent(current) !== overlayIntent(drag.line)) {
+      this.stopDrag();
+      this.render(this.args);
+      return;
+    }
     const point = this.point(event);
     drag.price = snapOverlayPrice(
       this.args.coords.yToPrice(point.y, this.args.scale, this.args.bounds),
-      (drag.line.tp || drag.line.position)?.tick,
+      (drag.line.protection || drag.line.tp || drag.line.position)?.tick,
     );
     this.stopDrag();
     const preview = previewProtection(drag.line, drag.price);
@@ -271,7 +287,7 @@ class TerminalOverlayLayer {
       if (!Number.isFinite(y) || y < args.bounds.top || y > args.bounds.top + args.bounds.height) continue;
       const hovered = args.cursor && Math.abs(args.cursor.y - y) <= 7;
       drawLine(ctx, line, y, width, hovered);
-      const hit = { line, y, draggable: Boolean(line.tp) };
+      const hit = { line, y, draggable: Boolean(line.tp || line.protection) };
       if (line.position) hit.protection = drawPill(ctx, 8, y, `${line.title} · ↕ TP / SL`, "#f0b90b");
       if (line.order) hit.cancel = drawCancel(ctx, width - 86, y, this.pendingCancels?.has(line.key));
       this.hits.push(hit);
@@ -368,7 +384,7 @@ export class VelaChartController {
     targets.set(targetId, {
       cancel: order => this.onOrderCancel?.(order),
       dragging: active => active ? this.draggingCells.add(cell.id) : this.draggingCells.delete(cell.id),
-      drop: (line, drop) => line.tp
+      drop: (line, drop) => line.protection ? this.onProtectionDrop?.(drop) : line.tp
         ? this.onTpDrop?.({ symbol: drop.symbol, price: drop.price, order: drop.order })
         : this.onProtectionDrop?.(drop),
     });

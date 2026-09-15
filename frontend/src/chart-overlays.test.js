@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildChartOverlays } from "./chart-overlays.js";
+import { riskOverlays } from "./vela-overlays.js";
 
 const positions = [{ symbol: "PF_XBTUSD", side: "long", size: 2, price: 100, liqPriceEstimate: 60 }];
 const instruments = [{ symbol: "PF_XBTUSD", tickSize: 0.5, contractSize: 1 }];
@@ -22,6 +23,61 @@ test("builds position, liquidation, and exact-order overlays", () => {
   assert.equal(takeProfit.tp.fullPosition, false);
   assert.match(takeProfit.title, /50%/);
   assert.equal(takeProfit.order.orderId, "tp-1");
+});
+
+test("Hyperliquid can expose exact cancellation without position or TP dragging", () => {
+  const symbol = "HL_APT", id = "12345678901234567890";
+  const pos = positions.map(p => ({ ...p, symbol }));
+  const orders = [{ symbol, order_id: id, orderType: "take_profit", side: "sell", stopPrice: 120, size: 1 }];
+  const locked = buildChartOverlays(symbol, pos, orders, [], true);
+  assert.ok(locked.every(line => !line.order && !line.tp && !line.position));
+  const cancellable = buildChartOverlays(symbol, pos, orders, [], true, true);
+  assert.ok(cancellable.every(line => !line.tp && !line.position));
+  const order = cancellable.find(line => line.order)?.order;
+  assert.equal(order.orderId, id);
+  assert.equal(order.symbol, symbol);
+});
+
+test("Native protection capability enables exact TP/SL and position handles but not limit moves", () => {
+  const symbol = "HL_APT";
+  const pos = [{ symbol, side: "long", size: 2, sizeExact: "2", price: 100 }];
+  const orders = [
+    { symbol, order_id: "12", orderType: "stp", triggerKind: "sl", triggerMarket: true, reduceOnly: true,
+      side: "sell", stopPrice: 90, limitPrice: 90, unfilledSizeExact: "1", unfilledSize: 1 },
+    { symbol, order_id: "13", orderType: "lmt", side: "buy", limitPrice: 80 },
+  ];
+  const lines = buildChartOverlays(symbol, pos, orders, [], true, true, true);
+  assert.ok(lines.find(line => line.position));
+  const stop = lines.find(line => line.protection);
+  assert.equal(stop.protection.kind, "sl");
+  assert.equal(stop.protection.order.snapshot.order_id, "12");
+  assert.ok(lines.filter(line => line.key.startsWith("order-limit:")).every(line => !line.protection && !line.tp));
+  const locked = buildChartOverlays(symbol, pos, orders, [], true, true, false);
+  assert.ok(locked.every(line => !line.protection && !line.position));
+  const tp = buildChartOverlays(symbol, pos, [{ ...orders[0], order_id: "14", orderType: "take_profit", triggerKind: "tp", stopPrice: 120 }], [], true, true, true)
+    .find(line => line.protection);
+  assert.equal(tp.tp.size, 1);
+  assert.equal(riskOverlays([tp]).length, 3);
+});
+
+test("native whole-position TP profit follows size and entry changes while fixed ladders do not", () => {
+  const symbol = "HL_GRIFFAIN";
+  const native = { symbol, order_id: "123", orderType: "take_profit", triggerKind: "tp", triggerMarket: true,
+    reduceOnly: true, positionTpsl: true, side: "sell", stopPrice: 0.013067, limitPrice: 0.013067,
+    size: 0, unfilledSize: 0, unfilledSizeExact: "0" };
+  for (const [size, entry] of [[1238, 0.01285], [3781, 0.012273], [1000, 0.012273]]) {
+    const pos = [{ symbol, side: "long", size, sizeExact: String(size), price: entry }];
+    const line = buildChartOverlays(symbol, pos, [native], [], true, true, true).find(l => l.protection);
+    assert.equal(line.tp.size, size);
+    assert.equal(line.tp.fullPosition, true);
+    assert.match(line.title, /100% · auto size/);
+    assert.ok(line.title.includes(((native.stopPrice - entry) * size).toFixed(2)));
+    assert.equal(riskOverlays([line]).length, 3);
+    const fixed = { ...native, positionTpsl: false, size: 1238, unfilledSize: 1238, unfilledSizeExact: "1238" };
+    const fixedLine = buildChartOverlays(symbol, pos, [fixed], [], true, true, true).find(l => l.key.startsWith("order-stop:"));
+    assert.doesNotMatch(fixedLine.title, /auto size/);
+    if (size === 3781) assert.match(fixedLine.title, /0.98.*33%/);
+  }
 });
 
 test("keeps symbol overlays isolated", () => {

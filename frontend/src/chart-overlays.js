@@ -1,6 +1,7 @@
-export function buildChartOverlays(symbol, positions, orders, instruments) {
+export function buildChartOverlays(symbol, positions, orders, instruments, readOnly = false, canCancel = false, canProtect = false) {
   const overlays = [];
   const position = (positions || []).find(p => !p.error && p.symbol === symbol && p.size);
+  const protectionReady = canProtect && (positions || []).filter(p => p.symbol === symbol).length === 1 && Number(position?.sizeExact) > 0;
   const instrument = (instruments || []).find(i => i.symbol === symbol) || {};
   const tick = Number(instrument.tickSize) || 0.01;
   const mult = Number(instrument.contractSize || 1);
@@ -14,7 +15,7 @@ export function buildChartOverlays(symbol, positions, orders, instruments) {
       color: p.side === "long" ? "#26a69a" : "#ef5350",
       title: `${p.side} ${Number(p.size)}`,
       dashed: false,
-      position: { symbol, entry: Number(p.price), size: Number(p.size), mult, dir, tick, side: p.side },
+      position: { symbol, entry: Number(p.price), size: Number(p.size), mult, dir, tick, side: p.side, snapshot: { ...p } },
     });
     if (p.liqPriceEstimate) {
       overlays.push({
@@ -38,6 +39,8 @@ export function buildChartOverlays(symbol, positions, orders, instruments) {
       cliOrdId: o.cliOrdId || null,
       orderId,
       price: Number(o.stopPrice || o.limitPrice),
+      snapshot: { ...o },
+      positionSnapshot: position ? { ...position } : null,
     } : null;
 
     if (o.limitPrice) {
@@ -69,7 +72,9 @@ export function buildChartOverlays(symbol, positions, orders, instruments) {
 
     const dir = String(position.side).toLowerCase() === "short" ? -1 : 1;
     const positionSize = Number(position.size);
-    const orderSize = Number(o.unfilledSize ?? o.size ?? positionSize);
+    const nativeFullPosition = o.positionTpsl === true && o.reduceOnly === true &&
+      o.side === (position.side === "long" ? "sell" : "buy");
+    const orderSize = nativeFullPosition ? positionSize : Number(o.unfilledSize ?? o.size ?? positionSize);
     const coveredSize = Math.min(positionSize, orderSize);
     const coverage = positionSize > 0 ? Math.round(orderSize / positionSize * 100) : 0;
     const pnl = dir * (Number(o.stopPrice) - Number(position.price)) * coveredSize * mult;
@@ -77,7 +82,7 @@ export function buildChartOverlays(symbol, positions, orders, instruments) {
       key: `order-stop:${identity}`,
       price: Number(o.stopPrice),
       color: isTp ? "#26a69a" : "#ef5350",
-      title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) · ${coverage}%`,
+      title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) · ${coverage}%${nativeFullPosition ? " · auto size" : ""}`,
       dashed: true,
       ...(isTp ? {
         tp: {
@@ -95,5 +100,24 @@ export function buildChartOverlays(symbol, positions, orders, instruments) {
     });
   }
 
-  return overlays.filter(line => Number.isFinite(line.price));
+  return overlays.filter(line => Number.isFinite(line.price)).map(line => {
+    if (readOnly) {
+      if (!protectionReady) delete line.position;
+      const order = line.order?.snapshot;
+      const protectionSize = order?.positionTpsl === true ? Number(position?.sizeExact) : Number(order?.unfilledSizeExact);
+      if (protectionReady && position && protectionSize > 0 &&
+          protectionSize <= Number(position.sizeExact) && line.key.startsWith("order-stop:") && order?.reduceOnly === true &&
+          order.side === (position.side === "long" ? "sell" : "buy") &&
+          ["tp", "sl"].includes(order.triggerKind) && typeof order.triggerMarket === "boolean") {
+        line.protection = { symbol, kind: order.triggerKind, entry: Number(position.price),
+          size: protectionSize, mult, dir: position.side === "long" ? 1 : -1,
+          tick, order: line.order, snapshot: { ...position } };
+      }
+      if (!canCancel) delete line.order;
+      if (line.protection?.kind === "tp") {
+        line.tp = { ...line.protection, fullPosition: protectionSize === Number(position.sizeExact) };
+      } else delete line.tp;
+    }
+    return line;
+  });
 }

@@ -7,7 +7,7 @@ globalThis.localStorage = {
   setItem: () => {},
 };
 
-const vite = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+const vite = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
 const { default: useStore } = await vite.ssrLoadModule("/src/store.js");
 
 test("bulk flatten blocks duplicate clicks and rejects unavailable state", async t => {
@@ -57,6 +57,18 @@ test("bulk flatten blocks duplicate clicks and rejects unavailable state", async
   await first;
   assert.equal(useStore.getState().bulkBusy, false);
   assert.match(toasts.at(-1), /simulated/i);
+
+  useStore.setState({ positions: [
+    { symbol: "PF_XBTUSD", side: "long", size: 1 },
+    { symbol: "PF_ETHUSD", side: "short", size: 2 },
+  ] });
+  let confirmation;
+  globalThis.confirm = message => { confirmation = message; return true; };
+  await useStore.getState().flattenAll("chase", "PF_ETHUSD");
+  assert.equal(requestBody.mode, "chase");
+  assert.equal(requestBody.symbol, "PF_ETHUSD");
+  assert.match(confirmation, /start 1 reduce-only closing Chase order\(s\) on PF_ETHUSD/);
+  assert.equal(useStore.getState().bulkBusy, false);
 
   let networkCalls = 0;
   globalThis.fetch = async () => { networkCalls += 1; throw new Error("should not fetch"); };

@@ -1,9 +1,8 @@
 """Reconciled post-only limit Chase engine.
 
-Live Chase remains disabled at the HTTP/action boundary until this state machine
-has passed a controlled Kraken demo test. The engine never treats an order that
-is merely absent from open orders as filled, and never replaces an order before
-a confirmed cancellation and fill reconciliation.
+The engine never treats an order that is merely absent from open orders as
+filled, and never replaces an order before confirmed cancellation and fill
+reconciliation. Exchange-initiated cancellations stop the worker without replacement.
 """
 
 from __future__ import annotations
@@ -132,10 +131,14 @@ class ChaseWorker(threading.Thread):
     def _finish(self, status: str, message: str) -> None:
         self.status = status
         self.state = "UNKNOWN" if status == "unknown" else status.upper()
-        if status == "unknown":
-            self.unknown_reason = message
+        self.unknown_reason = message if status == "unknown" else None
         self._audit("final", status=status, filled=self.filled, reason=message)
         self._log(f"chase {status}: {message}; filled {self.filled}/{self.spec.get('size')}")
+
+    def _terminal_status(self, fallback: str) -> str:
+        if self.filled >= float(self.spec["size"]) - 1e-9:
+            return "filled"
+        return "partial" if self.filled > 0 else fallback
 
     def _instrument(self) -> dict[str, Any]:
         for instrument in self.ctx.get_instruments().get("instruments", []):
@@ -152,7 +155,33 @@ class ChaseWorker(threading.Thread):
             return Decimal(str(bid)) - Decimal(offset) * tick
         return Decimal(str(ask)) + Decimal(offset) * tick
 
+    def _reducible_size(self) -> Decimal:
+        try:
+            response = self.ctx.client.get("/openpositions", private=True)
+            rows = response.get("openPositions") if response.get("result") == "success" else None
+            if not isinstance(rows, list) or any(not isinstance(p, dict) or not p.get("symbol") or p.get("error") for p in rows):
+                raise ValueError("missing successful openPositions")
+            matches = [p for p in rows if p.get("symbol") == self.spec["symbol"]]
+            if not matches:
+                return Decimal(0)
+            if len(matches) != 1:
+                raise ValueError("ambiguous position state")
+            position = matches[0]
+            size = Decimal(str(position.get("size")))
+            if not size.is_finite() or size < 0 or position.get("side") not in {"long", "short"}:
+                raise ValueError("invalid position size or side")
+            closing_side = "sell" if position["side"] == "long" else "buy"
+            return size if closing_side == self.spec["side"] else Decimal(0)
+        except Exception as exc:
+            raise ChaseTransient(f"position read unavailable; no reduce-only placement: {exc}") from exc
+
     def _place(self, price: Decimal, size: Decimal) -> None:
+        if self.spec.get("reduceOnly"):
+            size = min(size, self._reducible_size())
+            if size <= 0:
+                self.stop_reason = "no_reducible_position"
+                self._finish(self._terminal_status("cancelled"), "no remaining position to reduce; no order placed")
+                return
         cli_id = f"ch-{self.id}-{self.pegs}-{uuid.uuid4().hex[:6]}"
         self._active = {
             "cliOrdId": cli_id,
@@ -199,9 +228,9 @@ class ChaseWorker(threading.Thread):
         except Exception as exc:
             raise ChaseTransient(f"open-orders read failed: {exc}") from exc
         orders = response.get("openOrders") if isinstance(response, dict) and response.get("result") == "success" else None
-        if not isinstance(orders, list):
+        if not isinstance(orders, list) or any(not isinstance(o, dict) or o.get("error") for o in orders):
             raise ChaseTransient("open-orders response missing successful openOrders")
-        return [order for order in orders if isinstance(order, dict)]
+        return orders
 
     def _fill_size(self, order_id: str) -> float:
         try:
@@ -222,6 +251,16 @@ class ChaseWorker(threading.Thread):
         )
         return size
 
+    def _reconciled_size(self, active: dict[str, Any], status: str, filled: float, order_id: str) -> float:
+        # Keep authoritative progress even if the supplementary fills lookup fails.
+        active["seenFilled"] = max(float(active.get("seenFilled") or 0), filled)
+        self.filled = self._base_filled + active["seenFilled"]
+        if status == "CANCELLED":
+            return filled  # exact terminal status includes the final cumulative quantity
+        if status == "FULLY_EXECUTED" and abs(filled - active["size"]) <= max(1e-12, active["size"] * 1e-9):
+            return active["size"]
+        return max(active["seenFilled"], self._fill_size(order_id))
+
     def _order_status(self, active: dict[str, Any]) -> tuple[str, float, str]:
         order_id = str(active.get("orderId") or "")
         cli_id = str(active.get("cliOrdId") or "")
@@ -239,13 +278,65 @@ class ChaseWorker(threading.Thread):
             order = row.get("order") if isinstance(row, dict) else None
             row_order_id = str(order.get("orderId") or order.get("order_id") or "") if isinstance(order, dict) else ""
             row_cli_id = str(order.get("cliOrdId") or "") if isinstance(order, dict) else ""
-            if not isinstance(order, dict) or not ((order_id and row_order_id == order_id) or (cli_id and row_cli_id == cli_id)):
+            if not isinstance(order, dict) or not (row_order_id == order_id if order_id else row_cli_id == cli_id):
                 continue
+            if cli_id and row_cli_id and row_cli_id != cli_id:
+                raise ChaseUnknown("order status identity mismatch")
             status = str(row.get("status") or "").upper()
-            filled = float(order.get("filled") or 0)
+            filled = self._checked_filled(active, order.get("filled"))
             self._audit("order_status", orderId=row_order_id, cliOrdId=row_cli_id, status=status, filled=filled)
             return status, filled, row_order_id
+        if order_id:
+            return self._cancelled_history_status(active)
         raise ChaseTransient(f"order status unavailable for {cli_id or order_id}")
+
+    @staticmethod
+    def _checked_filled(active: dict[str, Any], value: Any) -> float:
+        try:
+            filled = Decimal(str(value))
+            size = Decimal(str(active["size"]))
+            seen = Decimal(str(active.get("seenFilled") or 0))
+            if not filled.is_finite() or not seen <= filled <= size:
+                raise ValueError("outside observed fills and placed quantity")
+            return float(filled)
+        except Exception as exc:
+            raise ChaseUnknown(f"invalid or contradictory filled quantity: {value}") from exc
+
+    def _cancelled_history_status(self, active: dict[str, Any]) -> tuple[str, float, str]:
+        from account_log import _get
+        from kraken_client import build_query
+        params = {"since": int((self.started - 60) * 1000), "tradeable": self.spec["symbol"],
+                  "sort": "desc", "count": 100}
+        try:
+            for _ in range(5):
+                response = _get(self.ctx.client, "/api/history/v3/orders", build_query(params))
+                if not isinstance(response.get("elements"), list):
+                    raise ChaseTransient("order history is unavailable")
+                for element in response["elements"]:
+                    cancelled = (element.get("event") or {}).get("OrderCancelled") or {}
+                    order = cancelled.get("order") or {}
+                    if order.get("uid") != active["orderId"]:
+                        continue
+                    if (order.get("clientId") != active["cliOrdId"]
+                            or order.get("tradeable") != self.spec["symbol"]
+                            or str(order.get("direction")).lower() != self.spec["side"]
+                            or Decimal(str(order.get("quantity"))) != Decimal(str(active["size"]))):
+                        raise ChaseUnknown("cancelled order history identity/quantity mismatch")
+                    filled = self._checked_filled(active, order.get("filled"))
+                    active["cancelReason"] = cancelled.get("reason")
+                    self._audit("historical_cancellation", orderId=active["orderId"],
+                                cliOrdId=active["cliOrdId"], filled=filled, reason=cancelled.get("reason"),
+                                eventId=element.get("uid"))
+                    return "CANCELLED", float(filled), active["orderId"]
+                token = response.get("continuationToken")
+                if not token:
+                    break
+                params["continuation_token"] = token
+        except ChaseError:
+            raise
+        except Exception as exc:
+            raise ChaseTransient(f"order history read failed: {exc}") from exc
+        raise ChaseTransient("exact cancelled order not found within bounded history lookup")
 
     @staticmethod
     def _matches(order: dict[str, Any], active: dict[str, Any]) -> bool:
@@ -286,9 +377,9 @@ class ChaseWorker(threading.Thread):
             status, status_filled, status_order_id = self._order_status(active)
             order_id = status_order_id or order_id
             active["orderId"] = order_id
-            fills_filled = self._fill_size(order_id)
+            fills_filled = self._reconciled_size(active, status, status_filled, order_id)
         except ChaseTransient as exc:
-            raise ChaseUnknown(f"{active['cliOrdId']} absent and cannot be reconciled: {exc}") from exc
+            raise ChaseTransient(f"{active['cliOrdId']} absent; reconciliation read will retry: {exc}") from exc
         active["seenFilled"] = max(float(active.get("seenFilled") or 0), status_filled, fills_filled)
         self.filled = self._base_filled + active["seenFilled"]
         if status == "FULLY_EXECUTED" and active["seenFilled"] >= active["size"] - max(1e-12, active["size"] * 1e-9):
@@ -296,6 +387,12 @@ class ChaseWorker(threading.Thread):
             self._active = None
             self.filled = self._base_filled
             return True
+        if status == "CANCELLED":
+            self._base_filled = self.filled
+            self._active = None
+            self.stop_reason = active.get("cancelReason") or "externally_cancelled"
+            self._finish(self._terminal_status("cancelled"), f"exchange cancellation confirmed for {order_id}; no replacement")
+            return False
         if status in {"ENTERED_BOOK", "TRIGGER_PLACED"}:
             raise ChaseTransient(f"{active['cliOrdId']} is still {status} but absent from open orders")
         raise ChaseUnknown(
@@ -306,6 +403,9 @@ class ChaseWorker(threading.Thread):
     def _cancel_active(self) -> None:
         active = self._active
         if not active:
+            return
+        if active.get("cancelConfirmed"):
+            self._retry_cancel_reconciliation()
             return
         self._audit("cancellation_intent", cliOrdId=active["cliOrdId"], orderId=active.get("orderId"))
         self._transition("CANCEL_REQUESTED", f"cancel requested for {active['cliOrdId']}")
@@ -322,7 +422,25 @@ class ChaseWorker(threading.Thread):
         if status != "cancelled":
             raise ChaseUnknown(f"cancellation status {status or 'missing'} for {active['cliOrdId']}: {str(detail)[:160]}")
         self._audit("cancellation_result", cliOrdId=active["cliOrdId"], orderId=active.get("orderId"), nestedStatus=status)
+        active["cancelConfirmed"] = True
         self._transition("CANCEL_CONFIRMED", f"cancel confirmed for {active['cliOrdId']}")
+        self._retry_cancel_reconciliation()
+
+    def _retry_cancel_reconciliation(self) -> None:
+        for attempt in range(3):
+            try:
+                self._reconcile_cancelled()
+                return
+            except ChaseTransient as exc:
+                if attempt == 2:
+                    raise ChaseUnknown(f"cancel confirmed, but reconciliation reads failed after 3 attempts: {exc}") from exc
+                self._log(f"cancel confirmed; retrying reconciliation reads only: {exc}")
+                time.sleep(1.0)
+
+    def _reconcile_cancelled(self) -> None:
+        active = self._active
+        if not active or not active.get("cancelConfirmed"):
+            raise ChaseUnknown("cancellation is not confirmed")
         self._transition("RECONCILING", f"reconciling cancelled {active['cliOrdId']}")
         try:
             if any(self._matches(order, active) for order in self._open_orders()):
@@ -335,16 +453,16 @@ class ChaseWorker(threading.Thread):
             active["orderId"] = order_id
             if order_state not in {"CANCELLED", "FULLY_EXECUTED"}:
                 raise ChaseUnknown(f"cancelled {active['cliOrdId']} has order state {order_state or 'missing'}")
-            fills_filled = self._fill_size(order_id)
+            fills_filled = self._reconciled_size(active, order_state, status_filled, order_id)
             reconciled = max(float(active.get("seenFilled") or 0), status_filled, fills_filled)
-            if order_state == "FULLY_EXECUTED":
-                reconciled = active["size"]
+            if order_state == "FULLY_EXECUTED" and reconciled < active["size"] - max(1e-12, active["size"] * 1e-9):
+                raise ChaseUnknown("full-execution status has incomplete filled quantity")
             self._audit(
                 "cancellation_reconciled", orderId=order_id, orderStatus=order_state,
                 statusFilled=status_filled, fillsObserved=fills_filled, reconciledFilled=reconciled,
             )
-        except ChaseTransient as exc:
-            raise ChaseUnknown(f"cancelled {active['cliOrdId']} but reconciliation failed: {exc}") from exc
+        except ChaseTransient:
+            raise
         self._base_filled += min(active["size"], reconciled)
         self.filled = self._base_filled
         self._active = None
@@ -354,9 +472,7 @@ class ChaseWorker(threading.Thread):
         if self._active:
             self._cancel_active()
         self.stop_reason = reason
-        size_total = float(self.spec.get("size") or 0)
-        status = "partial" if 0 < self._base_filled < size_total else reason
-        self._finish(status, f"{reason}; resting order cancelled and reconciled")
+        self._finish(self._terminal_status(reason), f"{reason}; resting order cancelled and reconciled")
 
     def _wait(self, seconds: float) -> None:
         self._abort.wait(max(0.0, seconds))
@@ -399,7 +515,9 @@ class ChaseWorker(threading.Thread):
             if self._active:
                 try:
                     if self._reconcile_resting():
-                        self._finish("filled", "authoritative fills account for the full order")
+                        self._finish(self._terminal_status("cancelled"), "authoritative fills account for the full order")
+                        break
+                    if self.status != "running":
                         break
                 except ChaseTransient as exc:
                     self._log(f"{exc}; leaving current order untouched")
@@ -438,6 +556,11 @@ class ChaseWorker(threading.Thread):
                     break
                 except ChaseUnknown:
                     raise
+                except ChaseTransient as exc:
+                    self.pegs -= 1
+                    self._log(str(exc))
+                if self.status != "running":
+                    break
             self._wait(repeg_sec)
 
 
@@ -484,9 +607,10 @@ class ChaseManager:
         worker.abort()
         return {"ok": True, "chase": worker.snapshot()}
 
-    def abort_all(self, wait_timeout: float = 5.0) -> dict[str, Any]:
+    def abort_all(self, wait_timeout: float = 5.0, *, chase_ids: set[str] | None = None) -> dict[str, Any]:
         with self._lock:
-            running = [worker for worker in self._chases.values() if worker.status == "running" and worker.is_alive()]
+            running = [worker for worker in self._chases.values() if worker.status == "running" and worker.is_alive()
+                       and (chase_ids is None or worker.id in chase_ids)]
         for worker in running:
             worker.abort()
         deadline = time.monotonic() + max(0.0, wait_timeout)
@@ -532,13 +656,81 @@ class ChaseManager:
             self._publish("chase", item)
         return found
 
-    def recover(self, snapshots: list[dict[str, Any]], orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def recover(self, snapshots: list[dict[str, Any]], orders: list[dict[str, Any]], ctx: Any = None) -> list[dict[str, Any]]:
         found = self.detect_orphans(orders)
+        resolved_ids = set()
+        if ctx is not None:
+            for snapshot in snapshots:
+                if snapshot.get("status") not in {"running", "unknown"}:
+                    continue
+                cli_id = snapshot.get("activeCliOrdId")
+                order_id = snapshot.get("activeOrderId")
+                spec = snapshot.get("spec") or {}
+                # Only recover a whole-size peg with its persisted placement identity.
+                # Partial-size/missing-history cases remain blocked for manual reconciliation.
+                placement = next((a.get("params", {}) for a in reversed(snapshot.get("audit", []))
+                                  if a.get("event") == "placement_intent" and a.get("params", {}).get("cliOrdId") == cli_id), {})
+                if not cli_id or not order_id or not spec.get("size") or placement.get("size") != spec["size"]:
+                    continue
+                if any(str(order.get("cliOrdId") or "") == cli_id
+                       or str(order.get("order_id") or order.get("orderId") or "") == order_id for order in orders):
+                    continue
+                worker = ChaseWorker(spec.copy(), ctx, lambda *_: None)
+                worker.id = snapshot["id"]
+                worker.started = snapshot.get("started", worker.started)
+                worker.pegs = snapshot.get("pegs", 0)
+                worker.audit = list(snapshot.get("audit", []))
+                worker._active = {"cliOrdId": cli_id, "orderId": order_id, "size": float(spec["size"]),
+                                  "seenFilled": snapshot.get("filled") or 0, "placedAt": 0}
+                confirmed_audit = next((a for a in reversed(worker.audit)
+                                        if a.get("event") == "order_status" and a.get("orderId") == order_id
+                                        and a.get("cliOrdId") in {None, "", cli_id}
+                                        and a.get("status") in {"FULLY_EXECUTED", "CANCELLED"}), None)
+                cancellation_confirmed = any(a.get("event") == "cancellation_result"
+                                             and a.get("orderId") == order_id and a.get("cliOrdId") == cli_id
+                                             and a.get("nestedStatus") == "cancelled" for a in worker.audit)
+                recovered_status = "filled"
+                if confirmed_audit:
+                    # Final exchange execution evidence does not expire when /orders/status does.
+                    try:
+                        quantity = worker._checked_filled(worker._active, confirmed_audit.get("filled"))
+                    except ChaseError:
+                        continue
+                    if confirmed_audit["status"] == "FULLY_EXECUTED" and quantity != float(spec["size"]):
+                        continue
+                    worker._base_filled = worker.filled = quantity
+                    worker._active = None
+                    recovered_status = worker._terminal_status("cancelled")
+                    if confirmed_audit["status"] == "CANCELLED":
+                        worker.stop_reason = "externally_cancelled"
+                    worker._audit("recovery_evidence", source="persisted_order_status", orderId=order_id,
+                                  filled=worker.filled, sourceEvent=confirmed_audit)
+                else:
+                    try:
+                        if cancellation_confirmed:
+                            worker._active["cancelConfirmed"] = True
+                            worker._retry_cancel_reconciliation()
+                            recovered_status = worker._terminal_status("cancelled")
+                        elif not worker._reconcile_resting():
+                            if worker.status not in {"cancelled", "partial", "filled"}:
+                                continue
+                            recovered_status = worker.status
+                    except ChaseError:
+                        continue
+                worker.publish = self._publish
+                worker._finish(recovered_status, "startup reconciliation confirmed terminal order state; no exchange writes")
+                worker._publish()
+                with self._lock:
+                    self._chases[worker.id] = worker
+                    for key, item in list(self._orphans.items()):
+                        if item.get("activeCliOrdId") == cli_id:
+                            del self._orphans[key]
+                resolved_ids.add(worker.id)
         open_cli_ids = {str(order.get("cliOrdId") or "") for order in orders}
         recovered = []
         with self._lock:
             for snapshot in snapshots:
-                if snapshot.get("status") not in {"running", "unknown"}:
+                if snapshot.get("status") not in {"running", "unknown"} or snapshot.get("id") in resolved_ids:
                     continue
                 cli_id = str(snapshot.get("activeCliOrdId") or "")
                 if cli_id and cli_id in open_cli_ids:

@@ -1,12 +1,15 @@
 # Agent Terminal
 
-A self-hosted Kraken Futures trading terminal with live market data, chart-based order management, account analytics, a volatility scanner, and an ARM-gated AI trading assistant.
+A self-hosted Kraken Futures trading terminal with live market data, chart-based order management, account analytics, a volatility scanner, and an ARM-gated AI trading assistant. A global selector also opens a separate, read-only Hyperliquid native-perpetual view.
 
 > [!WARNING]
 > This software can submit real orders. Every server restart returns it to **DISARMED**. Review the safety model and test against Kraken's demo environment before using live credentials.
 
 ## What is included
 
+- Global Kraken/Hyperliquid selector with disarm-on-switch, stale-request rejection, and separate chart/UI state
+- Hyperliquid public markets, native candles, books, trades, and read-only account views
+- Hyperliquid signed trading behind three gates: an explicit `HYPERLIQUID_TRADING` mode, credentials, and the ARM gate. Off by default and unreachable from the browser.
 - Kraken Futures positions, orders, fills, margin, and account history
 - Binance USDT-M candles for charting, with Kraken as the trading authority
 - PF-only market, limit, post-only, stop, take-profit, ladder, and Chase orders with unique client IDs and explicit write outcomes
@@ -115,6 +118,10 @@ See [`terminal/README.md`](terminal/README.md) for the API, data flow, execution
 | `KRAKEN_FUTURES_API_KEY` | none | Kraken Futures API key |
 | `KRAKEN_FUTURES_API_SECRET` | none | Kraken Futures API secret |
 | `KRAKEN_FUTURES_ENV` | `live` | Set to `demo` for Kraken's demo environment |
+| `HYPERLIQUID_NETWORK` | `mainnet` | Public native-perp data; `testnet` uses the separate testnet host |
+| `HYPERLIQUID_ACCOUNT_ADDRESS` | none | Master/subaccount address for read-only views and signed trading, not an API-agent address |
+| `HYPERLIQUID_TRADING` | `off` | Signed Hyperliquid actions. `off` refuses to sign; also accepts `testnet` or `mainnet`. |
+| `HYPERLIQUID_SECRET_KEY` | none | API-wallet key used only when `HYPERLIQUID_TRADING` is set. Read at startup; never returned by an endpoint. |
 | `PORT` | `8787` | Local HTTP port |
 | `AI_CHAT_MODEL` | `google/gemini-3.8-flash` | OpenRouter model |
 | `CHAT_CONTEXT_LIMIT` | `200000` | AI conversation compaction threshold |

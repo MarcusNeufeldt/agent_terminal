@@ -2,10 +2,13 @@ import { useState } from "react";
 import { fmt } from "../api";
 import useStore from "../store";
 import StatsModal from "./StatsModal";
+import AltBtcModal from "./AltBtcModal";
 
 export default function HeaderBar() {
   const [statsOpen, setStatsOpen] = useState(false);
+  const [altBtcOpen, setAltBtcOpen] = useState(false);
   const symbol = useStore(s => s.symbol);
+  const readOnly = useStore(s => s.readOnly);
   const tickers = useStore(s => s.tickers);
   const soundOn = useStore(s => s.soundOn);
   const positions = useStore(s => s.positions);
@@ -14,7 +17,7 @@ export default function HeaderBar() {
   const dataStatus = useStore(s => s.dataStatus);
   const toggleSound = useStore(s => s.toggleSound);
   const t = tickers[symbol] || {};
-  const ch = t.change24h !== undefined ? Number(t.change24h) : null;
+  const ch = t.change24h != null ? Number(t.change24h) : null;
   const chaseAlert = Object.values(chases || {}).find(chase => ["unknown", "orphaned"].includes(chase.status));
   const protectionAlert = Object.values(protectionAlerts || {})[0];
   const unavailableData = Object.entries(dataStatus || {}).filter(([, state]) => state?.state === "unavailable");
@@ -38,7 +41,7 @@ export default function HeaderBar() {
       <div className="h-sym">{symbol}</div>
       <div className="h-price">{t.last !== undefined ? fmt(t.last) : "–"}</div>
       <div className="h-item">
-        <span className="k">24h change</span>
+        <span className="k">{readOnly ? "24h mark change" : "24h change"}</span>
         <span className={"v " + (ch !== null ? (ch >= 0 ? "up" : "down") : "")}>{ch !== null ? (ch >= 0 ? "+" : "") + ch.toFixed(2) + "%" : "–"}</span>
       </div>
       <div className="h-item"><span className="k">Mark</span><span className="v">{fmt(t.markPrice)}</span></div>
@@ -48,7 +51,7 @@ export default function HeaderBar() {
       <div className="h-item"><span className="k">24h high</span><span className="v">{fmt(t.high24h)}</span></div>
       <div className="h-item"><span className="k">24h low</span><span className="v">{fmt(t.low24h)}</span></div>
       <div className="h-item"><span className="k">24h vol</span><span className="v">{fmtVol24(t.vol24h)}</span></div>
-      <div className="h-item"><span className="k">Funding</span><span className="v">{t.fundingRate !== undefined ? (Number(t.fundingRate) * 100).toFixed(4) + "%" : "–"}</span></div>
+      <div className="h-item"><span className="k">{readOnly ? "Funding / h" : "Funding"}</span><span className="v">{t.fundingRate !== undefined ? (Number(t.fundingRate) * 100).toFixed(4) + "%" : "–"}</span></div>
       <div className="h-item"><span className="k">Open interest</span><span className="v">{fmtVol24(t.openInterest)}</span></div>
       <button id="bell-btn" className={"h-action" + (soundOn ? "" : " off")} title={soundOn ? "Fill sound on — click to mute" : "Fill sound muted — click to enable"} onClick={toggleSound}>
         {soundOn ? "🔔" : "🔕"}
@@ -102,14 +105,17 @@ export default function HeaderBar() {
           </button>
         );
       })()}
-      <button className="h-action" onClick={() => setStatsOpen(true)}>Stats</button>
-      <button className="h-action" onClick={() => { location.href = "/volatility"; }}>Volatility Pairs</button>
+      <button className="h-action" disabled={readOnly} onClick={() => setAltBtcOpen(true)}>Alt/BTC</button>
+      <button className="h-action" disabled={readOnly} onClick={() => setStatsOpen(true)}>Stats</button>
+      <button className="h-action" disabled={readOnly} onClick={() => { location.href = "/volatility"; }}>Volatility Pairs</button>
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} />}
+      {altBtcOpen && <AltBtcModal onClose={() => setAltBtcOpen(false)} />}
     </header>
   );
 }
 
 function fmtVol24(x) {
+  if (x == null) return "–";
   const n = Number(x);
   if (!Number.isFinite(n)) return "–";
   if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + "B";

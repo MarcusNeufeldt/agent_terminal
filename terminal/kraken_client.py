@@ -166,17 +166,23 @@ class KrakenFuturesClient:
         if private:
             headers.update(self._auth_headers(normalized_endpoint, query))
 
-        req = request.Request(url, headers=headers, method="GET")
-        try:
-            with request.urlopen(req, timeout=self.timeout) as response:
-                raw = response.read()
-                content_type = response.headers.get("Content-Type", "")
-                return _decode_response(raw, content_type)
-        except error.HTTPError as exc:
-            payload = _decode_response(exc.read(), exc.headers.get("Content-Type", ""))
-            raise KrakenHTTPError(exc.code, exc.reason, payload) from exc
-        except error.URLError as exc:
-            raise KrakenFuturesError(f"request failed: {exc.reason}") from exc
+        for attempt in range(2):
+            if attempt and private:
+                headers.update(self._auth_headers(normalized_endpoint, query))
+            req = request.Request(url, headers=headers, method="GET")
+            try:
+                with request.urlopen(req, timeout=self.timeout) as response:
+                    raw = response.read()
+                    content_type = response.headers.get("Content-Type", "")
+                    return _decode_response(raw, content_type)
+            except error.HTTPError as exc:
+                payload = _decode_response(exc.read(), exc.headers.get("Content-Type", ""))
+                raise KrakenHTTPError(exc.code, exc.reason, payload) from exc
+            except (error.URLError, TimeoutError) as exc:
+                if attempt:
+                    raise KrakenFuturesError(f"request failed: {getattr(exc, 'reason', exc)}") from exc
+                # Only idempotent GET reads retry. Never replay an ambiguous exchange write.
+                time.sleep(0.25)
 
     def get_public_charts(
         self,

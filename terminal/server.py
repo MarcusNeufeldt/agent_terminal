@@ -24,6 +24,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+import grid_move
+from tp_cleanup import TakeProfitCleanup
+from exchange_routing import ExchangeRouting, ExchangeRoutingError, requested_exchange
+from hyperliquid_backend import HyperliquidBackend, READ_ONLY_MESSAGE
+import hyperliquid_trading
+import hyperliquid_recovery
+import hyperliquid_fills
+import hyperliquid_lifecycle
+import hyperliquid_grid
+import hyperliquid_chart
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -42,6 +52,7 @@ import chase as chase_mod  # noqa: E402
 import db as db_mod  # noqa: E402
 import account_log  # noqa: E402
 import binance_candles  # noqa: E402
+import alt_btc  # noqa: E402
 import binance_ws as binance_ws_mod  # noqa: E402
 import chat_compaction  # noqa: E402
 from actions import ActionContext  # noqa: E402
@@ -57,7 +68,7 @@ PORT = int(os.getenv("PORT", "8787"))
 VITE_ORIGINS = tuple(filter(None, (value.strip().lower() for value in os.getenv("VITE_DEV_ORIGINS", "").split(","))))
 security = LocalSecurity(PORT, VITE_ORIGINS)
 DEBUG_ENDPOINTS = os.getenv("TERMINAL_DEBUG", "").strip().lower() in {"1", "true", "yes"}
-IDEMPOTENT_WRITE_PATHS = {"/api/order", "/api/cancel", "/api/action", "/api/flatten", "/api/chase", "/api/chase/abort", "/api/chat"}
+IDEMPOTENT_WRITE_PATHS = {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/action", "/api/grid", "/api/flatten", "/api/chase", "/api/chase/abort", "/api/chat"}
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,100}$")
 
 client = KrakenFuturesClient.from_env()
@@ -65,6 +76,7 @@ hub = MarketHub(client.base_url)
 
 armed = False
 arm_lock = threading.RLock()
+exchange_routing = ExchangeRouting(arm_lock)
 
 
 class TTLCache:
@@ -128,6 +140,242 @@ class SseHub:
 
 sse = SseHub()
 hub.on_message = lambda kind, payload: sse.publish(kind, payload)
+# Kraken client/context/DB remain permanently bound to Kraken. No global client swap.
+hyperliquid_sse = SseHub()
+hyperliquid = HyperliquidBackend(hyperliquid_sse.publish)
+_hl_trader: dict[str, Any] = {"ready": False, "trader": None, "reason": None}
+_hl_gate: dict[str, Any] = {}
+
+
+# ---- hyperliquid signed writes ---------------------------------------------
+
+HL_TIF = {"mkt": "ioc", "lmt": "gtc", "post": "alo", "ioc": "ioc"}
+HL_TRIGGER = {"stp": "sl", "take_profit": "tp"}
+HL_WRITE_PATHS = {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview"}
+# These belong to the process, not to a venue: ARM guards every write, so the challenge
+# and the toggle must be reachable from whichever venue the browser is currently on.
+VENUE_NEUTRAL_PATHS = {"/api/arm", "/api/arm/challenge"}
+
+
+def _hl_instrument(symbol: str) -> dict[str, Any]:
+    instrument = (hyperliquid.markets().get(symbol) or {}).get("instrument")
+    if not instrument or instrument.get("tradeable") is False:
+        raise hyperliquid_trading.HyperliquidError("Unknown or untradeable Hyperliquid symbol")
+    return instrument
+
+
+def hyperliquid_gate() -> dict[str, Any]:
+    """Credential-free view of the signed-trading gate for health reporting.
+
+    Deliberately never retains the private key: the response leaves this process.
+    """
+    if not _hl_gate:
+        credentials = hyperliquid_trading.load_trading_credentials()
+        _hl_gate.update(mode=credentials["mode"], reason=credentials.get("reason"),
+                        signer=credentials.get("signer_address"), host=credentials.get("host"))
+        if credentials["mode"] != "off" and credentials["mode"] != hyperliquid.network:
+            _hl_gate.update(mode="off", reason="Hyperliquid read and signing networks disagree")
+    return dict(_hl_gate)
+
+
+def hyperliquid_trader() -> tuple[Any, str | None]:
+    """Build the signed trader once, on first use. Never at import time."""
+    if not _hl_trader["ready"]:
+        gate = hyperliquid_gate()
+        if gate["mode"] == "off":
+            return None, gate.get("reason") or "Hyperliquid signed trading is off"
+        def market(symbol: str) -> dict[str, Any]:
+            return (hyperliquid.markets().get(symbol) or {}).get("instrument") or {}
+        trader, reason = hyperliquid_trading.build_trader(market)
+        _hl_trader.update(ready=True, trader=trader, reason=reason)
+        db.log_event("hyperliquid_trader", {"signed": trader is not None, "reason": reason})
+    return _hl_trader["trader"], _hl_trader["reason"]
+
+
+def hyperliquid_leverage_intent(body):
+    instrument = _hl_instrument(str(body.get("symbol") or "").strip().upper())
+    leverage, previous, cross = body.get("leverage"), body.get("expectedLeverage"), body.get("cross")
+    if (type(leverage) is not int or not 1 <= leverage <= instrument.get("maxLeverage", 0) or
+            type(previous) is not int or previous < 1 or type(cross) is not bool or type(body.get("expectedArmed")) is not bool):
+        raise hyperliquid_trading.HyperliquidError("Valid exchange leverage, previous setting and margin mode are required")
+    return {"type": "leverageIntent", "action": {"type": "updateLeverage", "asset": instrument["assetId"],
+            "isCross": cross, "leverage": leverage}, "expiresAfter": int(time.time() * 1000) + 30000}
+
+
+def hyperliquid_order_action(body: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(body.get("symbol") or "").strip().upper()
+    side = str(body.get("side") or "").strip().lower()
+    order_type = str(body.get("orderType") or "lmt").strip().lower()
+    size = _as_float(body.get("size"))
+    reduce_only = body.get("reduceOnly", False)
+    close_position = body.get("closePosition", False)
+    if type(close_position) is not bool or (close_position and (order_type not in {"ioc", "mkt"} or reduce_only is not True)):
+        raise hyperliquid_trading.HyperliquidError("closePosition requires a reduce-only IOC or market order")
+    if close_position and order_type == "mkt" and (type(body.get('expectedArmed')) is not bool or not isinstance(body.get('position'), dict)):
+        raise hyperliquid_trading.HyperliquidError('Market close requires the reviewed position and ARM state')
+    if type(reduce_only) is not bool:
+        raise hyperliquid_trading.HyperliquidError("reduceOnly must be a boolean")
+    if side not in {"buy", "sell"}:
+        raise hyperliquid_trading.HyperliquidError("side must be buy or sell")
+    if isinstance(body.get('size'), bool) or size is None or size <= 0:
+        raise hyperliquid_trading.HyperliquidError("size must be a positive number")
+    instrument = _hl_instrument(symbol)
+    if "quickPercent" in body:
+        if reduce_only:
+            positions = hyperliquid.positions(fresh=True)["positions"]
+            matches = [p for p in positions if p.get("symbol") == symbol]
+            if len(matches) != 1 or matches[0].get("side") != ("long" if side == "sell" else "short"):
+                raise hyperliquid_trading.HyperliquidError("No current position for this percentage reduction")
+            available = matches[0]["sizeExact"]
+        else:
+            capacity = hyperliquid.trading_capacity(symbol)
+            if (type(body.get("expectedLeverage")) is not int or
+                    body["expectedLeverage"] != capacity["leverage"]["value"] or
+                    body.get("expectedMarginMode") != capacity["leverage"]["type"]):
+                raise hyperliquid_trading.HyperliquidError("Exchange leverage changed. Refresh quick sizing before submitting")
+            available = capacity["maxTradeSizes"][side]
+        size = hyperliquid_trading.percent_size(available, body["quickPercent"], size, instrument["contractValueTradePrecision"])
+    if order_type in HL_TRIGGER:
+        stop = _as_float(body.get("stopPrice"))
+        if stop is None or stop <= 0:
+            raise hyperliquid_trading.HyperliquidError("stopPrice is required for trigger orders")
+        if not reduce_only:
+            raise hyperliquid_trading.HyperliquidError("Hyperliquid trigger orders must be reduce-only")
+        market = body.get("triggerMarket", False)
+        if type(market) is not bool:
+            raise hyperliquid_trading.HyperliquidError("triggerMarket must be a boolean")
+        trigger = {"kind": HL_TRIGGER[order_type], "triggerPx": stop, "market": market}
+        action = hyperliquid_trading.order_action_for(instrument, side, size, _as_float(body.get("limitPrice")) or stop,
+                                                   tif="gtc", reduce_only=True, trigger=trigger,
+                                                   cloid=body.get("cloid"))
+        if "maxNotional" in body:
+            hyperliquid_trading.validate_order_notional(action, body["maxNotional"])
+        return action
+    if order_type not in HL_TIF:
+        raise hyperliquid_trading.HyperliquidError(
+            f"orderType must be one of {sorted(set(HL_TIF) | set(HL_TRIGGER))}")
+    if order_type == "mkt":
+        if "maxNotional" in body and body["maxNotional"] is None:
+            raise hyperliquid_trading.HyperliquidError("Maximum notional must be positive")
+        if body.get("limitPrice") is not None:
+            raise hyperliquid_trading.HyperliquidError("Market price is derived from fresh quotes, not a supplied limit")
+        return hyperliquid_trading.market_action_for(instrument, side, size,
+            hyperliquid.orderbook(symbol, fresh=True), body.get("slippagePercent", 0.5),
+            cloid=body.get("cloid"), reduce_only=reduce_only, maximum=body.get("maxNotional"))
+    price = _as_float(body.get("limitPrice"))
+    if price is None or price <= 0:
+        raise hyperliquid_trading.HyperliquidError("limitPrice is required")
+    action = hyperliquid_trading.order_action_for(instrument, side, size, price, tif=HL_TIF[order_type],
+                                               reduce_only=reduce_only, cloid=body.get("cloid"))
+    rounded_price = float(action["orders"][0]["p"])
+    if close_position and ((side == "buy" and rounded_price > price) or (side == "sell" and rounded_price < price)):
+        raise hyperliquid_trading.HyperliquidError("Price rounding would exceed the close price bound; use an exchange-precision price")
+    if "maxNotional" in body:
+        hyperliquid_trading.validate_order_notional(action, body["maxNotional"])
+    return action
+
+
+def hyperliquid_cancel_action(body: dict[str, Any]) -> dict[str, Any]:
+    if "targets" in body:
+        scope = hyperliquid_recovery.cancel_scope(body)
+        return {"type": "cancel", "cancels": [{"a": _hl_instrument(symbol)["assetId"], "o": int(identifier)}
+                                              for identifier, symbol in scope.items()]}
+    if "orderIds" in body:
+        identifiers = body["orderIds"]
+        if (not isinstance(identifiers, list) or not 1 <= len(identifiers) <= 100 or
+                any(body.get(key) is not None for key in ("orderId", "cliOrdId", "asset"))):
+            raise hyperliquid_trading.HyperliquidError("Bulk cancel requires 1 to 100 exact orderIds and one symbol")
+        parsed_ids = []
+        for identifier in identifiers:
+            if (not isinstance(identifier, str) or not identifier.isascii() or not identifier.isdigit() or
+                    not 1 <= len(identifier) <= 20 or not 0 < int(identifier) < 2**64):
+                raise hyperliquid_trading.HyperliquidError("Bulk cancel requires exact decimal-string orderIds")
+            parsed_ids.append(int(identifier))
+        if len(set(parsed_ids)) != len(parsed_ids):
+            raise hyperliquid_trading.HyperliquidError("Duplicate bulk cancel identity")
+        asset = _hl_instrument(str(body.get("symbol") or "").upper())["assetId"]
+        return {"type": "cancel", "cancels": [{"a": asset, "o": identifier} for identifier in parsed_ids]}
+    cloid = str(body.get("cliOrdId") or "")
+    if cloid:
+        if not hyperliquid_trading.CLOID_RE.fullmatch(cloid):
+            raise hyperliquid_trading.HyperliquidError("Invalid client order id")
+        return {"type": "cancelByCloid",
+                "cancels": [{"asset": _hl_instrument(str(body.get("symbol") or "").upper())["assetId"],
+                             "cloid": cloid}]}
+    asset, oid = body.get("asset"), body.get("orderId")
+    if body.get("symbol"):
+        expected_asset = _hl_instrument(str(body["symbol"]).upper())["assetId"]
+        if asset is not None and (type(asset) is not int or asset != expected_asset):
+            raise hyperliquid_trading.HyperliquidError("asset does not match symbol")
+        asset = expected_asset
+    # Order ids are 64-bit and lose precision as JSON numbers in a browser, so a
+    # decimal string is the transport-safe form. Python ints are unbounded.
+    if isinstance(oid, str) and oid.isascii() and oid.isdigit() and len(oid) <= 20:
+        oid = int(oid)
+    if type(asset) is not int or type(oid) is not int or asset < 0 or not 0 < oid < 2**64:
+        raise hyperliquid_trading.HyperliquidError(
+            "cancel requires cliOrdId with a symbol, or integer asset and orderId")
+    return {"type": "cancel", "cancels": [{"a": asset, "o": oid}]}
+
+
+def hyperliquid_write(path: str, body: dict[str, Any], *, prepared_action=None) -> dict[str, Any]:
+    """Validate, then simulate or sign. Mirrors the Kraken DISARMED contract."""
+    expires_after = None
+    if path == "/api/chart-order":
+        intent = prepared_action if prepared_action is not None else hyperliquid_chart.prepare(body, hyperliquid)
+        action, expires_after = intent["action"], intent["expiresAfter"]
+    elif path == "/api/leverage":
+        intent = prepared_action if prepared_action is not None else hyperliquid_leverage_intent(body)
+        action, expires_after = intent["action"], intent["expiresAfter"]
+    elif prepared_action is not None:
+        if path != "/api/order":
+            raise hyperliquid_trading.HyperliquidError("Prepared actions are only valid for orders")
+        action = prepared_action
+    elif path == "/api/order":
+        action = hyperliquid_order_action(body)
+    elif path == "/api/cancel":
+        action = hyperliquid_cancel_action(body)
+    else:
+        raise hyperliquid_trading.HyperliquidError(READ_ONLY_MESSAGE)
+    count = len(action.get("orders") or action.get("cancels") or [1])
+    close_target = (str(body["symbol"]).strip().upper(), "buy" if action["orders"][0]["b"] else "sell",
+                    action["orders"][0]["s"]) if path == "/api/order" and body.get("closePosition") else None
+    if close_target and str(body.get('orderType', '')).strip().lower() == 'mkt':
+        close_target = (*close_target, body['position'])
+    trader, reason = hyperliquid_trader()
+    # Serialize the final permission check with signing/submission and disarming.
+    with arm_lock:
+        if close_target and str(body.get('orderType', '')).strip().lower() == 'mkt' and body.get('expectedArmed') is not armed:
+            raise hyperliquid_trading.HyperliquidError('ARM state changed. Review the close again')
+        if path == "/api/leverage":
+            if body["expectedArmed"] is not armed:
+                raise hyperliquid_trading.HyperliquidError("ARM state changed. Review the leverage change again")
+            current = hyperliquid.trading_capacity(str(body["symbol"]).strip().upper())["leverage"]
+            if current["value"] != body["expectedLeverage"] or (current["type"] == "cross") != body["cross"]:
+                raise hyperliquid_trading.HyperliquidError("Exchange leverage or margin mode changed. Refresh before applying")
+        if path == "/api/chart-order" and body["expectedArmed"] is not armed:
+            raise hyperliquid_trading.HyperliquidError("ARM state changed. Review the chart change again")
+        if path == "/api/chart-order" and (not armed or trader is None):
+            hyperliquid_chart.validate(intent, hyperliquid)
+        if close_target and (not armed or trader is None):
+            hyperliquid.validate_close(*close_target)
+        if not armed:
+            return {"exchange": "hyperliquid", "type": action["type"], "outcome": "simulated", "simulated": True,
+                    "live": False, "action": action, "rows": [],
+                    "message": "Terminal is DISARMED — the Hyperliquid action was validated but not signed or sent."}
+        if trader is None:
+            return {"exchange": "hyperliquid", "type": action["type"], "outcome": "simulated", "simulated": True,
+                    "live": False, "action": action, "rows": [],
+                    "message": f"Not signed: {reason}"}
+        if trader.network != hyperliquid.network or trader.account_address != hyperliquid.account_address.lower():
+            raise hyperliquid_trading.HyperliquidError("Read and signing account identities disagree")
+        hyperliquid.require_agent(trader.address)
+        if path == "/api/chart-order":
+            hyperliquid_chart.validate(intent, hyperliquid)
+        if close_target:
+            hyperliquid.validate_close(*close_target)
+        result = trader.submit(action, count=count, expires_after=expires_after) if expires_after is not None else trader.submit(action, count=count)
+    return {"exchange": "hyperliquid", "type": action["type"], "live": True, **result}
 
 
 # ---- account helpers -------------------------------------------------------
@@ -432,7 +680,7 @@ def _detect_orphan_chases() -> None:
         if failed:
             db.log_event("chase_orphan_scan", {"ok": False, "error": str(failed)[:300]})
             return
-        found = chase_manager.recover(db.latest_chase_snapshots(), orders)
+        found = chase_manager.recover(db.latest_chase_snapshots(), orders, action_ctx)
         db.log_event("chase_orphan_scan", {"ok": True, "count": len(found)})
     except Exception as exc:
         db.log_event("chase_orphan_scan", {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]})
@@ -539,6 +787,21 @@ def _managed_protection_loop() -> None:
             sys.stderr.write(f"[protection-sync] {type(exc).__name__}: {exc}\n")
 
 
+tp_cleanup = TakeProfitCleanup(db, action_ctx, chase_manager,
+                               lambda: cache.drop("positions", "orders"), sse.publish)
+
+
+def _tp_cleanup_loop() -> None:
+    while True:
+        time.sleep(2.5)
+        try:
+            with arm_lock:
+                tp_cleanup.step(armed)
+        except Exception as exc:
+            sys.stderr.write(f"[tp-cleanup] {type(exc).__name__}: {exc}\n")
+
+
+threading.Thread(target=_tp_cleanup_loop, name="tp-cleanup", daemon=True).start()
 threading.Thread(target=_managed_protection_loop, name="managed-protection", daemon=True).start()
 
 RESOLUTIONS = {"1m", "5m", "15m", "30m", "1h", "4h", "12h", "1d", "1w"}
@@ -700,7 +963,7 @@ def _flatten_outcome(results: list[dict[str, Any]], is_armed: bool) -> str:
     return "rejected"
 
 
-def flatten_all(mode: str) -> dict[str, Any]:
+def flatten_all(mode: str, symbol: str = "") -> dict[str, Any]:
     """Run a server-authoritative flatten plan under the global ARM/write lock."""
     with arm_lock:
         is_armed = armed
@@ -710,7 +973,9 @@ def flatten_all(mode: str) -> dict[str, Any]:
             actions = trading_actions.build_flatten_actions(
                 mode,
                 get_positions(),
-                get_orders() if mode == "emergency" else None,
+                get_orders() if mode == "emergency" and not is_armed else None,
+                symbol=symbol,
+                defer_order_validation=is_armed and mode == "emergency",
             )
         except trading_actions.ActionError as exc:
             return {"mode": mode, "armed": is_armed, "outcome": "rejected", "error": str(exc), "actions": [], "results": []}
@@ -722,6 +987,9 @@ def flatten_all(mode: str) -> dict[str, Any]:
         if is_armed and mode == "chase" and actions:
             try:
                 active_chases = chase_manager.active()
+                if symbol:
+                    active_chases = [item for item in active_chases
+                                     if (item.get("symbol") or item.get("spec", {}).get("symbol")) in {None, "", symbol}]
             except Exception as exc:
                 return {"mode": mode, "armed": True, "outcome": "unknown",
                         "error": f"could not inspect active Chase workers: {type(exc).__name__}: {exc}",
@@ -867,11 +1135,59 @@ class TerminalHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            if path == "/api/session":
+            exchange = requested_exchange(parsed.query)
+            if path not in {"/api/session", "/api/exchanges", "/api/arm/challenge"}:
+                exchange_routing.check(exchange)
+                if exchange == "hyperliquid":
+                    if path == "/api/stream":
+                        self._stream_sse(exchange)
+                    elif path == "/api/order-lifecycle":
+                        try:
+                            request_id = query.get("requestId", "")
+                            if not REQUEST_ID_RE.fullmatch(request_id):
+                                raise hyperliquid_trading.HyperliquidError("valid requestId required")
+                            self._send_json(hyperliquid_lifecycle.inspect_order(db, hyperliquid, request_id))
+                        except (hyperliquid_trading.HyperliquidError, ValueError) as exc:
+                            self._send_json({"state": "unavailable", "error": str(exc)}, 503)
+                    elif path == "/api/fill-history":
+                        try:
+                            self._send_json(hyperliquid_fills.order_totals(db, hyperliquid, query.get("orderId")))
+                        except (hyperliquid_trading.HyperliquidError, ValueError) as exc:
+                            self._send_json({"state": "unavailable", "error": str(exc)}, 503)
+                    elif path == "/api/cancel-recovery":
+                        try:
+                            self._send_json(hyperliquid_recovery.cancellations(db, hyperliquid, query.get("requestId")))
+                        except (hyperliquid_trading.HyperliquidError, ValueError) as exc:
+                            self._send_json({"state": "unavailable", "error": str(exc)}, 503)
+                    elif path == "/api/execution-recovery":
+                        try:
+                            self._send_json(hyperliquid_recovery.unresolved(db, hyperliquid))
+                        except (hyperliquid_trading.HyperliquidError, ValueError) as exc:
+                            self._send_json({"state": "unavailable", "error": str(exc)}, 503)
+                    elif path == "/api/health":
+                        with arm_lock:
+                            exchange_routing.check(exchange)
+                            # ARM is process-wide, so report the real flag, never a constant.
+                            self._send_json({**hyperliquid.health(), **exchange_routing.snapshot(),
+                                             "armed": armed, "readOnly": False,
+                                             "accountAddress": hyperliquid.account_address,
+                                             "signedTrading": hyperliquid_gate()})
+                    else:
+                        payload, status = hyperliquid.read(path, query)
+                        self._send_json(payload, status)
+                    return
+            if path == "/api/exchanges":
+                # readOnly means "no browser trading UI for this venue"; signedTrading is the server gate.
+                self._send_json({**exchange_routing.snapshot(), "venues": [
+                    {"id": "kraken", "name": "Kraken Futures", "readOnly": False},
+                    {"id": "hyperliquid", "name": "Hyperliquid", "readOnly": True,
+                     "signedTrading": hyperliquid_gate()["mode"]},
+                ]})
+            elif path == "/api/session":
                 if not security.valid_host(self.headers):
                     self._send_json({"error": "invalid Host"}, 403)
                     return
-                self._send_json({"token": security.token})
+                self._send_json({"token": security.token, **exchange_routing.snapshot()})
             elif path == "/api/arm/challenge":
                 if not security.valid_token(self.headers):
                     self._send_json({"error": "invalid terminal token"}, 403)
@@ -879,15 +1195,26 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._send_json({"challenge": security.issue_arm_challenge()})
             elif path == "/api/health":
                 with arm_lock:
-                    is_armed = armed
-                self._send_json({
-                    "ok": True,
-                    "armed": is_armed,
-                    "env": "demo" if client.is_demo else "live",
-                    "hub": hub.status(),
-                    "hasKeys": bool(client.api_key and client.api_secret),
-                    "aiModel": os.getenv("AI_CHAT_MODEL", ai_chat.DEFAULT_MODEL),
-                })
+                    exchange_routing.check(exchange)
+                    self._send_json({
+                        "ok": True,
+                        **exchange_routing.snapshot(),
+                        "readOnly": False,
+                        "armed": armed,
+                        "env": "demo" if client.is_demo else "live",
+                        "hub": hub.status(),
+                        "hasKeys": bool(client.api_key and client.api_secret),
+                        "aiModel": os.getenv("AI_CHAT_MODEL", ai_chat.DEFAULT_MODEL),
+                    })
+            elif path == "/api/alt-btc":
+                window = query.get("window", "24h")
+                if window not in alt_btc.WINDOWS:
+                    self._send_json({"error": "Window must be 1h, 6h, or 24h"}, 400)
+                    return
+                try:
+                    self._send_json(alt_btc.get_snapshot(get_instruments().get("instruments"), window=window))
+                except Exception as exc:
+                    self._send_json({"state": "unavailable", "error": f"Alt/BTC data unavailable: {exc}"}, 503)
             elif path == "/api/instruments":
                 self._send_json(get_instruments())
             elif path == "/api/tickers":
@@ -965,6 +1292,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._send_json({"session": {"id": session["id"], "title": session["title"], "summary": bool(session["summary"])}, "messages": msgs})
             elif path == "/api/chase":
                 self._send_json({"chases": chase_manager.list()})
+            elif path == "/api/tp-cleanup":
+                self._send_json({"cleanups": db.tp_cleanup_states()})
             elif path == "/api/protection/alerts":
                 self._send_json({"alerts": db.protection_alerts()})
             elif path == "/api/debug/threads" and DEBUG_ENDPOINTS:
@@ -982,6 +1311,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._stream_sse()
             else:
                 self._send_json({"error": "unknown endpoint"}, 404)
+        except ExchangeRoutingError as exc:
+            self._send_json({"error": str(exc), **exchange_routing.snapshot()}, exc.status)
         except KrakenHTTPError as exc:
             self._send_json({"error": str(exc), "status": exc.status, "payload": exc.payload}, 502)
         except KrakenFuturesError as exc:
@@ -989,19 +1320,31 @@ class TerminalHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _stream_sse(self) -> None:
-        q = sse.subscribe()
+    def _stream_sse(self, exchange="kraken") -> None:
+        bus = sse if exchange == "kraken" else hyperliquid_sse
+        stream_epoch = exchange_routing.snapshot()["exchangeEpoch"]
+        q = bus.subscribe()
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-            hello = json.dumps({"status": hub.status(), "watchlist": hub.watchlist()})
+            status = hub.status() if exchange == "kraken" else hyperliquid.health()["hub"]
+            watchlist = hub.watchlist() if exchange == "kraken" else hyperliquid.watchlist()
+            hello = json.dumps({"status": status, "watchlist": watchlist, **exchange_routing.snapshot()})
             self.wfile.write(f"event: status\ndata: {hello}\n\n".encode("utf-8"))
+            # Reconnecting tabs must receive resolved Chase states missed during restart.
+            for chase in chase_manager.list() if exchange == "kraken" else []:
+                self.wfile.write(f"event: chase\ndata: {json.dumps(chase, default=str)}\n\n".encode("utf-8"))
             self.wfile.flush()
             idle = 0.0
             while True:
+                selected = exchange_routing.snapshot()
+                if selected["exchange"] != exchange or selected["exchangeEpoch"] != stream_epoch:
+                    self.wfile.write(f"event: exchange\ndata: {json.dumps(selected)}\n\n".encode())
+                    self.wfile.flush()
+                    return
                 try:
                     kind, payload = q.get(timeout=1.0)
                     data = json.dumps(payload, default=str)
@@ -1018,7 +1361,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
-            sse.unsubscribe(q)
+            bus.unsubscribe(q)
 
     # ---- POST ----
 
@@ -1037,26 +1380,129 @@ class TerminalHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._send_json({"error": "request body must be a JSON object"}, 400)
             return
-        if path in IDEMPOTENT_WRITE_PATHS:
-            request_id = str(body.get("requestId") or "")
-            if not REQUEST_ID_RE.fullmatch(request_id):
-                self._send_json({"error": "valid requestId required"}, 400)
+        try:
+            exchange = requested_exchange(parsed.query)
+            epoch = self.headers.get("X-Terminal-Exchange-Epoch")
+            if path == "/api/exchange":
+                def disarm():
+                    global armed
+                    armed = False
+                with arm_lock:
+                    selected = exchange_routing.switch(exchange, epoch, body.get("exchange"),
+                                                        active_chases=chase_manager.active, disarm=disarm)
+                    if selected["exchange"] != exchange:
+                        sse.publish("armed", {"armed": armed})
+                        sse.publish("exchange", selected)
+                        hyperliquid_sse.publish("exchange", selected)
+                        db.log_event("exchange_switch", {"from": exchange, **selected, "armed": armed})
+                    self._send_json({**selected, "armed": armed})
                 return
-            payload = {key: value for key, value in body.items() if key != "requestId"}
-            claim = db.claim_write_request(request_id, path, payload)
-            if claim["state"] == "conflict":
-                self._send_json({"error": "requestId was already used for different input"}, 409)
+            if "exchange" in body and body["exchange"] != exchange:
+                raise ExchangeRoutingError("Exchange target disagrees with the request body", 400)
+            # Keep the lease across the whole request, including AI work. A switch
+            # rejects in-flight requests rather than racing their later writes.
+            with exchange_routing.request(exchange, epoch):
+                if exchange == "hyperliquid" and path not in HL_WRITE_PATHS | VENUE_NEUTRAL_PATHS:
+                    # Unsupported venue actions never reach the write journal or Kraken.
+                    self._send_json({"outcome": "rejected", "error": READ_ONLY_MESSAGE,
+                                     "exchange": "hyperliquid"}, 405)
+                    return
+                if not self._claim_write(path, body):
+                    return
+                if exchange == "hyperliquid" and path not in VENUE_NEUTRAL_PATHS:
+                    self._hyperliquid_post(path, body)
+                else:
+                    self._do_kraken_post(path, body)
+        except ExchangeRoutingError as exc:
+            self._send_json({"error": str(exc), **exchange_routing.snapshot()}, exc.status)
+
+    def _claim_write(self, path: str, body: dict[str, Any]) -> bool:
+        """Persisted request identity, applied to every exchange's intentional writes."""
+        if path not in IDEMPOTENT_WRITE_PATHS:
+            return True
+        request_id = str(body.get("requestId") or "")
+        if not REQUEST_ID_RE.fullmatch(request_id):
+            self._send_json({"error": "valid requestId required"}, 400)
+            return False
+        payload = {key: value for key, value in body.items() if key != "requestId"}
+        if requested_exchange(urlparse(self.path).query) == "hyperliquid":
+            payload = {"venue": "hyperliquid", "network": hyperliquid.network,
+                       "account": hyperliquid.account_address.lower(), "body": payload}
+        claim = db.claim_write_request(request_id, path, payload)
+        if claim["state"] == "blocked":
+            self._send_json({"outcome": "rejected", "error": "Resolve the prior Hyperliquid submission before placing another order",
+                             "unresolvedRequestId": claim["requestId"]}, 409)
+            return False
+        if claim["state"] == "conflict":
+            self._send_json({"error": "requestId was already used for different input"}, 409)
+            return False
+        if claim["state"] == "pending":
+            self._send_json({
+                "outcome": "unknown",
+                "error": "request is already in progress or ended before its result was stored; not resubmitted",
+            }, 409)
+            return False
+        if claim["state"] == "replay":
+            self._send_json(claim["result"], claim["status"])
+            return False
+        self._write_request_id = request_id
+        return True
+
+    def _hyperliquid_post(self, path: str, body: dict[str, Any]) -> None:
+        try:
+            if path == "/api/grid/preview":
+                try:
+                    result = hyperliquid_grid.preview(body, hyperliquid)
+                except ValueError as exc:
+                    raise hyperliquid_trading.HyperliquidError(str(exc)) from exc
+                with arm_lock:
+                    result["armed"] = armed
+                self._send_json(result)
                 return
-            if claim["state"] == "pending":
-                self._send_json({
-                    "outcome": "unknown",
-                    "error": "request is already in progress or ended before its result was stored; not resubmitted",
-                }, 409)
+            if path == "/api/fill-history/sync":
+                self._send_json(hyperliquid_fills.sync(db, hyperliquid, body.get("startTime"), body.get("endTime")))
                 return
-            if claim["state"] == "replay":
-                self._send_json(claim["result"], claim["status"])
+            if path == "/api/cancel-reconcile":
+                request_id = body.get("requestId")
+                if not isinstance(request_id, str) or not REQUEST_ID_RE.fullmatch(request_id):
+                    raise hyperliquid_trading.HyperliquidError("valid requestId required")
+                self._send_json(hyperliquid_recovery.reconcile_cancel(db, hyperliquid, request_id, body.get("target")))
                 return
-            self._write_request_id = request_id
+            if path == "/api/order-reconcile":
+                request_id = body.get("requestId")
+                if not isinstance(request_id, str) or not REQUEST_ID_RE.fullmatch(request_id):
+                    raise hyperliquid_trading.HyperliquidError("valid requestId required")
+                self._send_json(hyperliquid_recovery.reconcile(db, hyperliquid, request_id))
+                return
+            prepared = None
+            if path in {"/api/order", "/api/leverage", "/api/chart-order"}:
+                prepared = (hyperliquid_chart.prepare(body, hyperliquid) if path == "/api/chart-order" else
+                            hyperliquid_order_action(body) if path == "/api/order" else hyperliquid_leverage_intent(body))
+                try:
+                    db.prepare_hyperliquid_order(self._write_request_id, prepared)
+                except ValueError as exc:
+                    raise hyperliquid_trading.HyperliquidError(str(exc)) from exc
+            result = hyperliquid_write(path, body, prepared_action=prepared)
+        except hyperliquid_trading.HyperliquidError as exc:
+            self._send_json({"outcome": "rejected", "error": str(exc), "exchange": "hyperliquid"}, 400)
+            return
+        if result["type"] == "cancel":
+            targets = result["action"]["cancels"]
+            rows = result.get("rows") or []
+            mapped = len(rows) == len(targets) and result.get("outcome") in {"confirmed", "partial", "rejected"}
+            result["cancelResults"] = []
+            for index, target in enumerate(targets):
+                row = rows[index] if mapped else {}
+                outcome = ("simulated" if result.get("simulated") else
+                           "confirmed" if row.get("state") == "ok" else
+                           "rejected" if row.get("state") == "error" or result.get("outcome") == "rejected" else "unknown")
+                result["cancelResults"].append({"orderId": str(target["o"]), "asset": target["a"],
+                                                "outcome": outcome,
+                                                "error": None if outcome in {"confirmed", "simulated"} else row.get("error") or result.get("error")})
+        db.log_action(f"hl_{result['type']}", bool(result.get("live")), [result["action"]], [result])
+        self._send_json(result)
+
+    def _do_kraken_post(self, path, body):
         try:
             if path == "/api/arm":
                 want = bool(body.get("armed"))
@@ -1074,6 +1520,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     state = armed
                 aborting = chase_manager.abort_all() if not state else {"requested": [], "completed": [], "pending": []}
                 sse.publish("armed", {"armed": state})
+                hyperliquid_sse.publish("armed", {"armed": state})
                 db.log_event("arm", {"armed": state, "env": "demo" if client.is_demo else "live", "abortingChases": aborting})
                 self._send_json({"armed": state, "env": "demo" if client.is_demo else "live", "abortingChases": aborting})
             elif path == "/api/order":
@@ -1088,6 +1535,38 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 result = cancel_order(body)
                 db.log_action("api_cancel", result.get("outcome") != "simulated", [{"type": "cancel", **body}], [result])
                 self._send_json(result)
+            elif path in {"/api/grid/preview", "/api/grid"}:
+                action = {key: body[key] for key in (
+                    "symbol", "side", "startPrice", "endPrice", "orders", "size", "notional", "orderType", "reduceOnly", "previewHash",
+                ) if key in body}
+                action["type"] = "ladder"
+                if "startPrice" not in action or "endPrice" not in action:
+                    self._send_json({"error": "Grid requires start and end prices."}, 400)
+                    return
+                with arm_lock:
+                    is_armed = armed
+                    if path == "/api/grid/preview":
+                        try:
+                            plan = trading_actions._ladder_plan(action, action_ctx)
+                            validation_error = None
+                            try:
+                                plan["warnings"] += trading_actions.validate_grid(plan, action_ctx)
+                            except (trading_actions.ActionError, trading_actions.GridError) as exc:
+                                validation_error = str(exc)
+                        except (trading_actions.ActionError, trading_actions.GridError) as exc:
+                            self._send_json({"error": str(exc)}, 400)
+                            return
+                        self._send_json({"plan": plan, "armed": is_armed,
+                                         "ready": validation_error is None, "validationError": validation_error})
+                        return
+                    if not action.get("previewHash") or body.get("expectedArmed") is not is_armed:
+                        self._send_json({"error": "Preview the grid again; ARM state or preview is missing/changed."}, 409)
+                        return
+                    cache.drop("positions", "orders", "account")
+                    results = trading_actions.execute_actions([action], action_ctx, is_armed)
+                    db.log_action("grid", is_armed, [action], results)
+                cache.drop("positions", "orders", "account")
+                self._send_json({"results": results, "armed": is_armed})
             elif path == "/api/action":
                 raw = body.get("actions")
                 try:
@@ -1117,7 +1596,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 if mode not in {"emergency", "chase"}:
                     self._send_json({"error": "mode must be emergency or chase"}, 400)
                     return
-                result = flatten_all(mode)
+                symbol = str(body.get("symbol") or "").strip().upper()
+                result = flatten_all(mode, symbol)
                 logged_results = result.get("results") or [{
                     "type": "flatten", "outcome": result.get("outcome"), "error": result.get("error"),
                 }]
@@ -1490,6 +1970,22 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
             min_volume_quote=max(0.0, float(args.get("minVolumeQuote") or 1_000_000)),
             max_spread_percent=max(0.01, min(5.0, float(args.get("maxSpreadPercent") or 0.5))),
         )
+    if name in {"get_grids", "move_grid"}:
+        symbol = _normalize_symbol(str(args.get("symbol") or ""))
+        side = args.get("side", "buy")
+        if name == "get_grids":
+            return {"grids": grid_move.list_grids(db, action_ctx, symbol, side)[:20]}
+        with arm_lock:
+            armed_now = armed
+            try:
+                result = grid_move.move_grid(db, action_ctx, {**args, "symbol": symbol}, armed_now)
+            except grid_move.GridError as exc:
+                result = {"type": "move_grid", "outcome": "rejected", "error": str(exc)}
+            except Exception as exc:
+                result = {"type": "move_grid", "outcome": "unknown", "error": str(exc)}
+            db.log_action("chat", armed_now, [{**args, "type": "move_grid"}], [result])
+        cache.drop("orders", "positions", "account")
+        return {"armed": armed_now, **result}
     kind = _CHAT_ACTION_TOOLS.get(name)
     if kind:
         a = dict(args)
@@ -1549,6 +2045,8 @@ def main() -> None:
     except KeyboardInterrupt:
         hub.stop()
         binance_klines.stop()
+        if hyperliquid.feed:
+            hyperliquid.feed.stop()
         server.shutdown()
 
 
