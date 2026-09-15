@@ -25,6 +25,47 @@ test("builds position, liquidation, and exact-order overlays", () => {
   assert.equal(takeProfit.order.orderId, "tp-1");
 });
 
+test("Kraken stop-loss lines are draggable, so a stop can be moved into profit", () => {
+  const lines = buildChartOverlays("PF_XBTUSD", positions, [
+    { symbol: "PF_XBTUSD", order_id: "sl-1", orderType: "stop", side: "sell",
+      stopPrice: 95, size: 2, unfilledSize: 2, reduceOnly: true },
+  ], instruments);
+  const stop = lines.find(line => line.key === "order-stop:sl-1");
+  assert.ok(stop.protection, "an existing stop must carry drag metadata like TP does");
+  assert.equal(stop.protection.kind, "sl", "the drop routes to replace_sl, not replace_tp");
+  assert.equal(stop.protection.entry, 100);
+  assert.equal(stop.protection.size, 2);
+  assert.equal(stop.protection.dir, 1);
+  assert.equal(stop.protection.tick, 0.5);
+  assert.equal(stop.protection.symbol, "PF_XBTUSD");
+  assert.equal(stop.protection.order.orderId, "sl-1", "edits target the exact order");
+  assert.ok(!stop.tp, "a stop is not a take profit");
+
+  // A stop above entry is still a stop: the server validates against mark, not entry,
+  // so locking in profit must produce the same draggable line.
+  const inProfit = buildChartOverlays("PF_XBTUSD", positions, [
+    { symbol: "PF_XBTUSD", order_id: "sl-2", orderType: "stp", side: "sell",
+      stopPrice: 110, size: 2, unfilledSize: 2, reduceOnly: true },
+  ], instruments).find(line => line.key === "order-stop:sl-2");
+  assert.equal(inProfit.protection.kind, "sl");
+  assert.match(inProfit.title, /\+\$20\.00/, "a stop in profit shows the gain it locks in");
+});
+
+test("take profit keeps its own drag path and a stop without a position is not draggable", () => {
+  const tpLine = buildChartOverlays("PF_XBTUSD", positions, [
+    { symbol: "PF_XBTUSD", order_id: "tp-1", orderType: "take_profit", side: "sell", stopPrice: 120, size: 2, unfilledSize: 2 },
+  ], instruments).find(line => line.key === "order-stop:tp-1");
+  assert.ok(tpLine.tp, "take profit still drags through the tp path");
+  assert.ok(!tpLine.protection, "take profit must not be relabelled as a stop loss");
+
+  // No position means no entry to price the stop against.
+  const orphan = buildChartOverlays("PF_XBTUSD", [], [
+    { symbol: "PF_XBTUSD", order_id: "sl-3", orderType: "stop", side: "sell", stopPrice: 95, size: 2 },
+  ], instruments).find(line => line.key === "order-stop:sl-3");
+  assert.ok(!orphan.protection);
+  assert.ok(!orphan.tp);
+});
+
 test("Hyperliquid can expose exact cancellation without position or TP dragging", () => {
   const symbol = "HL_APT", id = "12345678901234567890";
   const pos = positions.map(p => ({ ...p, symbol }));

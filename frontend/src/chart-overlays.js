@@ -96,6 +96,24 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
           order,
         },
       } : {}),
+      // A stop gets the same drag affordance the take profit already has, routed to
+      // replace_sl. The server validates a stop against the current mark rather than
+      // entry, so dragging one above entry to lock in profit is legitimate. Requires
+      // an exact order so the edit targets that stop instead of creating a new one.
+      // Hyperliquid sets its own protection further down, under stricter checks.
+      ...(!isTp && !readOnly && order ? {
+        protection: {
+          symbol,
+          kind: "sl",
+          entry: Number(position.price),
+          size: coveredSize,
+          mult,
+          dir,
+          tick,
+          order,
+          snapshot: { ...position },
+        },
+      } : {}),
       ...(order ? { order } : {}),
     });
   }
