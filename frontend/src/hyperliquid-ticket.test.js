@@ -977,3 +977,74 @@ test("the request layer refuses Hyperliquid writes while the gate is off", async
   store.getState().setSignedTradingMode("mainnet");
   assert.equal(api.apiUrl("/api/order"), "/api/order?exchange=hyperliquid");
 });
+
+test("Stop and take-profit orders default to a market trigger so protection cannot rest unfilled", async t => {
+  const { store, render, posts, prompts } = await harness(t, resting);
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ armed: true, otype: "stp" });
+  assert.match(render(), /id="hl-stop-limit"/, "the ticket offers stop-limit as an explicit opt-in");
+  assert.doesNotMatch(render(), /id="hl-stop-limit"[^>]*checked=""/, "market trigger is the default");
+  await store.getState().submitHyperliquidOrder("sell", { size: 2, stopPrice: 0.55 });
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].orderType, "stp");
+  assert.equal(posts[0].triggerMarket, true, "a stop must trigger at market, not rest as a limit");
+  assert.equal(posts[0].limitPrice, undefined, "a market trigger carries no limit price");
+  assert.equal(posts[0].reduceOnly, true);
+  store.setState({ otype: "take_profit" });
+  await store.getState().submitHyperliquidOrder("sell", { size: 2, stopPrice: 0.75 });
+  assert.equal(posts[1].triggerMarket, true, "take profit defaults the same way");
+  assert.equal(prompts.length, 0, "the safe default needs no extra confirmation");
+});
+
+test("Stop-limit is still available but demands a price and a confirmation naming the non-fill risk", async t => {
+  const { store, posts, prompts, toasts } = await harness(t, resting);
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ armed: true, otype: "stp" });
+  await store.getState().submitHyperliquidOrder("sell", { size: 2, stopPrice: 0.55, triggerMarket: false });
+  assert.equal(posts.length, 0, "a stop-limit without its own limit price must not submit");
+  assert.ok(toasts.some(([, message]) => /stop-limit price/i.test(message)));
+  await store.getState().submitHyperliquidOrder("sell", { size: 2, stopPrice: 0.55, triggerMarket: false, limitPrice: 0.54 });
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].triggerMarket, false);
+  assert.equal(posts[0].limitPrice, 0.54);
+  assert.equal(prompts.length, 1, "the unsafe variant is confirmed explicitly");
+  assert.match(prompts[0], /may remain unfilled/i);
+});
+
+test("Market orders sized in contracts still carry a USD ceiling and show it before signing", async t => {
+  const { store, posts, prompts } = await harness(t, resting);
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ armed: true, otype: "mkt" });
+  await store.getState().submitHyperliquidOrder("buy", { size: 20, slippagePercent: 0.5, reduceOnly: false, maxNotional: "12.06" });
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].orderType, "mkt");
+  assert.ok(Number(posts[0].maxNotional) > 0, "a contract-sized market order is still bounded in dollars");
+  assert.match(prompts.at(-1), /20 contracts/, "the contract count stays visible");
+  assert.match(prompts.at(-1), /\$12\.06/, "the dollar ceiling is shown alongside it");
+});
+
+test("Open Hyperliquid positions get their own book, so PnL is never valued off a quiet tape", async t => {
+  const { store, reads } = await harness(t, resting);
+  store.setState({ readOnly: true, symbol: SYMBOL, positions: [
+    { symbol: SYMBOL, side: "long", size: 1, sizeExact: "1" },
+    { symbol: "HL_CHIP", side: "long", size: 1598, sizeExact: "1598" },
+    { symbol: "HL_CHIP", side: "long", size: 1598, sizeExact: "1598" },
+    { error: "positions unavailable" },
+  ] });
+  reads.length = 0;
+  await store.getState().refreshPositionBooks();
+  assert.equal(reads.length, 1, "the selected symbol is already polled, and duplicates collapse");
+  assert.match(reads[0], /\/api\/orderbook\?symbol=HL_CHIP/);
+
+  // A failing book must not break the poller for the rest of the positions.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("book unavailable"); };
+  await store.getState().refreshPositionBooks();
+  globalThis.fetch = originalFetch;
+
+  // Kraken populates bid/ask on its own tickers, so it does not pay for this.
+  store.setState({ readOnly: false });
+  reads.length = 0;
+  await store.getState().refreshPositionBooks();
+  assert.deepEqual(reads, []);
+});

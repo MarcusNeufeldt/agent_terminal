@@ -69,6 +69,7 @@ export async function bootTerminal(signal) {
   every(() => useStore.getState().refreshAccount(), 5000);
   every(() => useStore.getState().refreshTables(), 5000);
   every(() => s.readOnly ? useStore.getState().refreshFills() : useStore.getState().checkFills(), 5000);
+  if (s.readOnly) every(() => useStore.getState().refreshPositionBooks(), 5000);
   if (!s.readOnly) {
     every(() => useStore.getState().updateRulePeaks(), 5000);
     useStore.getState().refreshStats();

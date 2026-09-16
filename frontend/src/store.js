@@ -463,7 +463,7 @@ const useStore = create((set, get) => ({
   },
 
   // ---- account / tables ----
-  proAdj(v) { return get().pro ? Number(v || 0) + 3800 : Number(v || 0); },
+  proAdj(v) { return get().pro ? Number(v || 0) + 4300 : Number(v || 0); },
 
   async refreshAccount() {
     try {
@@ -600,6 +600,21 @@ const useStore = create((set, get) => ({
   // ---- signals / book ----
   async refreshSignal() { /* handled by components fetching /api/signal */ },
   refreshBook() { /* orderbook component polls itself */ },
+
+  // Hyperliquid only writes bid/ask into a ticker once that symbol's book has been
+  // fetched, so a position in a symbol you are not looking at would be valued off a
+  // last trade that can be minutes old on a thin coin. Fetching the book publishes a
+  // ticker over SSE, which keeps the exit price a real one. The selected symbol is
+  // already polled by the order book component.
+  async refreshPositionBooks() {
+    const s = get();
+    if (!s.readOnly) return;
+    const symbols = [...new Set(s.positions
+      .filter(p => p && !p.error && typeof p.symbol === "string" && p.symbol && p.symbol !== s.symbol)
+      .map(p => p.symbol))].slice(0, 8);
+    await Promise.all(symbols.map(symbol =>
+      api(`/api/orderbook?symbol=${encodeURIComponent(symbol)}`).catch(() => {})));
+  },
 
   // ---- orders ----
   async submitOrder(side) {
@@ -856,6 +871,17 @@ const useStore = create((set, get) => ({
       if (!Number.isFinite(order.stopPrice) || order.stopPrice <= 0) { s.toast("Enter a trigger price.", "err"); return; }
       body.stopPrice = order.stopPrice;
       body.reduceOnly = true;
+      // A trigger-limit rests at its limit price once it fires, so a fast move
+      // through the trigger can leave the position unprotected. Market trigger is
+      // the default; the limit variant stays available but is opt-in and confirmed.
+      body.triggerMarket = order.triggerMarket !== false;
+      if (!body.triggerMarket) {
+        if (!Number.isFinite(order.limitPrice) || order.limitPrice <= 0) {
+          s.toast("Enter a stop-limit price.", "err"); return;
+        }
+        body.limitPrice = order.limitPrice;
+        if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} ${orderType === "stp" ? "STOP" : "TAKE-PROFIT"}-LIMIT ${symbol}: triggers at ${order.stopPrice}, then rests as a limit at ${order.limitPrice}. It may remain unfilled and leave the position unprotected. Continue?`)) return;
+      }
     } else if (market) {
       if (!Number.isFinite(order.slippagePercent) || order.slippagePercent < 0.01 || order.slippagePercent > 5) {
         s.toast("Enter a slippage limit between 0.01% and 5%.", "err"); return;
@@ -889,7 +915,7 @@ const useStore = create((set, get) => ({
       }
       body.maxNotional = order.maxNotional;
     }
-    if (market && !close && !confirm(`${s.armed ? "LIVE" : "SIMULATED"} MARKET ${side.toUpperCase()} ${symbol}: ${body.maxNotional !== undefined ? `$${body.maxNotional} maximum notional` : `${size} contracts`}, slippage limit ${body.slippagePercent}%. Partial or no fill is possible. Continue?`)) return;
+    if (market && !close && !confirm(`${s.armed ? "LIVE" : "SIMULATED"} MARKET ${side.toUpperCase()} ${symbol}: ${size} contracts${body.maxNotional !== undefined ? ` (up to $${body.maxNotional})` : ""}, slippage limit ${body.slippagePercent}%. Partial or no fill is possible. Continue?`)) return;
     const requestId = newRequestId();
     const identity = setting ? { kind: "leverage" } : { cloid: newCloid() };
     const pending = { version: 1, requestId, ...identity, body: { ...body, requestId, ...(setting ? {} : identity) },

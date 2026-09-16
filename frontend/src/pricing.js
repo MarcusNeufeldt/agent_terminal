@@ -52,23 +52,45 @@ export function isLastStale(ticker) {
   return last < Math.min(bid, ask) || last > Math.max(bid, ask);
 }
 
+// A trade this old is no longer evidence of the current price. Only Hyperliquid
+// tickers carry a trade timestamp today, so where none is present a last trade is
+// taken at face value and Kraken behaviour is unchanged.
+export const STALE_LAST_MS = 60000;
+
+export function isLastQuiet(ticker, now = Date.now()) {
+  const at = Number(ticker?.lastTime);
+  return Number.isFinite(at) && at > 0 && now - at > STALE_LAST_MS;
+}
+
 /* Resolve the price to value a position at.
  *
- * mode "mid"  -> book mid, falling back to last
- * mode "exit" -> exit side of the book, falling back to mid, then last
+ * mode "mid"  -> book mid, then last, then mark
+ * mode "exit" -> exit side of the book, then mid, then last, then mark
  *
- * The fallback to last is deliberate: a suspended or one-sided book is worse than
- * a stale trade. `basis` reports which one was actually used so the UI can label
- * it honestly rather than implying a book price it did not have.
+ * Mark is never allowed to displace a live book, and never a recent trade: it is
+ * not tradeable and can dislocate on a thin pair, showing a freshly opened
+ * position as instantly deep in the red. It is reached only when there is no book
+ * and the tape has gone quiet past STALE_LAST_MS.
+ *
+ * That case is common on Hyperliquid, where a ticker only carries bid/ask once its
+ * book has been fetched — so a position in a symbol you are not looking at has no
+ * book, and its last trade can be minutes old on a thin coin. markPx is what
+ * Hyperliquid's own interface shows, so the two agree instead of drifting apart.
+ *
+ * `basis` reports which one was actually used so the UI can label it honestly
+ * rather than implying a book price it did not have.
  */
-export function valuationPrice(ticker, { mode = "mid", side } = {}) {
-  const last = positive(ticker?.last);
+export function valuationPrice(ticker, { mode = "mid", side, now = Date.now() } = {}) {
   if (mode === "exit") {
     const exit = exitPrice(ticker, side);
     if (exit !== null) return { price: exit, basis: "exit" };
   }
   const mid = midPrice(ticker);
   if (mid !== null) return { price: mid, basis: "mid" };
+  const last = positive(ticker?.last);
+  if (last !== null && !isLastQuiet(ticker, now)) return { price: last, basis: "last" };
+  const mark = positive(ticker?.markPrice);
+  if (mark !== null) return { price: mark, basis: "mark" };
   if (last !== null) return { price: last, basis: "last" };
   return { price: null, basis: "none" };
 }

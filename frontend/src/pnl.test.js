@@ -46,11 +46,11 @@ test("display PnL uses the exit side of the book, never mark or account PnL, wit
   assert.ok(table.includes("66.7% · 50.0×ATR"), "liquidation distance must still use mark, not last");
   store.setState({ pro: true, tickers: { [symbol]: { ...ticker, markPrice: 1000 } } });
   assert.equal(pnl(position), 20, "mark changes and Pro Mode must not alter book-based PnL");
-  assert.equal(store.getState().proAdj(0), 3800);
-  assert.equal(store.getState().proAdj(1000), 4800);
+  assert.equal(store.getState().proAdj(0), 4300);
+  assert.equal(store.getState().proAdj(1000), 5300);
   const proSidebar = render(Sidebar);
-  assert.ok(proSidebar.includes("$4,800"), "balance uses the shared display offset");
-  assert.ok(proSidebar.includes("$4,400"), "available margin uses the same offset");
+  assert.ok(proSidebar.includes("$5,300"), "balance uses the shared display offset");
+  assert.ok(proSidebar.includes("$4,900"), "available margin uses the same offset");
   assert.equal(store.getState().account, account);
   assert.equal(position.liqPriceEstimate, 50);
   store.setState({ instruments: [{ ...instrument, contractSize: 10 }] });
@@ -79,9 +79,19 @@ test("display PnL uses the exit side of the book, never mark or account PnL, wit
   unsubscribe();
   store.setState({ positions: [position], instruments: [instrument] });
 
+  // With no book and an unusable last, mark is the remaining valuation. It beats a
+  // stale trade and matches what Hyperliquid's own interface shows, but it is never
+  // the exchange's reported PnL.
   for (const last of [undefined, null, 0, -1, "NaN", Infinity]) {
     store.setState({ tickers: { [symbol]: { ...ticker, last } } });
-    assert.equal(pnl(position), null, `invalid last ${last} must not fall back to mark or reported PnL`);
+    assert.equal(pnl(position), 100, `invalid last ${last} falls back to mark, not reported PnL`);
+  }
+  assert.ok(!render(BottomTabs).includes("+999"), "never substitute exchange-reported PnL");
+
+  // Nothing usable at all must read as unavailable, never as a confident zero.
+  for (const last of [undefined, null, 0, -1, "NaN", Infinity]) {
+    store.setState({ tickers: { [symbol]: { symbol, last } } });
+    assert.equal(pnl(position), null, `invalid last ${last} with no mark must not invent a price`);
     assert.equal(total(), null);
   }
   const unavailableSidebar = render(Sidebar);
@@ -89,7 +99,6 @@ test("display PnL uses the exit side of the book, never mark or account PnL, wit
   assert.ok(unavailableSidebar.includes("Book PnL unavailable"));
   assert.ok(!unavailableSidebar.includes("+$555"), "never label account PnL as position PnL");
   assert.ok(unavailableTable.includes('title="Book PnL unavailable">–</td>'));
-  assert.ok(unavailableTable.includes('title="Mark for risk: 150">–</td>'), "invalid last price is not displayed as a quote");
   assert.ok(!unavailableTable.includes("+999"), "never substitute exchange-reported PnL");
 
   // The live book wins over the tape. On thin Kraken pairs the last trade drifts

@@ -67,6 +67,7 @@ export default function HyperliquidTicket() {
   const [reduce, setReduce] = useState(false);
   const [slippage, setSlippage] = useState("0.5");
   const [percent, setPercent] = useState(0);
+  const [stopLimit, setStopLimit] = useState(false);
 
   useEffect(() => {
     if (!recoveryKey) return;
@@ -115,10 +116,18 @@ export default function HyperliquidTicket() {
     quickPercent: sizingSource === "percent" ? percent : undefined,
     expectedLeverage: sizingSource === "percent" && capacityCurrent ? capacity.leverage.value : undefined,
     expectedMarginMode: sizingSource === "percent" && capacityCurrent ? capacity.leverage.type : undefined,
-    maxNotional: sizingSource === "usd" ? usd : undefined,
-    limitPrice: trigger || market ? undefined : Number(limit),
+    // A market order's price comes from the server's fresh quote, so bound the
+    // dollar value to what was on screen. USD sizing already states that budget.
+    maxNotional: sizingSource === "usd" ? usd
+      : market && notional !== null
+        ? String(Number((notional * (1 + (Number(slippage) || 0) / 100)).toFixed(8)))
+        : undefined,
+    limitPrice: trigger ? (stopLimit ? Number(limit) : undefined) : market ? undefined : Number(limit),
     slippagePercent: market ? Number(slippage) : undefined,
     stopPrice: trigger ? Number(stop) : undefined,
+    // Market trigger by default: a trigger-limit can rest unfilled and leave the
+    // position unprotected, so the limit variant is an explicit opt-in.
+    triggerMarket: trigger ? !stopLimit : undefined,
     // A trigger without reduce-only is refused by the venue, so it is forced here.
     reduceOnly: trigger || closeDraft ? true : reduce,
   });
@@ -152,6 +161,19 @@ export default function HyperliquidTicket() {
             <label htmlFor="hl-stop">Trigger price <span id="trigger-signal-note">(mark)</span></label>
             <input id="hl-stop" type="number" step="any" placeholder={fmt(ticker.markPrice)} value={stop}
               onChange={e => setStop(e.target.value)} />
+            <div className="check-row">
+              <input id="hl-stop-limit" type="checkbox" checked={stopLimit}
+                onChange={e => setStopLimit(e.target.checked)} />
+              <label htmlFor="hl-stop-limit">Stop-limit instead of market trigger</label>
+            </div>
+            {stopLimit ? (
+              <>
+                <label htmlFor="hl-trigger-limit">Limit price once triggered</label>
+                <input id="hl-trigger-limit" type="number" step="any" placeholder={fmt(ticker.last)} value={limit}
+                  onChange={e => setLimit(e.target.value)} />
+                <div className="ticket-note">Rests as a limit at this price once the trigger fires. If the market moves past it the order stays unfilled and the position is left unprotected.</div>
+              </>
+            ) : <div className="ticket-note">Triggers at market, which is the variant most likely to actually fill.</div>}
           </div>
         ) : (
           <div className="field" id="f-limit">

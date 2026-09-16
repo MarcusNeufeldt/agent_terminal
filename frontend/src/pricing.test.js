@@ -60,3 +60,44 @@ test("a stale last does not leak into a valuation when the book is present", () 
   assert.equal(valuationPrice(quiet).price, 100.1);
   assert.equal(valuationPrice(quiet, { mode: "exit", side: "long" }).price, 100);
 });
+
+test("a quiet tape yields to mark, a recent trade does not", () => {
+  const now = 1_700_000_000_000;
+  const fresh = { last: 0.0362, lastTime: now - 5_000, markPrice: 0.036193 };
+  assert.deepEqual(valuationPrice(fresh, { now }), { price: 0.0362, basis: "last" },
+    "a recent trade is still the best evidence when there is no book");
+
+  // The Hyperliquid case: a position in a symbol whose book was never fetched, on a
+  // thin coin whose last trade is minutes old while the market has moved away.
+  const quiet = { last: 0.0362, lastTime: now - 10 * 60_000, markPrice: 0.036193 };
+  assert.deepEqual(valuationPrice(quiet, { now }), { price: 0.036193, basis: "mark" });
+  assert.deepEqual(valuationPrice(quiet, { mode: "exit", side: "long", now }),
+    { price: 0.036193, basis: "mark" });
+
+  // A quiet tape with no mark still reports the stale trade rather than nothing,
+  // and says so.
+  assert.deepEqual(valuationPrice({ last: 0.0362, lastTime: now - 10 * 60_000 }, { now }),
+    { price: 0.0362, basis: "last" });
+
+  // Kraken tickers carry no trade timestamp, so their behaviour is unchanged.
+  assert.deepEqual(valuationPrice({ last: 110, markPrice: 150 }, { now }),
+    { price: 110, basis: "last" });
+  for (const lastTime of [undefined, null, 0, -1, "NaN", Infinity]) {
+    assert.equal(valuationPrice({ last: 110, lastTime, markPrice: 150 }, { now }).basis, "last");
+  }
+  assert.deepEqual(valuationPrice({ markPrice: 0, last: 0 }, { now }), { price: null, basis: "none" });
+});
+
+test("mark never displaces a usable book, however quiet the tape", () => {
+  // The reason mark was rejected as a primary basis: it is not tradeable and can
+  // dislocate on a thin pair, showing a freshly opened position as deep in the red.
+  const now = 1_700_000_000_000;
+  const dislocated = { bid: 100, ask: 100.2, last: 100.1, lastTime: now - 10 * 60_000, markPrice: 150 };
+  assert.equal(valuationPrice(dislocated, { now }).basis, "mid");
+  assert.equal(valuationPrice(dislocated, { now }).price, 100.1);
+  assert.equal(valuationPrice(dislocated, { mode: "exit", side: "long", now }).price, 100);
+  assert.equal(valuationPrice(dislocated, { mode: "exit", side: "short", now }).price, 100.2);
+  // A one-sided book still beats mark on the side it can serve.
+  assert.equal(valuationPrice({ bid: 100, ask: null, lastTime: now - 10 * 60_000, markPrice: 150 },
+    { mode: "exit", side: "long", now }).price, 100);
+});

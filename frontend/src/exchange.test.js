@@ -98,7 +98,7 @@ test("Hyperliquid requests, UI, storage, and overlays stay separate from Kraken"
   // as an empty account while funds sit in spot.
   assert.match(markup, /Perp balance<\/span><span class="v">\$0<\/span>/);
   assert.match(markup, /Spot USDC<\/span><span class="v">\$13\.77<\/span>/);
-  assert.doesNotMatch(markup, /\$3,800/);
+  assert.doesNotMatch(markup, /\$4,300/);
   // Unified account: one USDC balance backs both spot and perps, so a "Perp balance $0"
   // row would read as an empty account while the money is right there.
   store.setState({ account: { balanceValue: 13.77, unified: true, spotUsdc: 13.77, withdrawable: null } });
@@ -207,7 +207,7 @@ test("Hyperliquid boot owns its stream and never loads Kraken automation or chat
   assert.deepEqual(requests, ["/api/health", "/api/execution-recovery", "/api/instruments", "/api/tickers"]);
   assert.equal(store.getState().hlRecoveryLoaded, true);
   assert.deepEqual(store.getState().chat, []);
-  assert.equal(intervals.size, 5);
+  assert.equal(intervals.size, 6);
   source.handlers.ticker({ data: JSON.stringify({ symbol: "HL_BTC", exchange: "hyperliquid", last: 100 }) });
   source.handlers.ticker({ data: JSON.stringify({ symbol: "PF_XBTUSD", exchange: "kraken", last: 999 }) });
   assert.equal(store.getState().tickers.HL_BTC.last, 100);
