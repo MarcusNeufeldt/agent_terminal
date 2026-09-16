@@ -98,12 +98,12 @@ export default function Sidebar() {
 
       <div className="list-tools">
         <button className="tool-btn" title="Pair filters" onClick={() => setFiltersOpen(true)}>⚙ Filters</button>
-        <button className="tool-btn" disabled={readOnly} title="Rank markets by realized volatility" onClick={() => rankByVol()}>
+        <button className="tool-btn" title="Rank markets by realized volatility" onClick={() => rankByVol()}>
           {volLoading ? "Scanning…" : "⚡ Vol rank"}
         </button>
         <select className="tool-select" value={sortBy} onChange={e => setSortBy(e.target.value)} title="Sort pairs">
           <option value="vol24">24h volume</option>
-          <option value="realized" disabled={readOnly}>Realized vol</option>
+          <option value="realized">Realized vol</option>
           <option value="change">|24h change|</option>
           <option value="symbol">Symbol</option>
         </select>

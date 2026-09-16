@@ -14,12 +14,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from hyperliquid_client import HyperliquidError
 from kraken_client import KrakenFuturesError
 
 VOL_CACHE_TTL = 60.0
 SIGNAL_CACHE_TTL = 60.0
 _vol_cache: dict[tuple[int, int, float, float], tuple[float, dict[str, Any]]] = {}
 _signal_cache: dict[str, tuple[float, Any]] = {}
+_hl_vol_cache: dict[tuple[int, int, float, float], tuple[float, dict[str, Any]]] = {}
 
 
 def _as_float(value: Any) -> float | None:
@@ -125,6 +127,118 @@ def scan_volatility(
         "rows": rows[:limit],
     }
     _vol_cache[cache_key] = (time.monotonic(), data)
+    return {**data, "cached": False}
+
+
+def _hl_candles(backend, coin: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+    """Hyperliquid 1m candles, reshaped into what _measure reads.
+
+    A dedicated fetch rather than backend.candles(): that one pulls 1500 bars and
+    subscribes the symbol, neither of which a scan of 60-odd markets wants.
+    """
+    raw = backend.client.info("candleSnapshot",
+                              req={"coin": coin, "interval": "1m",
+                                   "startTime": start_ms, "endTime": end_ms})
+    if not isinstance(raw, list):
+        raise HyperliquidError(f"no candles for {coin}")
+    candles = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        values = [_as_float(row.get(key)) for key in ("t", "c", "h", "l")]
+        if any(value is None or value <= 0 for value in values):
+            continue
+        candles.append({"time": values[0], "close": values[1], "high": values[2], "low": values[3]})
+    return candles
+
+
+def scan_volatility_hyperliquid(
+    backend,
+    *,
+    window_minutes: int = 5,
+    limit: int = 15,
+    min_volume_quote: float = 1_000_000,
+    max_spread_percent: float = 0.5,
+) -> dict[str, Any]:
+    """scan_volatility against Hyperliquid's own universe.
+
+    The same measurement on the same shape of candle, with two venue differences
+    worth stating. Hyperliquid publishes no top of book on the shared asset
+    context, so the spread filter uses impactPxs, a depth-adjusted quote wider
+    than the touch: the filter is therefore conservative, never permissive. And
+    the universe carries delisted assets that quote nothing at all, which are
+    dropped before any candle is fetched rather than scanned and discarded.
+    """
+    now = time.monotonic()
+    for key, (ts, _) in list(_hl_vol_cache.items()):
+        if now - ts >= VOL_CACHE_TTL:
+            del _hl_vol_cache[key]
+    cache_key = (window_minutes, limit, min_volume_quote, max_spread_percent)
+    hit = _hl_vol_cache.get(cache_key)
+    if hit and now - hit[0] < VOL_CACHE_TTL:
+        return {**hit[1], "cached": True}
+
+    markets = backend.markets()
+    by_coin = {entry["instrument"]["coin"]: (symbol, entry)
+               for symbol, entry in markets.items()
+               if isinstance(entry.get("instrument"), dict)}
+    payload = backend.client.info("metaAndAssetCtxs")
+    if not isinstance(payload, list) or len(payload) != 2 or not isinstance(payload[0], dict):
+        raise HyperliquidError("Invalid Hyperliquid universe payload")
+    universe, contexts = payload[0].get("universe"), payload[1]
+    if not isinstance(universe, list) or not isinstance(contexts, list) or len(universe) != len(contexts):
+        raise HyperliquidError("Invalid Hyperliquid universe payload")
+
+    candidates: list[dict[str, Any]] = []
+    for asset, ctx in zip(universe, contexts):
+        if not isinstance(asset, dict) or not isinstance(ctx, dict):
+            continue
+        entry = by_coin.get(asset.get("name"))
+        if not entry:
+            continue
+        symbol, market = entry
+        if market["instrument"].get("tradeable") is False:
+            continue
+        mark = _as_float(ctx.get("markPx"))
+        volume = _as_float(ctx.get("dayNtlVlm")) or 0.0
+        if not mark or mark <= 0 or volume < min_volume_quote:
+            continue
+        impact = ctx.get("impactPxs")
+        if not isinstance(impact, list) or len(impact) != 2:
+            continue
+        bid, ask = (_as_float(impact[0]), _as_float(impact[1]))
+        if bid is None or ask is None or not 0 < bid <= ask:
+            continue
+        if (ask - bid) / mark * 100 > max_spread_percent:
+            continue
+        candidates.append({"symbol": symbol, "coin": asset["name"], "markPrice": mark,
+                           "bid": bid, "ask": ask, "volumeQuote": volume})
+    candidates.sort(key=lambda t: t["volumeQuote"], reverse=True)
+
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - (window_minutes + 10) * 60 * 1000
+    rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(12, len(candidates)) or 1) as pool:
+        futures = {pool.submit(_hl_candles, backend, t["coin"], start_ms, end_ms): t for t in candidates}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                row = _measure(ticker, future.result(), window_minutes)
+                if row:
+                    rows.append(row)
+            except HyperliquidError:
+                continue
+
+    rows.sort(key=lambda r: (r["realizedVolatilityPercent"], r["volumeQuote"] or 0), reverse=True)
+    data = {
+        "metric": "realized volatility from closed 1m log returns",
+        "windowMinutes": window_minutes,
+        "marketsScanned": len(candidates),
+        "exchange": "hyperliquid",
+        "spreadBasis": "impact",
+        "rows": rows[:limit],
+    }
+    _hl_vol_cache[cache_key] = (time.monotonic(), data)
     return {**data, "cached": False}
 
 

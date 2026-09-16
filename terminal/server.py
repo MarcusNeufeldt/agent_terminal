@@ -1164,6 +1164,17 @@ class TerminalHandler(BaseHTTPRequestHandler):
                                              "armed": armed, "readOnly": False,
                                              "accountAddress": hyperliquid.account_address,
                                              "signedTrading": hyperliquid_gate()})
+                    elif path == "/api/volatility":
+                        try:
+                            self._send_json(scanner.scan_volatility_hyperliquid(
+                                hyperliquid,
+                                window_minutes=int(query.get("window", "5")),
+                                limit=int(query.get("limit", "15")),
+                                min_volume_quote=float(query.get("minVolume", "1000000")),
+                                max_spread_percent=float(query.get("maxSpread", "0.5")),
+                            ))
+                        except (hyperliquid_trading.HyperliquidError, ValueError) as exc:
+                            self._send_json({"error": str(exc), "rows": []}, 503)
                     else:
                         payload, status = hyperliquid.read(path, query)
                         self._send_json(payload, status)

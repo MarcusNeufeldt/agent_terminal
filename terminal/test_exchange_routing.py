@@ -39,6 +39,8 @@ class ExchangeRoutingTests(unittest.TestCase):
                                                             "outcome": "simulated", "live": False,
                                                             "action": {"type": "order"}, "rows": []})
         self.account = Mock(return_value={"balanceValue": 123})
+        self.scanner = Mock()
+        self.scanner.scan_volatility_hyperliquid.return_value = {"rows": [], "exchange": "hyperliquid"}
         source = ast.parse(Path(__file__).with_name("server.py").read_text())
         handler = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "TerminalHandler")
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
@@ -48,7 +50,7 @@ class ExchangeRoutingTests(unittest.TestCase):
                                                 valid_token=lambda _: True, token="fixture-token",
                                                 consume_arm_challenge=lambda _: True,
                                                 issue_arm_challenge=lambda: "fixture-challenge"),
-                   "exchange_routing": self.routing, "ExchangeRoutingError": ExchangeRoutingError,
+                   "scanner": self.scanner, "exchange_routing": self.routing, "ExchangeRoutingError": ExchangeRoutingError,
                    "requested_exchange": requested_exchange,
                    "REQUEST_ID_RE": re.compile(r"^[A-Za-z0-9._:-]{8,100}$"), "READ_ONLY_MESSAGE": READ_ONLY_MESSAGE,
                    "arm_lock": lock, "armed": True, "client": self.kraken, "db": self.db,
@@ -414,12 +416,25 @@ class ExchangeRoutingTests(unittest.TestCase):
 
     def test_unsupported_hyperliquid_reads_do_not_leak_kraken_history_or_alerts(self):
         self.switch("hyperliquid")
-        for path in ("chat/history", "chase", "tp-cleanup", "protection/alerts", "stats", "equity", "alt-btc", "volatility", "signal"):
+        for path in ("chat/history", "chase", "tp-cleanup", "protection/alerts", "stats", "equity", "alt-btc", "signal"):
             status, data = self.request(f"/api/{path}?exchange=hyperliquid")
             self.assertEqual((status, data["state"]), (501, "unsupported"))
         self.db.get_messages.assert_not_called()
         self.db.get_equity.assert_not_called()
         self.hl_client.info.assert_not_called()
+        self.scanner.scan_volatility.assert_not_called()
+
+    def test_volatility_scan_reads_the_hyperliquid_universe_not_the_kraken_one(self):
+        self.switch("hyperliquid")
+        status, data = self.request("/api/volatility?exchange=hyperliquid&limit=7&minVolume=250000")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["exchange"], "hyperliquid")
+        self.scanner.scan_volatility.assert_not_called()
+        called = self.scanner.scan_volatility_hyperliquid.call_args
+        self.assertIs(called.args[0], self.hl, "the scan must read the Hyperliquid backend")
+        self.assertEqual(called.kwargs["limit"], 7)
+        self.assertEqual(called.kwargs["min_volume_quote"], 250000)
+        self.kraken.get.assert_not_called()
 
     def test_invalid_or_duplicate_venue_is_not_defaulted_to_kraken(self):
         for query in ("exchange=unknown", "exchange=", "exchange=kraken&exchange=hyperliquid"):
