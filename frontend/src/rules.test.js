@@ -258,3 +258,75 @@ test("evaluateRules skips errored and flat positions", () => {
   assert.equal(result.rows.length, 0);
   assert.equal(result.basket.positions, 0);
 });
+
+test("an exit filled in clips is one loss, however it straddles the clock", () => {
+  // Measured against this account: ENA lost $360 across 191 seconds in 12 fills.
+  // Fixed 60-second buckets split it into sub-threshold pieces, so the largest
+  // qualifying loss in the whole history never started a cooldown.
+  const start = 1_000_000;
+  const rows = Array.from({ length: 12 }, (_, i) =>
+    ({ t: start + i * 17, contract: "pf_enausd", pnl: -30, funding: 0, fee: 0 }));
+  const events = realizedEvents(rows);
+  assert.equal(events.length, 1, "one exit is one event");
+  assert.equal(events[0].net, -360);
+  assert.equal(events[0].t, start + 11 * 17, "stamped at the last fill, so the pause runs from the end");
+  const cooldown = evaluateCooldown({
+    events, equity: 5000, now: (start + 11 * 17) * 1000 + 1000,
+  });
+  assert.equal(cooldown.active, true, "-$360 on $5,000 equity is over the 3% limit");
+});
+
+test("fills further apart than the window are separate exits", () => {
+  const apart = realizedEvents([
+    { t: 1000, contract: "pf_enausd", pnl: -100, funding: 0, fee: 0 },
+    { t: 1061, contract: "pf_enausd", pnl: -100, funding: 0, fee: 0 },
+  ]);
+  assert.equal(apart.length, 2, "a 61-second gap starts a new exit");
+  const touching = realizedEvents([
+    { t: 1000, contract: "pf_enausd", pnl: -100, funding: 0, fee: 0 },
+    { t: 1060, contract: "pf_enausd", pnl: -100, funding: 0, fee: 0 },
+  ]);
+  assert.equal(touching.length, 1, "exactly at the window they are still one");
+  assert.equal(touching[0].net, -200);
+  // Clustering is per contract: two symbols exiting together stay distinct.
+  const mixed = realizedEvents([
+    { t: 1000, contract: "pf_enausd", pnl: -100, funding: 0, fee: 0 },
+    { t: 1001, contract: "pf_uniusd", pnl: -100, funding: 0, fee: 0 },
+  ]);
+  assert.equal(mixed.length, 2);
+});
+
+test("ledger rows arriving out of order still cluster correctly", () => {
+  const events = realizedEvents([
+    { t: 1030, contract: "pf_enausd", pnl: -50, funding: 0, fee: 0 },
+    { t: 1000, contract: "pf_enausd", pnl: -50, funding: 0, fee: 0 },
+    { t: 1200, contract: "pf_enausd", pnl: -50, funding: 0, fee: 0 },
+  ]).sort((a, b) => a.t - b.t);
+  assert.equal(events.length, 2);
+  assert.equal(events[0].net, -100);
+  assert.equal(events[1].net, -50);
+});
+
+test("the size cap prices exposure off the book, not a quiet tape", () => {
+  // The tape is 10% away from the live book, which is the case that made position
+  // PnL wrong. Exposure is measured at mid: it is what the position is worth, not
+  // what closing it would realise.
+  const result = evaluateRules({
+    positions: [{ symbol: "PF_UNIUSD", side: "long", size: 1000, price: 6 }],
+    account: { portfolioValue: 5000 },
+    instruments: [{ symbol: "PF_UNIUSD", contractSize: 1, type: "flexible_futures" }],
+    tickers: { PF_UNIUSD: { symbol: "PF_UNIUSD", bid: 6, ask: 6.02, last: 6.6 } },
+    peaks: {}, realized: [], upnlFor: () => 0, now: 1_000_000,
+  });
+  assert.equal(result.rows[0].size.notional, 6010, "book mid, not the stale last (6600)");
+  assert.equal(result.basket.notional, 6010);
+  // With no book at all it still works from the last trade.
+  const noBook = evaluateRules({
+    positions: [{ symbol: "PF_UNIUSD", side: "long", size: 1000, price: 6 }],
+    account: { portfolioValue: 5000 },
+    instruments: [{ symbol: "PF_UNIUSD", contractSize: 1, type: "flexible_futures" }],
+    tickers: { PF_UNIUSD: { symbol: "PF_UNIUSD", last: 6.6 } },
+    peaks: {}, realized: [], upnlFor: () => 0, now: 1_000_000,
+  });
+  assert.equal(noBook.rows[0].size.notional, 6600);
+});

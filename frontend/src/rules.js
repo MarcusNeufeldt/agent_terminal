@@ -14,6 +14,8 @@
 //   cooldownLossPct 0.03  a realized loss this size preceded the worst re-entries;
 //   cooldownMs      2h    median re-entry after a loss was 4 minutes vs 47 after a
 //                         win, and a 2h pause was worth ~+3,000.
+import { valuationPrice } from "./pricing.js";
+
 export const RULES = {
   takeProfitPct: 0.03,
   trailGiveback: 0.30,
@@ -109,7 +111,7 @@ export function evaluateSize({ notional, equity, config = RULES }) {
 export function realizedEvents(rows, { windowSeconds = 60, sinceMs = null } = {}) {
   if (!Array.isArray(rows) || windowSeconds <= 0) return [];
   const sinceSeconds = Number.isFinite(sinceMs) ? sinceMs / 1000 : null;
-  const buckets = new Map();
+  const byContract = new Map();
   for (const row of rows) {
     const t = Number(row?.t);
     if (!Number.isFinite(t)) continue;
@@ -123,16 +125,30 @@ export function realizedEvents(rows, { windowSeconds = 60, sinceMs = null } = {}
     if (!Number.isFinite(pnl) && !Number.isFinite(funding)) continue;
     const net = parts[0] + parts[1] - parts[2];
     if (!Number.isFinite(net)) continue;
-    const key = `${contract}|${Math.floor(t / windowSeconds)}`;
-    const existing = buckets.get(key);
-    if (existing) {
-      existing.net += net;
-      existing.t = Math.max(existing.t, t);
-    } else {
-      buckets.set(key, { t, contract, net });
-    }
+    if (!byContract.has(contract)) byContract.set(contract, []);
+    byContract.get(contract).push({ t, net });
   }
-  return [...buckets.values()].sort((a, b) => a.t - b.t);
+  // One exit usually fills in many clips. Rows closer together than the window are
+  // the same event however they fall against the clock: grouping by a fixed
+  // wall-clock bucket split a loss taken across a boundary into smaller pieces, and
+  // on this account's own history that hid 4 of 31 qualifying losses, including the
+  // largest one in the dataset (ENA, -$360 over 191 seconds in 12 fills).
+  const events = [];
+  for (const [contract, list] of byContract) {
+    list.sort((a, b) => a.t - b.t);
+    let current = null;
+    for (const row of list) {
+      if (current && row.t - current.t <= windowSeconds) {
+        current.net += row.net;
+        current.t = row.t; // the pause should run from when the exit finished
+      } else {
+        if (current) events.push(current);
+        current = { t: row.t, contract, net: row.net };
+      }
+    }
+    if (current) events.push(current);
+  }
+  return events.sort((a, b) => a.t - b.t);
 }
 
 // `now` and event timestamps are both epoch milliseconds / seconds respectively;
@@ -184,10 +200,14 @@ export function evaluateRules({
 
   const rows = live.map(position => {
     const instrument = bySymbol.get(position.symbol) || null;
-    const last = Number(tickers?.[position.symbol]?.last);
+    // Exposure is priced at book mid, not the last trade: on a quiet tape the last
+    // print drifts outside the book and the size multiple drifts with it. Mid rather
+    // than the exit side because this measures what the position is worth, not what
+    // closing it would realise.
+    const { price } = valuationPrice(tickers?.[position.symbol], { mode: "mid" });
     const upnl = typeof upnlFor === "function" ? upnlFor(position) : null;
     const key = peakKey(position);
-    const notional = positionNotional(position, instrument, last);
+    const notional = positionNotional(position, instrument, price);
     return {
       symbol: position.symbol,
       side: position.side,
