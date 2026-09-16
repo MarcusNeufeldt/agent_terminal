@@ -12,7 +12,7 @@ export function quickGridPreset(side, ticker, position, positionState) {
 }
 
 export default function GridTicket({ symbol }) {
-  const previewOnly = useStore(s => s.exchange === "hyperliquid");
+  const isHyperliquid = useStore(s => s.exchange === "hyperliquid");
   const seed = useStore(s => s.gridSeed);
   const position = useStore(s => s.positions.find(p => !p.error && p.symbol === symbol));
   const positionState = useStore(s => s.dataStatus.positions?.state);
@@ -51,7 +51,7 @@ export default function GridTicket({ symbol }) {
         const body = JSON.parse(key);
         const requested = checkRequest.current;
         checkRequest.current = null;
-        if (previewOnly && requested?.key === key && requested.refresh === refresh) body.checkCurrentOrders = true;
+        if (isHyperliquid && requested?.key === key && requested.refresh === refresh) body.checkCurrentOrders = true;
         const data = await api("/api/grid/preview", { method: "POST", body, signal: controller.signal });
         if (controller.signal.aborted) return;
         setPreview({ ...data, key, refresh });
@@ -62,7 +62,7 @@ export default function GridTicket({ symbol }) {
       }
     }, 250);
     return () => { clearTimeout(timer); controller.abort(); setGridPreview(null); };
-  }, [key, complete, refresh, armed, rightView, setGridPreview, previewOnly, checkRequest]);
+  }, [key, complete, refresh, armed, rightView, setGridPreview, isHyperliquid, checkRequest]);
 
   const current = preview?.key === key && preview.refresh === refresh && preview.armed === armed ? preview : null;
   const shownResult = result?.symbol === symbol ? result : null;
@@ -152,7 +152,7 @@ export default function GridTicket({ symbol }) {
     </fieldset>
     <div className="grid-preview" aria-busy={complete && !current && !error}>
       <div className="grid-heading">Preview <button type="button" disabled={busy || !complete} onClick={() => { setError(""); setRefresh(r => r + 1); }}>Refresh</button></div>
-      {previewOnly && <button type="button" disabled={busy || !complete || !current} onClick={() => {
+      {isHyperliquid && <button type="button" disabled={busy || !complete || !current} onClick={() => {
         checkRequest.current = { key, refresh: refresh + 1 }; setError(""); setRefresh(r => r + 1);
       }}>Check current orders and quotes</button>}
       {!complete ? <p>Set a range and total size. Preview lines will appear on the chart.</p>
@@ -168,13 +168,13 @@ export default function GridTicket({ symbol }) {
             {current.validationError && <p className="grid-error" role="alert">{current.validationError}</p>}
           </>}
     </div>
-    {!previewOnly && <button type="button" className={`grid-submit ${side}`} disabled={busy || !current?.ready || !!alreadySent}
+    <button type="button" className={`grid-submit ${side}`} disabled={busy || !current?.ready || !!alreadySent}
       onClick={() => submitGrid(action, current)}>
       {busy ? "Submitting grid…" : alreadySent ? "Submission recorded below" : `${armed ? "Place LIVE" : "Simulate"} ${count} ${side} orders`}
-    </button>}
-    {previewOnly ? <p className="ticket-note">Hyperliquid planning only. Grid placement is not implemented. No orders will be sent.</p>
-      : <p className="ticket-note">{armed ? `LIVE · ${env}` : "DISARMED · no orders sent"}. Existing orders and TP/SL stay untouched. Stops at the first non-confirmed rung.</p>}
-    {!previewOnly && shownResult && <div className="grid-result" role="status">
+    </button>
+    <p className="ticket-note">{armed ? `LIVE · ${env}` : "DISARMED · no orders sent"}. Existing orders and TP/SL stay untouched.
+      {isHyperliquid ? " Sent as one signed batch; margin is not pre-checked." : " Stops at the first non-confirmed rung."}</p>
+    {shownResult && <div className="grid-result" role="status">
       <strong>{shownResult.simulated ? "Simulated" : `Grid ${shownResult.outcome}`}</strong>
       {shownResult.error && <p>{shownResult.error}</p>}
       {shownResult.responses?.length > 0 && <ol>{shownResult.responses.map((row, i) => <li key={i}>

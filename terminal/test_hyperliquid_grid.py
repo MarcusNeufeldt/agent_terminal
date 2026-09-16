@@ -24,8 +24,11 @@ class HyperliquidGridTests(unittest.TestCase):
             if side == "sell":
                 spec["startPrice"], spec["endPrice"] = spec["endPrice"], spec["startPrice"]
             result = preview(spec, self.backend)
-            self.assertFalse(result["ready"])
-            self.assertTrue(result["previewOnly"])
+            # A clean plan is reviewable; submission still re-derives it and compares
+            # the hash, so "ready" is a review gate rather than a safety guarantee.
+            self.assertTrue(result["ready"])
+            self.assertFalse(result["previewOnly"])
+            self.assertIsNone(result["validationError"])
             plan = result["plan"]
             self.assertEqual(len(plan["orders"]), 3)
             self.assertLessEqual(Decimal(str(plan["notional"])), Decimal(100))
@@ -165,14 +168,13 @@ class HyperliquidGridTests(unittest.TestCase):
         self.backend.positions = Mock(return_value={"positions": []})
         self.backend.orders = Mock(return_value={"orders": []})
 
-    def test_current_checks_are_opt_in_fresh_and_never_enable_placement(self):
+    def test_current_checks_are_opt_in_and_always_read_fresh_state(self):
         self.install_reads()
         self.assertIsNone(preview(self.spec, self.backend)["orderChecksPassed"])
         self.backend.orderbook.assert_not_called()
         result = preview({**self.spec, "checkCurrentOrders": True}, self.backend)
         self.assertTrue(result["orderChecksPassed"])
-        self.assertFalse(result["ready"])
-        self.assertTrue(result["previewOnly"])
+        self.assertTrue(result["ready"])
         self.assertTrue(result["orderCheckedAt"])
         self.backend.orderbook.assert_called_once_with("HL_APT", fresh=True)
         self.backend.positions.assert_called_once_with(fresh=True)

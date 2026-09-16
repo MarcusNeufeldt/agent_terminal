@@ -383,18 +383,43 @@ const useStore = create((set, get) => ({
 
   async submitGrid(action, preview) {
     const s = get();
-    if (s.readOnly) { s.toast("Hyperliquid Grid is preview-only. No orders were sent.", "warn"); return; }
     if (s.ticketBusy || s.bulkBusy || s.symbol !== action.symbol) return;
     const prior = s.gridRequest;
     const replay = prior?.previewHash === preview.plan.previewHash && prior.expectedArmed === preview.armed;
     if (!replay && s.armed !== preview.armed) { s.toast("ARM state changed. Refresh the grid preview.", "warn"); return; }
-    const body = prior?.previewHash === preview.plan.previewHash && prior.expectedArmed === preview.armed
+    let body = replay
       ? prior
       : { ...action, previewHash: preview.plan.previewHash, expectedArmed: preview.armed, requestId: newRequestId() };
+    if (s.readOnly) {
+      // Hyperliquid signs the whole grid as one batch, so every rung's client id has
+      // to be durable before anything leaves: a lost response is resolved by looking
+      // those identities up, never by sending the grid a second time. A replay keeps
+      // the ids it already recorded, for the same reason.
+      if (!replay && unresolvedReceipt(s.hlReceipt)) {
+        s.toast("Resolve the unfinished Hyperliquid submission before placing a grid.", "err", 12000);
+        return;
+      }
+      if (!replay) {
+        const rungs = preview.plan.orders?.length ?? 0;
+        if (rungs < 2 || rungs > 20) { s.toast("A Hyperliquid grid needs 2 to 20 rungs.", "err"); return; }
+        body = { ...body, cloids: Array.from({ length: rungs }, () => newCloid()) };
+      }
+      const pending = { version: 1, requestId: body.requestId, batch: true, cloids: body.cloids,
+        body, outcome: "pending", uncertain: true, createdAt: new Date().toISOString() };
+      try {
+        writeReceipt(s.hlReceiptKey, pending);
+      } catch (error) {
+        set({ hlRecoveryError: error.message });
+        s.toast(`Grid not sent: ${error.message}`, "err", 12000);
+        return;
+      }
+      set({ hlReceipt: pending });
+    }
     set({ ticketBusy: true, gridRequest: body, gridResult: null });
     try {
       const response = await api("/api/grid", { method: "POST", body });
       const result = response.results?.[0] || { outcome: "unknown", error: response.error || "No execution result returned." };
+      if (get().readOnly) get().settleGridReceipt(body, result);
       set({ gridResult: { ...result, previewHash: body.previewHash, symbol: body.symbol } });
       get().setGridPreview(null);
       get().toast(result.simulated ? "Grid simulated. No orders sent."
@@ -403,12 +428,28 @@ const useStore = create((set, get) => ({
       result.simulated ? "warn" : result.outcome === "confirmed" ? "ok" : "err", 10000);
       await Promise.all([get().refreshTables(), get().refreshAccount()]);
     } catch (error) {
+      if (get().readOnly) {
+        const rejected = error.data?.outcome === "rejected";
+        get().settleGridReceipt(body, { outcome: rejected ? "rejected" : "unknown", error: error.message });
+      }
       set({ gridResult: { outcome: "unknown", error: error.message, transportError: true,
         previewHash: body.previewHash, symbol: body.symbol } });
       get().toast("Grid response unavailable. Check submission to reuse the same request ID; do not blindly place again.", "err", 12000);
     } finally {
       set({ ticketBusy: false });
     }
+  },
+
+  // Record what the venue said about a batch against its stored identities. The
+  // pending receipt already blocks a resubmission, so a failed write here is safe.
+  settleGridReceipt(body, result) {
+    const s = get();
+    const outcome = result.simulated ? "simulated" : result.outcome || "unknown";
+    const receipt = { version: 1, requestId: body.requestId, batch: true, cloids: body.cloids, body,
+      outcome, uncertain: !["confirmed", "rejected", "simulated"].includes(outcome),
+      error: result.error || null, createdAt: s.hlReceipt?.createdAt || new Date().toISOString() };
+    set({ hlReceipt: receipt });
+    try { writeReceipt(s.hlReceiptKey, receipt); } catch { /* the pending receipt still guards */ }
   },
 
   setRes(res) {

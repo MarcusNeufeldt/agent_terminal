@@ -2,7 +2,7 @@ import { EXCHANGE, READ_ONLY, reloadExchange } from "./exchange.js";
 
 // Hyperliquid signed trading is gated by the backend. Until the gate is on, this venue
 // accepts reads only, so a stale page cannot send a write the server would honour.
-const HL_WRITE_PATHS = new Set(["/api/order", "/api/cancel", "/api/leverage", "/api/chart-order"]);
+const HL_WRITE_PATHS = new Set(["/api/order", "/api/cancel", "/api/leverage", "/api/chart-order", "/api/grid"]);
 // Venue-neutral writes: switching venue, and the ARM gate itself. Disarming must always
 // be possible, including when signed trading is off, or the terminal could be stuck live.
 const VENUE_NEUTRAL_WRITES = new Set(["/api/exchange", "/api/arm"]);

@@ -151,7 +151,7 @@ _hl_gate: dict[str, Any] = {}
 
 HL_TIF = {"mkt": "ioc", "lmt": "gtc", "post": "alo", "ioc": "ioc"}
 HL_TRIGGER = {"stp": "sl", "take_profit": "tp"}
-HL_WRITE_PATHS = {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview"}
+HL_WRITE_PATHS = {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview", "/api/grid"}
 # These belong to the process, not to a venue: ARM guards every write, so the challenge
 # and the toggle must be reachable from whichever venue the browser is currently on.
 VENUE_NEUTRAL_PATHS = {"/api/arm", "/api/arm/challenge"}
@@ -328,7 +328,7 @@ def hyperliquid_write(path: str, body: dict[str, Any], *, prepared_action=None) 
         intent = prepared_action if prepared_action is not None else hyperliquid_leverage_intent(body)
         action, expires_after = intent["action"], intent["expiresAfter"]
     elif prepared_action is not None:
-        if path != "/api/order":
+        if path not in {"/api/order", "/api/grid"}:
             raise hyperliquid_trading.HyperliquidError("Prepared actions are only valid for orders")
         action = prepared_action
     elif path == "/api/order":
@@ -355,6 +355,8 @@ def hyperliquid_write(path: str, body: dict[str, Any], *, prepared_action=None) 
                 raise hyperliquid_trading.HyperliquidError("Exchange leverage or margin mode changed. Refresh before applying")
         if path == "/api/chart-order" and body["expectedArmed"] is not armed:
             raise hyperliquid_trading.HyperliquidError("ARM state changed. Review the chart change again")
+        if path == "/api/grid" and body.get("expectedArmed") is not armed:
+            raise hyperliquid_trading.HyperliquidError("ARM state changed. Refresh the grid preview")
         if path == "/api/chart-order" and (not armed or trader is None):
             hyperliquid_chart.validate(intent, hyperliquid)
         if close_target and (not armed or trader is None):
@@ -1479,9 +1481,17 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._send_json(hyperliquid_recovery.reconcile(db, hyperliquid, request_id))
                 return
             prepared = None
-            if path in {"/api/order", "/api/leverage", "/api/chart-order"}:
-                prepared = (hyperliquid_chart.prepare(body, hyperliquid) if path == "/api/chart-order" else
-                            hyperliquid_order_action(body) if path == "/api/order" else hyperliquid_leverage_intent(body))
+            if path in {"/api/order", "/api/leverage", "/api/chart-order", "/api/grid"}:
+                if path == "/api/grid":
+                    # GridError is a ValueError, so it has to be mapped before the
+                    # journal's own ValueError handling swallows the reason.
+                    try:
+                        prepared = hyperliquid_grid.prepare(body, hyperliquid, body.get("cloids"))
+                    except trading_actions.GridError as exc:
+                        raise hyperliquid_trading.HyperliquidError(str(exc)) from exc
+                else:
+                    prepared = (hyperliquid_chart.prepare(body, hyperliquid) if path == "/api/chart-order" else
+                                hyperliquid_order_action(body) if path == "/api/order" else hyperliquid_leverage_intent(body))
                 try:
                     db.prepare_hyperliquid_order(self._write_request_id, prepared)
                 except ValueError as exc:
@@ -1503,6 +1513,11 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 result["cancelResults"].append({"orderId": str(target["o"]), "asset": target["a"],
                                                 "outcome": outcome,
                                                 "error": None if outcome in {"confirmed", "simulated"} else row.get("error") or result.get("error")})
+        if path == "/api/grid":
+            orders = result["action"].get("orders") or []
+            result["results"] = [{**result, "responses": result.get("rows") or [],
+                                  "requestId": self._write_request_id, "batch": True,
+                                  "cloids": [order.get("c") for order in orders]}]
         db.log_action(f"hl_{result['type']}", bool(result.get("live")), [result["action"]], [result])
         self._send_json(result)
 

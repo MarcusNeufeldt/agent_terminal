@@ -19,6 +19,7 @@ import hyperliquid_recovery
 import hyperliquid_fills
 import hyperliquid_lifecycle
 import hyperliquid_grid
+from grid import GridError
 from hyperliquid_backend import HyperliquidBackend, READ_ONLY_MESSAGE
 from read_state import account_payload
 from local_security import LocalSecurity
@@ -59,12 +60,12 @@ class ExchangeRoutingTests(unittest.TestCase):
                    "hyperliquid_write": self.hl_write, "hyperliquid_trading": hyperliquid_trading,
                    "hyperliquid_order_action": Mock(return_value={"type": "order", "orders": []}),
                    "hyperliquid_leverage_intent": Mock(return_value={"type": "leverageIntent", "action": {"type": "updateLeverage"}, "expiresAfter": 1}),
-                   "hyperliquid_recovery": hyperliquid_recovery, "hyperliquid_fills": hyperliquid_fills,
+                   "trading_actions": SimpleNamespace(GridError=GridError), "hyperliquid_recovery": hyperliquid_recovery, "hyperliquid_fills": hyperliquid_fills,
                    "hyperliquid_lifecycle": hyperliquid_lifecycle, "hyperliquid_grid": hyperliquid_grid,
                    "hyperliquid_gate": Mock(return_value={"mode": "off", "reason": "disabled"}),
                    "IDEMPOTENT_WRITE_PATHS": {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/action", "/api/grid",
                                               "/api/flatten", "/api/chase", "/api/chase/abort", "/api/chat"},
-                   "HL_WRITE_PATHS": {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview"},
+                   "HL_WRITE_PATHS": {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview", "/api/grid"},
                    "VENUE_NEUTRAL_PATHS": {"/api/arm", "/api/arm/challenge"}}
         exec(compile(module, "isolated_exchange_handler", "exec"), self.ns)
         self.handler = self.ns["TerminalHandler"]
@@ -140,7 +141,7 @@ class ExchangeRoutingTests(unittest.TestCase):
 
     def test_hyperliquid_writes_leave_kraken_untouched_and_unsupported_paths_are_refused(self):
         self.switch("hyperliquid")
-        for path in ("action", "grid", "flatten", "chase",
+        for path in ("action", "flatten", "chase",
                      "chase/abort", "chat", "chat/note", "chat/reset", "anything-new"):
             with self.subTest(path=path):
                 status, data = self.request(f"/api/{path}?exchange=hyperliquid", {"armed": True}, 1)
@@ -201,15 +202,14 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.hl_write.assert_not_called()
         self.kraken.post.assert_not_called()
 
-    def test_hyperliquid_grid_preview_checks_are_read_only_and_cannot_place(self):
+    def test_hyperliquid_grid_preview_checks_are_read_only_and_never_sign(self):
         self.switch("hyperliquid")
         self.hl.markets = Mock(return_value={"HL_APT": {"instrument": {
             "symbol": "HL_APT", "tradeable": True, "contractValueTradePrecision": 2}}})
         body = {"symbol": "HL_APT", "side": "buy", "startPrice": 0.6, "endPrice": 0.5, "orders": 3, "notional": 100}
         status, result = self.request("/api/grid/preview?exchange=hyperliquid", body, 1)
         self.assertEqual(status, 200)
-        self.assertTrue(result["previewOnly"])
-        self.assertFalse(result["ready"])
+        self.assertFalse(result["previewOnly"])
         self.assertEqual(len(result["plan"]["orders"]), 3)
         self.hl.orderbook = Mock(return_value={"time": time.time() * 1000, "orderBook": {"bids": [[0.5, 1]], "asks": [[0.7, 1]]}})
         self.hl.positions = Mock(return_value={"positions": []})
@@ -217,10 +217,13 @@ class ExchangeRoutingTests(unittest.TestCase):
         status, checked = self.request("/api/grid/preview?exchange=hyperliquid", {**body, "checkCurrentOrders": True}, 1)
         self.assertEqual(status, 200)
         self.assertTrue(checked["orderChecksPassed"])
-        self.assertFalse(checked["ready"])
         self.hl.orders.assert_called_once_with(fresh=True)
-        status, _ = self.request("/api/grid?exchange=hyperliquid", body, 1)
-        self.assertEqual(status, 405)
+        # Placement exists now, but a preview body alone is not a submission: it
+        # carries no request identity and no per-rung client IDs, so nothing is
+        # journalled and nothing is signed.
+        status, refused = self.request("/api/grid?exchange=hyperliquid", body, 1)
+        self.assertEqual(status, 400)
+        self.db.prepare_hyperliquid_order.assert_not_called()
         self.hl_write.assert_not_called()
         self.db.claim_write_request.assert_not_called()
         self.kraken.post.assert_not_called()
@@ -259,6 +262,47 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.assertEqual((status, result["outcome"]), (200, "simulated"))
         self.kraken.post.assert_not_called()
         self.assertEqual(self.hl_write.call_count, 1)
+
+    def test_grid_route_journals_the_prepared_batch_before_dispatch(self):
+        self.switch("hyperliquid")
+        cloids = ["0x" + f"{n:032x}" for n in (1, 2, 3)]
+        body = {"symbol": "HL_APT", "cloids": cloids, "previewHash": "hash-fixture",
+                "expectedArmed": False, "requestId": "grid-fixture"}
+        prepared = {"type": "order", "grouping": "na",
+                    "orders": [{"a": 1, "b": True, "p": "1", "s": "1", "r": False, "c": c} for c in cloids]}
+        self.ns["hyperliquid_grid"] = Mock()
+        self.ns["hyperliquid_grid"].prepare.return_value = prepared
+
+        def dispatch(path, received, *, prepared_action):
+            # The exact signed batch must be journalled before anything is sent.
+            self.db.prepare_hyperliquid_order.assert_called_once_with(body["requestId"], prepared)
+            self.assertEqual(path, "/api/grid")
+            self.assertIs(prepared_action, prepared)
+            return {"exchange": "hyperliquid", "type": "order", "outcome": "simulated", "simulated": True,
+                    "live": False, "action": prepared_action, "rows": []}
+        self.hl_write.side_effect = dispatch
+        status, result = self.request("/api/grid?exchange=hyperliquid", body, 1)
+        self.assertEqual((status, result["outcome"]), (200, "simulated"))
+        self.ns["hyperliquid_grid"].prepare.assert_called_once_with(body, self.hl, cloids)
+        # The browser matches this against its saved batch receipt before trusting it.
+        row = result["results"][0]
+        self.assertEqual((row["batch"], row["cloids"], row["requestId"]), (True, cloids, "grid-fixture"))
+        self.assertEqual(row["responses"], [])
+        self.assertEqual(row["outcome"], "simulated")
+        self.kraken.post.assert_not_called()
+
+    def test_grid_planning_failures_are_rejections_not_crashes(self):
+        self.switch("hyperliquid")
+        self.ns["hyperliquid_grid"] = Mock()
+        self.ns["hyperliquid_grid"].prepare.side_effect = GridError("Grid preview changed.")
+        body = {"symbol": "HL_APT", "cloids": ["0x" + f"{n:032x}" for n in (1, 2)],
+                "expectedArmed": False, "requestId": "grid-reject"}
+        status, result = self.request("/api/grid?exchange=hyperliquid", body, 1)
+        self.assertEqual(status, 400)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertIn("Grid preview changed", result["error"])
+        self.db.prepare_hyperliquid_order.assert_not_called()
+        self.hl_write.assert_not_called()
 
     def test_batch_recovery_handler_persists_progress_without_signing(self):
         from test_hyperliquid_batch_recovery import BatchRecoveryTests

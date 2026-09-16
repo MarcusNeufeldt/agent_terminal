@@ -407,24 +407,30 @@ test("Hyperliquid positions show read-only stop observations and withdraw them f
   assert.equal(posts.length, 0);
 });
 
-test("Hyperliquid Grid shares the preview UI but cannot submit orders", async t => {
-  const response = { previewOnly: true, ready: false, armed: false, plan: { orders: [], previewHash: "fixture", warnings: [] } };
+test("Hyperliquid Grid previews with trading off, and the gate still guards placement", async t => {
+  const response = { previewOnly: false, ready: true, armed: false,
+    plan: { orders: [], previewHash: "fixture", warnings: [] } };
   const { store, api, render, posts } = await harness(t, () => response);
   store.setState({ otype: "grid" });
   const markup = render();
-  assert.match(markup, /Hyperliquid planning only/);
-  assert.match(markup, /disabled="">Check current orders and quotes/);
-  assert.doesNotMatch(markup, /class="grid-submit|id="hl-btn-buy"/);
+  assert.match(markup, /Check current orders and quotes/, "the venue keeps its read-only preflight");
+  assert.match(markup, /one signed batch/, "the note says how Hyperliquid places a grid");
   const action = { symbol: SYMBOL, side: "buy", startPrice: 0.6, endPrice: 0.5, orders: 3, notional: 100 };
   await api.api("/api/grid/preview", { method: "POST", body: action });
   assert.equal(posts.length, 1, "preview works with signed trading off");
   await api.api("/api/grid/preview", { method: "POST", body: { ...action, checkCurrentOrders: true } });
   assert.equal(posts.at(-1).checkCurrentOrders, true);
+
+  // Placement is refused by the request layer while the backend gate is off.
+  await assert.rejects(api.api("/api/grid", { method: "POST", body: action }));
+  assert.equal(posts.length, 2);
+
+  // Gate on, but a preview that planned no rungs still places nothing.
   store.getState().setSignedTradingMode("mainnet");
   store.setState({ armed: true });
-  await store.getState().submitGrid(action, { ...response, ready: true, armed: true });
-  await assert.rejects(api.api("/api/grid", { method: "POST", body: action }));
-  assert.equal(posts.length, 2, "even a forged ready preview cannot submit a Grid");
+  await store.getState().submitGrid(action, { ...response, armed: true });
+  assert.equal(posts.length, 2, "a ready preview with no rungs mints no identities and sends nothing");
+  assert.equal(store.getState().hlReceipt, null);
 });
 
 test("USD budget is retained in the journal body and rounded-price rejection is not retried", async t => {
@@ -1047,4 +1053,80 @@ test("Open Hyperliquid positions get their own book, so PnL is never valued off 
   reads.length = 0;
   await store.getState().refreshPositionBooks();
   assert.deepEqual(reads, []);
+});
+
+const gridOk = () => ({
+  exchange: "hyperliquid", type: "order", live: true, outcome: "confirmed",
+  action: { type: "order", orders: [] }, rows: [{ state: "resting" }, { state: "resting" }, { state: "resting" }],
+  results: [{ outcome: "confirmed", simulated: false, batch: true,
+              responses: [{ state: "resting" }, { state: "resting" }, { state: "resting" }] }],
+});
+const gridPreview = (hash = "hash-1", rungs = 3, armed = true) =>
+  ({ armed, plan: { previewHash: hash, orders: Array.from({ length: rungs }, () => ({})) } });
+
+test("A Hyperliquid grid carries one client id per rung and is recorded before it is sent", async t => {
+  let receiptAtSend = null;
+  const saved = new Map();
+  const { store, posts } = await harness(t, n => {
+    // Read the durable receipt at the moment the request is in flight.
+    receiptAtSend = saved.get("seen") ?? null;
+    return gridOk(n);
+  });
+  // Mirror localStorage writes so the assertion above can observe ordering.
+  const realSet = globalThis.localStorage.setItem;
+  globalThis.localStorage.setItem = (k, v) => { if (k.startsWith("kt.hyperliquid.receipt")) saved.set("seen", v); return realSet(k, v); };
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ armed: true, symbol: SYMBOL });
+
+  await store.getState().submitGrid({ symbol: SYMBOL, side: "buy" }, gridPreview());
+  assert.equal(posts.length, 1);
+  const body = posts[0];
+  assert.equal(body.cloids.length, 3, "one immutable id per rung");
+  assert.ok(body.cloids.every(id => /^0x[0-9a-f]{32}$/.test(id)));
+  assert.equal(new Set(body.cloids).size, 3, "rung ids must be distinct");
+  assert.equal(body.expectedArmed, true);
+  assert.ok(body.previewHash && body.requestId);
+
+  assert.ok(receiptAtSend, "the batch receipt must exist before the request leaves");
+  const pending = JSON.parse(receiptAtSend);
+  assert.equal(pending.batch, true);
+  assert.deepEqual(pending.cloids, body.cloids);
+  assert.equal(pending.outcome, "pending");
+  assert.equal(pending.requestId, body.requestId);
+  assert.equal(store.getState().hlReceipt.outcome, "confirmed", "the response resolves the receipt");
+});
+
+test("One unresolved Hyperliquid batch blocks the next grid, and a replay keeps its identity", async t => {
+  const { store, posts, toasts } = await harness(t, gridOk);
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ armed: true, symbol: SYMBOL,
+    hlReceipt: { version: 1, requestId: "stuck", batch: true, outcome: "unknown", uncertain: true,
+                 cloids: ["0x" + "a".repeat(32), "0x" + "b".repeat(32)], body: {} } });
+  await store.getState().submitGrid({ symbol: SYMBOL, side: "buy" }, gridPreview());
+  assert.equal(posts.length, 0, "an unresolved batch must not be followed by another");
+  assert.ok(toasts.some(([kind, m]) => kind === "err" && /unfinished/i.test(m)));
+
+  // Cleared receipt: the grid goes, and checking the same submission reuses the ids.
+  store.setState({ hlReceipt: null });
+  await store.getState().submitGrid({ symbol: SYMBOL, side: "buy" }, gridPreview("hash-2"));
+  assert.equal(posts.length, 1);
+  const first = posts[0];
+  store.setState({ ticketBusy: false });
+  await store.getState().submitGrid(first, { armed: true, plan: { previewHash: "hash-2" } });
+  assert.equal(posts.length, 2);
+  assert.deepEqual(posts[1].cloids, first.cloids, "a replay must not mint new identities");
+  assert.equal(posts[1].requestId, first.requestId);
+});
+
+test("A grid outside the venue's rung limits is refused before any identity is minted", async t => {
+  const { store, posts, toasts } = await harness(t, gridOk);
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ armed: true, symbol: SYMBOL });
+  for (const rungs of [1, 21]) {
+    store.setState({ ticketBusy: false, gridRequest: null });
+    await store.getState().submitGrid({ symbol: SYMBOL, side: "buy" }, gridPreview("h" + rungs, rungs));
+    assert.equal(posts.length, 0);
+  }
+  assert.ok(toasts.some(([kind, m]) => kind === "err" && /2 to 20/.test(m)));
+  assert.equal(store.getState().hlReceipt, null, "no receipt for a grid that was never sent");
 });

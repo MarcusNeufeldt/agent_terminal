@@ -107,8 +107,10 @@ def preview(spec, backend):
         except (GridError, HyperliquidError) as exc:
             passed, error = False, str(exc)
         checked_at = datetime.now(timezone.utc).isoformat()
-    plan["warnings"].append("Planning only. Margin has not been validated. Order/quote checks are snapshots, not execution guarantees."
-                            if requested_check else "Planning only. Margin, existing orders and reduce-only coverage have not been checked.")
+    plan["warnings"].append("Margin has not been validated. Order/quote checks are snapshots, not execution guarantees."
+                            if requested_check else "Margin, existing orders and reduce-only coverage have not been checked.")
+    # Submission re-derives this plan from the same inputs and refuses unless the
+    # previewHash still matches, so "ready" is a review gate, not the safety check.
     return {"plan": plan, "exchange": "hyperliquid", "network": backend.network,
-            "previewOnly": True, "ready": False, "orderChecksPassed": passed, "orderCheckedAt": checked_at,
-            "validationError": error or "Hyperliquid Grid placement is not implemented."}
+            "previewOnly": False, "ready": passed is not False, "orderChecksPassed": passed,
+            "orderCheckedAt": checked_at, "validationError": error}
