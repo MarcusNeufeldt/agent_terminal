@@ -34,6 +34,7 @@ LIMIT_TYPES = {"lmt", "post", "ioc"}
 TRIGGER_TYPES = {"stp", "take_profit"}
 MANAGED_TP_PREFIX = "kt-full-tp-"
 MANAGED_SL_PREFIX = "kt-full-sl-"
+PROTECTION_ORDER_TYPES = {"TP": {"take_profit"}, "SL": {"stp", "stop"}}
 PRICE_MAX_AGE_SECONDS = 5.0
 
 
@@ -60,6 +61,43 @@ def _round_size(value: Decimal, precision: int) -> Decimal:
 
 def _fmt(value: Decimal) -> float:
     return float(value)
+
+
+def _as_number(value: Any) -> float | None:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def protection_covers(orders: list[dict[str, Any]], symbol: str, kind: str, position_size: Any) -> bool:
+    """True when reduce-only protection of this kind covers the whole position.
+
+    Hyperliquid reports native position TP/SL with the exchange's zero-size
+    sentinel, because the venue resolves the full position at trigger time.
+    Summing the reported size would score a fully protected position as naked
+    and leave its alert permanently unclearable, so the flag wins over the size.
+    """
+    size = _as_number(position_size)
+    if size is None or size <= 0:
+        return False
+    accepted = PROTECTION_ORDER_TYPES.get(kind)
+    if not accepted:
+        return False
+    coverage = 0.0
+    for order in orders:
+        if (str(order.get("symbol") or "") != symbol or
+                str(order.get("orderType") or "").lower() not in accepted or
+                str(order.get("reduceOnly")).lower() != "true"):
+            continue
+        if order.get("positionTpsl") is True:
+            return True
+        reported = order.get("unfilledSize")
+        amount = _as_number(order.get("size") if reported is None else reported)
+        if amount is None:
+            continue
+        coverage += amount
+    return coverage >= size
 
 
 class ActionContext:

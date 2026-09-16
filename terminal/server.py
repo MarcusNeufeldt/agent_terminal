@@ -722,15 +722,7 @@ def _reconcile_protection_alerts(positions: list[dict[str, Any]], orders: list[d
         if not position or not (_as_float(position.get("size")) or 0) > 0:
             _clear_protection_alert(symbol, kind)
             continue
-        accepted_types = {"take_profit"} if kind == "TP" else {"stp", "stop"}
-        coverage = sum(
-            _as_float(order.get("unfilledSize") if order.get("unfilledSize") is not None else order.get("size")) or 0
-            for order in orders
-            if str(order.get("symbol") or "") == symbol
-            and str(order.get("orderType") or "").lower() in accepted_types
-            and str(order.get("reduceOnly")).lower() == "true"
-        )
-        if coverage >= (_as_float(position.get("size")) or 0):
+        if trading_actions.protection_covers(orders, symbol, kind, position.get("size")):
             _clear_protection_alert(symbol, kind)
 
 
