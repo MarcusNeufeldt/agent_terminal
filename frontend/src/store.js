@@ -504,7 +504,7 @@ const useStore = create((set, get) => ({
   },
 
   // ---- account / tables ----
-  proAdj(v) { return get().pro ? Number(v || 0) + 4650 : Number(v || 0); },
+  proAdj(v) { return get().pro ? Number(v || 0) + 5450 : Number(v || 0); },
 
   async refreshAccount() {
     try {
