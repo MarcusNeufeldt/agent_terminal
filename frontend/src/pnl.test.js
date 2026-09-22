@@ -46,11 +46,11 @@ test("display PnL uses the exit side of the book, never mark or account PnL, wit
   assert.ok(table.includes("66.7% · 50.0×ATR"), "liquidation distance must still use mark, not last");
   store.setState({ pro: true, tickers: { [symbol]: { ...ticker, markPrice: 1000 } } });
   assert.equal(pnl(position), 20, "mark changes and Pro Mode must not alter book-based PnL");
-  assert.equal(store.getState().proAdj(0), 4550);
-  assert.equal(store.getState().proAdj(1000), 5550);
+  assert.equal(store.getState().proAdj(0), 950);
+  assert.equal(store.getState().proAdj(1000), 1950);
   const proSidebar = render(Sidebar);
-  assert.ok(proSidebar.includes("$5,550"), "balance uses the shared display offset");
-  assert.ok(proSidebar.includes("$5,150"), "available margin uses the same offset");
+  assert.ok(proSidebar.includes("$1,950"), "balance uses the shared display offset");
+  assert.ok(proSidebar.includes("$1,550"), "available margin uses the same offset");
   assert.equal(store.getState().account, account);
   assert.equal(position.liqPriceEstimate, 50);
   store.setState({ instruments: [{ ...instrument, contractSize: 10 }] });
