@@ -34,6 +34,7 @@ import hyperliquid_fills
 import hyperliquid_lifecycle
 import hyperliquid_grid
 import hyperliquid_chart
+import hyperliquid_chase
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -151,7 +152,7 @@ _hl_gate: dict[str, Any] = {}
 
 HL_TIF = {"mkt": "ioc", "lmt": "gtc", "post": "alo", "ioc": "ioc"}
 HL_TRIGGER = {"stp": "sl", "take_profit": "tp"}
-HL_WRITE_PATHS = {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview", "/api/grid"}
+HL_WRITE_PATHS = {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview", "/api/grid", "/api/chase", "/api/chase/abort"}
 # These belong to the process, not to a venue: ARM guards every write, so the challenge
 # and the toggle must be reachable from whichever venue the browser is currently on.
 VENUE_NEUTRAL_PATHS = {"/api/arm", "/api/arm/challenge"}
@@ -656,6 +657,15 @@ def _clear_protection_alert(symbol: str, kind: str) -> None:
 
 
 chase_manager = chase_mod.ChaseManager(_publish_chase)
+
+
+def _publish_hl_chase(kind: str, payload: dict[str, Any]) -> None:
+    db.log_event("chase", payload)
+    hyperliquid_sse.publish(kind, payload)
+
+
+hl_chase_manager = chase_mod.ChaseManager(_publish_hl_chase, worker_factory=hyperliquid_chase.HyperliquidChaseWorker,
+                                          orphan_prefix=hyperliquid_chase.CLOID_PREFIX)
 binance_klines = binance_ws_mod.BinanceKlineStream(hub, sse.publish)
 binance_klines.start()
 
@@ -682,10 +692,21 @@ def _detect_orphan_chases() -> None:
         if failed:
             db.log_event("chase_orphan_scan", {"ok": False, "error": str(failed)[:300]})
             return
-        found = chase_manager.recover(db.latest_chase_snapshots(), orders, action_ctx)
+        snapshots = db.latest_chase_snapshots()
+        kraken = [item for item in snapshots if item.get("exchange") != "hyperliquid"]
+        found = chase_manager.recover(kraken, orders, action_ctx)
         db.log_event("chase_orphan_scan", {"ok": True, "count": len(found)})
     except Exception as exc:
         db.log_event("chase_orphan_scan", {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]})
+    try:
+        # Hyperliquid: surface chase orders still resting and chases that never finished.
+        # Nothing is cancelled here; the terminal starts DISARMED.
+        hl_orders = hyperliquid.orders(fresh=True)["orders"] if hyperliquid.account_configured else []
+        hl_snapshots = [item for item in db.latest_chase_snapshots() if item.get("exchange") == "hyperliquid"]
+        found = hl_chase_manager.recover(hl_snapshots, hl_orders)
+        db.log_event("hl_chase_orphan_scan", {"ok": True, "count": len(found)})
+    except Exception as exc:
+        db.log_event("hl_chase_orphan_scan", {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]})
 
 
 threading.Thread(target=_equity_snapshot_loop, name="equity-snapshots", daemon=True).start()
@@ -703,6 +724,78 @@ def _start_chase_if_armed(spec: dict[str, Any]) -> dict[str, Any]:
         else:
             action_ctx.require_new_exposure(symbol)
         return chase_manager.start(spec, action_ctx)
+
+
+class _HyperliquidChaseContext:
+    """What a Hyperliquid Chase worker may do. Placement needs ARM, checked under
+    arm_lock together with the submission; cancelling is always allowed."""
+
+    backend = hyperliquid
+
+    def armed(self) -> bool:
+        with arm_lock:
+            return armed
+
+    def verify_signer(self) -> None:
+        trader, reason = hyperliquid_trader()
+        if trader is None:
+            raise hyperliquid_trading.HyperliquidError(reason or "Hyperliquid signed trading is off")
+        hyperliquid.require_agent(trader.address)
+
+    def submit(self, action: dict[str, Any], *, placement: bool) -> dict[str, Any]:
+        trader, reason = hyperliquid_trader()
+        if trader is None:
+            return {"outcome": "rejected", "error": f"Not signed: {reason}", "rows": []}
+        with arm_lock:
+            if placement and not armed:
+                return {"outcome": "rejected", "error": "Terminal is DISARMED", "rows": []}
+            if trader.network != hyperliquid.network or trader.account_address != hyperliquid.account_address.lower():
+                return {"outcome": "rejected", "error": "Read and signing account identities disagree", "rows": []}
+            result = trader.submit(action, count=1)
+        db.log_action(f"hl_chase_{action.get('type')}", True, [action], [result])
+        return result
+
+
+hl_chase_ctx = _HyperliquidChaseContext()
+HL_CHASE_LIMIT = 5
+
+
+def _hl_chase_unresolved() -> bool:
+    return any(item.get("status") in {"unknown", "orphaned"} for item in hl_chase_manager.active())
+
+
+def hyperliquid_chase_start(body: dict[str, Any]) -> dict[str, Any]:
+    spec = hyperliquid_chase.parse_spec(body)
+    if _hl_chase_unresolved():
+        raise hyperliquid_trading.HyperliquidError("A Hyperliquid Chase ended in an unknown state. Check it on Hyperliquid first")
+    if hyperliquid.account_configured and db.venue_unresolved(hyperliquid.network, hyperliquid.account_address)["items"]:
+        raise hyperliquid_trading.HyperliquidError("Resolve the prior Hyperliquid submission before starting a Chase")
+    running = [item for item in hl_chase_manager.active() if item.get("status") == "running"]
+    if len(running) >= HL_CHASE_LIMIT or any(item.get("symbol") == spec["symbol"] for item in running):
+        raise hyperliquid_trading.HyperliquidError(
+            f"One Chase per market and at most {HL_CHASE_LIMIT} at once. Stop the running one first")
+    with arm_lock:
+        if body["expectedArmed"] is not armed:
+            raise hyperliquid_trading.HyperliquidError("ARM state changed. Review the Chase again")
+        is_armed = armed
+    if not is_armed:
+        prepared = hyperliquid_chase.preview(spec, hyperliquid)
+        return {"exchange": "hyperliquid", "type": "chase", "outcome": "simulated", "simulated": True, "live": False,
+                "action": prepared["action"], "spec": spec,
+                "message": "Terminal is DISARMED: the first post-only order was validated but nothing was signed or sent."}
+    trader, reason = hyperliquid_trader()
+    if trader is None:
+        return {"exchange": "hyperliquid", "type": "chase", "outcome": "simulated", "simulated": True, "live": False,
+                "spec": spec, "message": f"Not signed: {reason}"}
+    if trader.network != hyperliquid.network or trader.account_address != hyperliquid.account_address.lower():
+        raise hyperliquid_trading.HyperliquidError("Read and signing account identities disagree")
+    hyperliquid.require_agent(trader.address)
+    hyperliquid.watch([spec["symbol"]])
+    with arm_lock:
+        if not armed:
+            raise hyperliquid_trading.HyperliquidError("Terminal was disarmed. Chase not started")
+        snapshot = hl_chase_manager.start(spec, hl_chase_ctx)
+    return {"exchange": "hyperliquid", "type": "chase", "outcome": "confirmed", "live": True, "chase": snapshot}
 
 
 action_ctx.start_chase = _start_chase_if_armed
@@ -1166,6 +1259,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
                                              "armed": armed, "readOnly": False,
                                              "accountAddress": hyperliquid.account_address,
                                              "signedTrading": hyperliquid_gate()})
+                    elif path == "/api/chase":
+                        self._send_json({"chases": hl_chase_manager.list(), "exchange": "hyperliquid"})
                     elif path == "/api/volatility":
                         try:
                             self._send_json(scanner.scan_volatility_hyperliquid(
@@ -1395,7 +1490,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     armed = False
                 with arm_lock:
                     selected = exchange_routing.switch(exchange, epoch, body.get("exchange"),
-                                                        active_chases=chase_manager.active, disarm=disarm)
+                                                        active_chases=lambda: chase_manager.active() + hl_chase_manager.active(),
+                                                        disarm=disarm)
                     if selected["exchange"] != exchange:
                         sse.publish("armed", {"armed": armed})
                         sse.publish("exchange", selected)
@@ -1480,8 +1576,20 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     raise hyperliquid_trading.HyperliquidError("valid requestId required")
                 self._send_json(hyperliquid_recovery.reconcile(db, hyperliquid, request_id))
                 return
+            if path == "/api/chase":
+                self._send_json(hyperliquid_chase_start(body))
+                return
+            if path == "/api/chase/abort":
+                chase_id = str(body.get("chaseId", ""))
+                # acknowledge: the user checked an unknown Chase on Hyperliquid; nothing is sent.
+                self._send_json(hl_chase_manager.acknowledge(chase_id) if body.get("acknowledge") is True
+                                else hl_chase_manager.abort(chase_id))
+                return
             prepared = None
             if path in {"/api/order", "/api/leverage", "/api/chart-order", "/api/grid"}:
+                if _hl_chase_unresolved():
+                    raise hyperliquid_trading.HyperliquidError(
+                        "A Hyperliquid Chase ended in an unknown state. Check it on Hyperliquid before placing orders")
                 if path == "/api/grid":
                     # GridError is a ValueError, so it has to be mapped before the
                     # journal's own ValueError handling swallows the reason.
@@ -1538,6 +1646,10 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     armed = want
                     state = armed
                 aborting = chase_manager.abort_all() if not state else {"requested": [], "completed": [], "pending": []}
+                if not state:
+                    stopped = hl_chase_manager.abort_all()
+                    for key in aborting:
+                        aborting[key] = aborting[key] + stopped[key]
                 sse.publish("armed", {"armed": state})
                 hyperliquid_sse.publish("armed", {"armed": state})
                 db.log_event("arm", {"armed": state, "env": "demo" if client.is_demo else "live", "abortingChases": aborting})

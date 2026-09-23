@@ -565,14 +565,17 @@ class ChaseWorker(threading.Thread):
 
 
 class ChaseManager:
-    def __init__(self, publish: Any) -> None:
+    def __init__(self, publish: Any, *, worker_factory: Any = None, orphan_prefix: str = "ch-") -> None:
         self._chases: dict[str, ChaseWorker] = {}
         self._orphans: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._publish = publish
+        # One manager per venue: the worker class and client-id prefix are venue specific.
+        self._worker_factory = worker_factory or ChaseWorker
+        self._orphan_prefix = orphan_prefix
 
     def start(self, spec: dict[str, Any], ctx: Any) -> dict[str, Any]:
-        worker = ChaseWorker(spec, ctx, self._publish)
+        worker = self._worker_factory(spec, ctx, self._publish)
         with self._lock:
             if len(self._chases) > 40:
                 for key in sorted(self._chases, key=lambda item: self._chases[item].started)[:-20]:
@@ -607,6 +610,25 @@ class ChaseManager:
         worker.abort()
         return {"ok": True, "chase": worker.snapshot()}
 
+    def acknowledge(self, chase_id: str) -> dict[str, Any]:
+        """The user checked an unknown or orphaned Chase on the exchange. Nothing is sent;
+        the item stops blocking, and the acknowledgement outlives a restart."""
+        with self._lock:
+            worker = self._chases.get(chase_id)
+            key = next((k for k, item in self._orphans.items() if item["id"] == chase_id), None)
+            orphan = self._orphans.pop(key) if key else None
+        if orphan:
+            original = chase_id[len("recovery-"):] if chase_id.startswith("recovery-") else chase_id
+            for item_id in {chase_id, original}:
+                self._publish("chase", {**orphan, "id": item_id, "status": "acknowledged", "state": "ACKNOWLEDGED"})
+            return {"ok": True}
+        if worker and worker.status == "unknown" and not worker.is_alive():
+            worker.status, worker.state = "acknowledged", "ACKNOWLEDGED"
+            worker._audit("acknowledged")
+            worker._publish()
+            return {"ok": True, "chase": worker.snapshot()}
+        return {"error": f"chase {chase_id} is not waiting for a manual check"}
+
     def abort_all(self, wait_timeout: float = 5.0, *, chase_ids: set[str] | None = None) -> dict[str, Any]:
         with self._lock:
             running = [worker for worker in self._chases.values() if worker.status == "running" and worker.is_alive()
@@ -627,7 +649,7 @@ class ChaseManager:
         with self._lock:
             for order in orders:
                 cli_id = str(order.get("cliOrdId") or "")
-                if not cli_id.startswith("ch-"):
+                if not cli_id.lower().startswith(self._orphan_prefix):
                     continue
                 order_id = str(order.get("order_id") or order.get("orderId") or "")
                 key = order_id or cli_id

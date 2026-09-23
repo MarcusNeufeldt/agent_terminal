@@ -36,6 +36,13 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.hl = HyperliquidBackend(Mock(), client=self.hl_client, account_address="", enable_feed=False)
         self.chases = Mock()
         self.chases.active.return_value = []
+        self.hl_chases = Mock()
+        self.hl_chases.active.return_value = []
+        self.hl_chases.list.return_value = [{"id": "hl1", "exchange": "hyperliquid"}]
+        self.hl_chases.abort_all.return_value = {"requested": ["hl1"], "completed": [], "pending": []}
+        self.chases.abort_all.return_value = {"requested": [], "completed": [], "pending": []}
+        self.chase_start = Mock(return_value={"exchange": "hyperliquid", "type": "chase", "outcome": "simulated"})
+        self.chase_unresolved = Mock(return_value=False)
         self.hl_write = Mock(side_effect=lambda path, body, **_: {"exchange": "hyperliquid", "type": "order",
                                                             "outcome": "simulated", "live": False,
                                                             "action": {"type": "order"}, "rows": []})
@@ -56,6 +63,8 @@ class ExchangeRoutingTests(unittest.TestCase):
                    "REQUEST_ID_RE": re.compile(r"^[A-Za-z0-9._:-]{8,100}$"), "READ_ONLY_MESSAGE": READ_ONLY_MESSAGE,
                    "arm_lock": lock, "armed": True, "client": self.kraken, "db": self.db,
                    "sse": Mock(), "hyperliquid_sse": Mock(), "hyperliquid": self.hl, "chase_manager": self.chases,
+                   "hl_chase_manager": self.hl_chases, "hyperliquid_chase_start": self.chase_start,
+                   "_hl_chase_unresolved": self.chase_unresolved,
                    "get_account": self.account, "_account_payload": account_payload,
                    "hyperliquid_write": self.hl_write, "hyperliquid_trading": hyperliquid_trading,
                    "hyperliquid_order_action": Mock(return_value={"type": "order", "orders": []}),
@@ -65,7 +74,7 @@ class ExchangeRoutingTests(unittest.TestCase):
                    "hyperliquid_gate": Mock(return_value={"mode": "off", "reason": "disabled"}),
                    "IDEMPOTENT_WRITE_PATHS": {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/action", "/api/grid",
                                               "/api/flatten", "/api/chase", "/api/chase/abort", "/api/chat"},
-                   "HL_WRITE_PATHS": {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview", "/api/grid"},
+                   "HL_WRITE_PATHS": {"/api/order", "/api/leverage", "/api/chart-order", "/api/cancel", "/api/order-reconcile", "/api/cancel-reconcile", "/api/fill-history/sync", "/api/grid/preview", "/api/grid", "/api/chase", "/api/chase/abort"},
                    "VENUE_NEUTRAL_PATHS": {"/api/arm", "/api/arm/challenge"}}
         exec(compile(module, "isolated_exchange_handler", "exec"), self.ns)
         self.handler = self.ns["TerminalHandler"]
@@ -141,8 +150,7 @@ class ExchangeRoutingTests(unittest.TestCase):
 
     def test_hyperliquid_writes_leave_kraken_untouched_and_unsupported_paths_are_refused(self):
         self.switch("hyperliquid")
-        for path in ("action", "flatten", "chase",
-                     "chase/abort", "chat", "chat/note", "chat/reset", "anything-new"):
+        for path in ("action", "flatten", "chat", "chat/note", "chat/reset", "anything-new"):
             with self.subTest(path=path):
                 status, data = self.request(f"/api/{path}?exchange=hyperliquid", {"armed": True}, 1)
                 self.assertEqual(status, 405)
@@ -460,13 +468,45 @@ class ExchangeRoutingTests(unittest.TestCase):
 
     def test_unsupported_hyperliquid_reads_do_not_leak_kraken_history_or_alerts(self):
         self.switch("hyperliquid")
-        for path in ("chat/history", "chase", "tp-cleanup", "protection/alerts", "stats", "equity", "alt-btc", "signal"):
+        for path in ("chat/history", "tp-cleanup", "protection/alerts", "stats", "equity", "alt-btc", "signal"):
             status, data = self.request(f"/api/{path}?exchange=hyperliquid")
             self.assertEqual((status, data["state"]), (501, "unsupported"))
         self.db.get_messages.assert_not_called()
         self.db.get_equity.assert_not_called()
         self.hl_client.info.assert_not_called()
         self.scanner.scan_volatility.assert_not_called()
+
+    def test_hyperliquid_chase_routes_to_its_own_manager_never_kraken(self):
+        self.switch("hyperliquid")
+        status, data = self.request("/api/chase?exchange=hyperliquid")
+        self.assertEqual((status, data["chases"]), (200, [{"id": "hl1", "exchange": "hyperliquid"}]))
+        self.chases.list.assert_not_called()
+        body = {"requestId": "fixture-chase-1", "symbol": "HL_APT", "side": "buy", "size": 1,
+                "reduceOnly": False, "expectedArmed": False}
+        status, data = self.request("/api/chase?exchange=hyperliquid", body, 1)
+        self.assertEqual((status, data["outcome"]), (200, "simulated"))
+        self.chase_start.assert_called_once()
+        self.assertEqual(self.chase_start.call_args.args[0]["symbol"], "HL_APT")
+        self.request("/api/chase/abort?exchange=hyperliquid", {"requestId": "fixture-chase-2", "chaseId": "hl1"}, 1)
+        self.hl_chases.abort.assert_called_once_with("hl1")
+        self.chases.abort.assert_not_called()
+        self.kraken.post.assert_not_called()
+
+    def test_an_unknown_hyperliquid_chase_blocks_new_orders(self):
+        self.switch("hyperliquid")
+        self.chase_unresolved.return_value = True
+        status, data = self.request("/api/order?exchange=hyperliquid",
+                                    {"requestId": "fixture-order-blocked", "symbol": "HL_APT"}, 1)
+        self.assertEqual((status, data["outcome"]), (400, "rejected"))
+        self.assertIn("Chase", data["error"])
+        self.hl_write.assert_not_called()
+
+    def test_disarm_stops_chases_on_both_venues(self):
+        status, data = self.request("/api/arm", {"armed": False})
+        self.assertEqual(status, 200)
+        self.chases.abort_all.assert_called_once()
+        self.hl_chases.abort_all.assert_called_once()
+        self.assertEqual(data["abortingChases"]["requested"], ["hl1"])
 
     def test_volatility_scan_reads_the_hyperliquid_universe_not_the_kraken_one(self):
         self.switch("hyperliquid")

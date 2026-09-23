@@ -1130,3 +1130,54 @@ test("A grid outside the venue's rung limits is refused before any identity is m
   assert.ok(toasts.some(([kind, m]) => kind === "err" && /2 to 20/.test(m)));
   assert.equal(store.getState().hlReceipt, null, "no receipt for a grid that was never sent");
 });
+
+test("Chase renders without a price field and sends explicit Hyperliquid values, never the Kraken DOM", async t => {
+  const replies = [
+    { exchange: "hyperliquid", type: "chase", outcome: "simulated", simulated: true,
+      action: { type: "order", orders: [{ a: 1, b: false, p: "0.61", s: "20", r: true, t: { limit: { tif: "Alo" } } }] } },
+    { exchange: "hyperliquid", type: "chase", outcome: "confirmed", live: true,
+      chase: { id: "c1", exchange: "hyperliquid", symbol: SYMBOL, side: "buy", size: 20, filled: 0, status: "running", pegs: 1 } },
+    { ok: true },
+  ];
+  const { store, render, posts, postPaths, prompts, toasts } = await harness(t, n => replies[n - 1]);
+  store.setState({ otype: "chase" });
+  const markup = render();
+  assert.match(markup, /CHASE BUY/);
+  assert.match(markup, /CHASE SELL/);
+  assert.doesNotMatch(markup, /id="hl-limit"/, "a Chase prices itself from the book");
+  assert.match(markup, /re-pegs as the book moves/);
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ canTrade: true });
+
+  await store.getState().submitHyperliquidChase("sell", { size: 20, reduceOnly: true });
+  assert.deepEqual({ ...posts[0], requestId: undefined },
+    { symbol: SYMBOL, side: "sell", size: 20, reduceOnly: true, expectedArmed: false, requestId: undefined });
+  assert.match(postPaths[0], /^\/api\/chase\?exchange=hyperliquid/);
+  assert.equal(prompts.length, 0, "a DISARMED simulation needs no live confirmation");
+  assert.match(toasts.at(-1)[1], /simulated \(DISARMED\).*0\.61.*Nothing was sent/);
+
+  store.setState({ armed: true });
+  await store.getState().submitHyperliquidChase("buy", { size: 20, reduceOnly: false });
+  assert.match(prompts[0], /LIVE CHASE BUY 20 HL_APT/);
+  assert.match(prompts[0], /unfilled rest is cancelled/, "an entry never goes to market on timeout");
+  assert.equal(posts[1].expectedArmed, true);
+  assert.equal(store.getState().chases.c1.status, "running");
+  assert.match(render(), /Chase buy HL_APT: running/);
+  assert.match(render(), />Stop</);
+
+  await store.getState().abortChase("c1");
+  assert.match(postPaths[2], /^\/api\/chase\/abort/);
+  assert.deepEqual({ ...posts[2], requestId: undefined }, { chaseId: "c1", requestId: undefined });
+
+  globalThis.confirm = () => false;
+  await store.getState().submitHyperliquidChase("buy", { size: 20, reduceOnly: false });
+  assert.equal(posts.length, 3, "a declined live Chase sends nothing");
+});
+
+test("Stopping a Chase works even with the signed-trading gate off", async t => {
+  const { store, posts, postPaths } = await harness(t, () => ({ ok: true }));
+  store.getState().setSignedTradingMode("off");
+  await store.getState().abortChase("c9");
+  assert.match(postPaths[0], /^\/api\/chase\/abort/);
+  assert.equal(posts[0].chaseId, "c9");
+});

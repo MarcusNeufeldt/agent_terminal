@@ -1,4 +1,4 @@
-/* Hyperliquid manual orders and Grid planning. Grid execution, Chase and AI remain disabled. */
+/* Hyperliquid manual orders, Grid and Chase. AI remains disabled on this venue. */
 
 import { useEffect, useState } from "react";
 import { fmt } from "../api";
@@ -8,7 +8,7 @@ import { contractsForNotional, normalizeContractSize } from "../size-precision";
 import { linearExitPreview } from "../risk-preview";
 import GridTicket from "./GridTicket";
 
-const TYPES = [["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["ioc", "IOC"], ["stp", "Stop"], ["take_profit", "Take profit"], ["grid", "Grid preview"]];
+const TYPES = [["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["chase", "Chase"], ["ioc", "IOC"], ["stp", "Stop"], ["take_profit", "Take profit"], ["grid", "Grid preview"]];
 // The venue rejects these with a minimum order value, so warn before submitting.
 const MIN_ORDER_VALUE = 10;
 
@@ -48,6 +48,9 @@ export default function HyperliquidTicket() {
   const recoveryBlocked = !recoveryKey || !recoveryLoaded || !!recoveryError ||
     serverUnresolved.length > 0 || recoveryHasMore || unresolvedReceipt(receipt);
   const submitHyperliquidOrder = useStore(s => s.submitHyperliquidOrder);
+  const submitHyperliquidChase = useStore(s => s.submitHyperliquidChase);
+  const abortChase = useStore(s => s.abortChase);
+  const chases = useStore(s => s.chases);
   const tickers = useStore(s => s.tickers);
   const instruments = useStore(s => s.instruments);
   const capacity = useStore(s => s.hlCapacity);
@@ -81,7 +84,9 @@ export default function HyperliquidTicket() {
   const trigger = !closeDraft && ["stp", "take_profit"].includes(otype);
   const matchingPositions = positions.filter(p => !p.error && p.symbol === symbol);
   const market = !closeDraft && otype === "mkt";
-  const explicitPrice = market ? (ticker.ask || ticker.last || ticker.markPrice) : trigger ? stop : limit;
+  // A Chase prices itself from the book, so sizing uses the current quote.
+  const chase = !closeDraft && otype === "chase";
+  const explicitPrice = market || chase ? (ticker.ask || ticker.last || ticker.markPrice) : trigger ? stop : limit;
   const validPrice = Number.isFinite(Number(explicitPrice)) && Number(explicitPrice) > 0;
   const price = Number(explicitPrice) || Number(ticker.last ?? ticker.markPrice) || 0;
   const lotDecimals = instrument.contractValueTradePrecision ?? 0;
@@ -111,7 +116,11 @@ export default function HyperliquidTicket() {
     setSizingSource("percent");
   };
 
-  const submit = side => submitHyperliquidOrder(side, {
+  const liveChases = Object.values(chases || {}).filter(c => c.exchange === "hyperliquid" &&
+    ["running", "unknown", "orphaned"].includes(c.status));
+  const submit = side => chase ? submitHyperliquidChase(side, {
+    size: Number(sizingSource === "percent" ? percentQuantity(side) : contracts), reduceOnly: reduce,
+  }) : submitHyperliquidOrder(side, {
     size: Number(sizingSource === "percent" ? percentQuantity(side) : contracts),
     quickPercent: sizingSource === "percent" ? percent : undefined,
     expectedLeverage: sizingSource === "percent" && capacityCurrent ? capacity.leverage.value : undefined,
@@ -151,7 +160,11 @@ export default function HyperliquidTicket() {
           ))}
         </div>
         {otype === "grid" && !closeDraft ? <GridTicket symbol={symbol} /> : <>
-        {market ? <div className="field">
+        {chase ? <div className="ticket-note">
+          Rests post-only at the best bid (buy) or ask (sell) and re-pegs as the book moves, so every fill pays the maker fee.
+          {reduce ? " Reduce-only: after 5 minutes the unfilled rest closes with a reduce-only market order."
+            : " After 5 minutes the unfilled rest is cancelled."} Stop cancels only and never sends a market order.
+        </div> : market ? <div className="field">
           <label htmlFor="hl-slippage">Market slippage limit (%)</label>
           <input id="hl-slippage" type="number" min="0.01" max="5" step="0.01" value={slippage}
             onChange={e => setSlippage(e.target.value)} />
@@ -229,9 +242,9 @@ export default function HyperliquidTicket() {
             disabled={ticketBusy || fillBusy || reconciling || !canTrade || recoveryBlocked}
             onClick={() => submit(closeDraft.side)}>{ticketBusy ? "SUBMITTING…" : `${closeDraft.side.toUpperCase()} TO CLOSE`}</button> : <>
           <button id="hl-btn-buy" disabled={ticketBusy || fillBusy || reconciling || !canTrade || recoveryBlocked || (sizingSource === "percent" && !percentQuantity("buy"))} onClick={() => submit("buy")}>
-            {ticketBusy ? "SUBMITTING…" : market ? "MARKET BUY / LONG" : "BUY / LONG"}</button>
+            {ticketBusy ? "SUBMITTING…" : market ? "MARKET BUY / LONG" : chase ? "CHASE BUY" : "BUY / LONG"}</button>
           <button id="hl-btn-sell" disabled={ticketBusy || fillBusy || reconciling || !canTrade || recoveryBlocked || (sizingSource === "percent" && !percentQuantity("sell"))} onClick={() => submit("sell")}>
-            {ticketBusy ? "SUBMITTING…" : market ? "MARKET SELL / SHORT" : "SELL / SHORT"}</button>
+            {ticketBusy ? "SUBMITTING…" : market ? "MARKET SELL / SHORT" : chase ? "CHASE SELL" : "SELL / SHORT"}</button>
           </>}
         </div>
         </>}
@@ -242,6 +255,15 @@ export default function HyperliquidTicket() {
               ? "ARMED — a confirmed click signs and sends a real order to Hyperliquid."
               : "DISARMED — the exact order is validated and shown, but nothing is signed or sent."}
         </div>
+        {liveChases.map(c => (
+          <div key={c.id} className="ticket-note" role="status">
+            Chase {c.side} {c.symbol}: {c.status} · filled {fmt(c.filled)}/{fmt(c.size)} · {c.pegs ?? 0} pegs
+            {c.status === "running"
+              ? <button type="button" onClick={() => abortChase(c.id)}>Stop</button>
+              : <div>{c.unknownReason || "Needs a manual check on Hyperliquid."} New orders are blocked until it is checked.
+                  {" "}<button type="button" onClick={() => abortChase(c.id, { acknowledge: true })}>Mark checked</button></div>}
+          </div>
+        ))}
         {recoveryError && <div className="ticket-note" role="alert">Recovery blocked: {recoveryError}</div>}
         {(!recoveryLoaded || serverUnresolved.length > 0) && (
           <div className="ticket-note" role="status">

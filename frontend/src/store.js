@@ -1046,6 +1046,51 @@ const useStore = create((set, get) => ({
     }
   },
 
+  // Hyperliquid Chase: values come from the Hyperliquid ticket, never the Kraken DOM.
+  async submitHyperliquidChase(side, { size, reduceOnly }) {
+    const s = get(), symbol = s.symbol;
+    if (s.exchange !== "hyperliquid" || s.exchangeBusy || s.ticketBusy || s.hlReconciling || !isVenueSymbol(symbol)) return;
+    if (!s.canTrade) { s.toast("Hyperliquid trading is disabled by the backend gate.", "err", 9000); return; }
+    if (!s.hlRecoveryLoaded || s.hlRecoveryError || s.hlServerUnresolved.length || unresolvedReceipt(s.hlReceipt)) {
+      s.toast(s.hlRecoveryError || "Resolve the saved Hyperliquid submission before starting a Chase.", "err", 12000);
+      return;
+    }
+    const instrument = s.instruments.find(i => i.symbol === symbol) || {};
+    const quantity = normalizeContractSize(size, instrument.contractValueTradePrecision ?? 0);
+    if (!Number.isFinite(quantity) || quantity <= 0) { s.toast("Enter a size that meets this market's lot size.", "err"); return; }
+    const onTimeout = reduceOnly ? "the unfilled rest closes with a reduce-only market order" : "the unfilled rest is cancelled";
+    if (s.armed && !confirm(`LIVE CHASE ${side.toUpperCase()} ${quantity} ${symbol}${reduceOnly ? " (reduce-only)" : ""}\n\n`
+      + `Rests post-only at the best ${side === "buy" ? "bid" : "ask"} and re-pegs as it moves. After 5 minutes ${onTimeout}. Continue?`)) return;
+    set({ ticketBusy: true });
+    try {
+      const r = await api("/api/chase", { method: "POST",
+        body: { symbol, side, size: quantity, reduceOnly: !!reduceOnly, expectedArmed: s.armed, requestId: newRequestId() } });
+      if (r.outcome === "simulated") {
+        const order = r.action?.orders?.[0];
+        get().toast(`Chase simulated (DISARMED): first order ${side} ${order?.s ?? quantity} @ ${order?.p ?? "?"} post-only. Nothing was sent.`, "ok", 12000);
+      } else if (r.chase) {
+        get().onChaseEvent(r.chase);
+        get().toast(`Chase ${r.chase.id} running: ${side} ${quantity} ${symbol}.`, "ok", 9000);
+      }
+    } catch (e) {
+      get().toast(`Chase failed: ${e.message}`, "err", 12000);
+    } finally {
+      set({ ticketBusy: false });
+    }
+  },
+
+  async abortChase(chaseId, { acknowledge = false } = {}) {
+    if (acknowledge && !confirm("Mark this Chase as checked?\n\nOnly do this after confirming on Hyperliquid that no chase order is still open and the position is what you expect. Nothing is sent.")) return;
+    try {
+      const r = await api("/api/chase/abort", { method: "POST",
+        body: { chaseId, ...(acknowledge ? { acknowledge: true } : {}), requestId: newRequestId() } });
+      if (r.error) get().toast(r.error, "err", 9000);
+      else if (r.chase) get().onChaseEvent(r.chase);
+    } catch (e) {
+      get().toast(`Stop failed: ${e.message}`, "err", 9000);
+    }
+  },
+
   clearHyperliquidClose() { set({ hlCloseDraft: null, otype: "lmt" }); },
 
   async observeHyperliquidClose(receipt, scopeKey) {

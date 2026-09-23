@@ -48,7 +48,8 @@ test("Hyperliquid requests, UI, storage, and overlays stay separate from Kraken"
   assert.equal(apiUrl("/api/stream"), "/api/stream?exchange=hyperliquid");
   const before = requests.length;
   // /api/arm is deliberately absent: the ARM gate is venue-neutral, so it is reachable here.
-  for (const path of ["order", "cancel", "action", "grid", "flatten", "chase", "chase/abort", "chat", "chat/reset"]) {
+  // So is /api/chase/abort: stopping a Chase only cancels (see hyperliquid-ticket.test.js).
+  for (const path of ["order", "cancel", "action", "grid", "flatten", "chase", "chat", "chat/reset"]) {
     await assert.rejects(api(`/api/${path}`, { method: "POST", body: {} }), /disabled by the backend gate/);
   }
   await assert.rejects(api("/api/account?exchange=kraken"), /Cross-exchange/);
