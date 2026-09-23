@@ -243,13 +243,14 @@ class SpecAndPreviewTests(unittest.TestCase):
 class OrphanDetectionTests(unittest.TestCase):
     def test_hyperliquid_manager_recognises_only_its_own_client_ids(self):
         manager = chase_mod.ChaseManager(lambda *_: None, worker_factory=hc.HyperliquidChaseWorker,
-                                         orphan_prefix=hc.CLOID_PREFIX)
+                                         orphan_prefix=hc.CLOID_PREFIX, venue="hyperliquid")
         found = manager.detect_orphans([
             {"cliOrdId": hc.chase_cloid(), "order_id": "5", "symbol": SYMBOL, "side": "buy", "unfilledSize": 1},
             {"cliOrdId": "0x" + "ab" * 16, "order_id": "6", "symbol": SYMBOL, "side": "buy", "unfilledSize": 1},
             {"cliOrdId": None, "order_id": "7"},
         ])
         self.assertEqual([item["activeOrderId"] for item in found], ["5"])
+        self.assertEqual(found[0]["exchange"], "hyperliquid", "the Hyperliquid ticket must be able to show it")
         kraken = chase_mod.ChaseManager(lambda *_: None)
         self.assertEqual(kraken.detect_orphans([{"cliOrdId": hc.chase_cloid(), "order_id": "5"}]), [])
 

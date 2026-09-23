@@ -1172,6 +1172,13 @@ test("Chase renders without a price field and sends explicit Hyperliquid values,
   globalThis.confirm = () => false;
   await store.getState().submitHyperliquidChase("buy", { size: 20, reduceOnly: false });
   assert.equal(posts.length, 3, "a declined live Chase sends nothing");
+
+  // An order found resting after a restart blocks new orders, so it must be visible and clearable.
+  store.getState().onChaseEvent({ id: "orphan-0x6368", exchange: "hyperliquid", symbol: SYMBOL, side: "buy",
+    size: 20, filled: 0, status: "orphaned", unknownReason: "exchange order exists without a live Chase worker" });
+  const orphaned = render();
+  assert.match(orphaned, /orphaned/);
+  assert.match(orphaned, /Mark checked/);
 });
 
 test("Stopping a Chase works even with the signed-trading gate off", async t => {

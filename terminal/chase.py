@@ -565,7 +565,8 @@ class ChaseWorker(threading.Thread):
 
 
 class ChaseManager:
-    def __init__(self, publish: Any, *, worker_factory: Any = None, orphan_prefix: str = "ch-") -> None:
+    def __init__(self, publish: Any, *, worker_factory: Any = None, orphan_prefix: str = "ch-",
+                 venue: str = "kraken") -> None:
         self._chases: dict[str, ChaseWorker] = {}
         self._orphans: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -573,6 +574,7 @@ class ChaseManager:
         # One manager per venue: the worker class and client-id prefix are venue specific.
         self._worker_factory = worker_factory or ChaseWorker
         self._orphan_prefix = orphan_prefix
+        self._venue = venue
 
     def start(self, spec: dict[str, Any], ctx: Any) -> dict[str, Any]:
         worker = self._worker_factory(spec, ctx, self._publish)
@@ -659,6 +661,7 @@ class ChaseManager:
                 remaining = float(order.get("unfilledSize") or order.get("size") or 0)
                 item = {
                     "id": f"orphan-{cli_id}",
+                    "exchange": self._venue,
                     "symbol": order.get("symbol"),
                     "side": order.get("side"),
                     "size": filled + remaining,

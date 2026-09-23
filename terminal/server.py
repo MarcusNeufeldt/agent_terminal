@@ -665,7 +665,7 @@ def _publish_hl_chase(kind: str, payload: dict[str, Any]) -> None:
 
 
 hl_chase_manager = chase_mod.ChaseManager(_publish_hl_chase, worker_factory=hyperliquid_chase.HyperliquidChaseWorker,
-                                          orphan_prefix=hyperliquid_chase.CLOID_PREFIX)
+                                          orphan_prefix=hyperliquid_chase.CLOID_PREFIX, venue="hyperliquid")
 binance_klines = binance_ws_mod.BinanceKlineStream(hub, sse.publish)
 binance_klines.start()
 
