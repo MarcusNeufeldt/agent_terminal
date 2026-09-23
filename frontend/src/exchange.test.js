@@ -66,7 +66,8 @@ test("Hyperliquid requests, UI, storage, and overlays stay separate from Kraken"
     dataStatus: { positions: { state: "current" }, orders: { state: "current" } },
     tickers: { HL_APT: { symbol: "HL_APT", last: .6, markPrice: .7 } },
   });
-  assert.ok(Math.abs(store.getState().totalUpnl() - .2) < 1e-12, "HL display PnL also uses actual last, not mark");
+  assert.ok(Math.abs(store.getState().totalUpnl() - (.2 - 0.00045 * 2 * .6)) < 1e-12,
+    "HL net PnL: actual last less the taker fee, never mark");
   store.getState().onTicker({ symbol: "PF_APTUSD", last: 999, exchange: "kraken" });
   assert.equal(store.getState().tickers.PF_APTUSD, undefined);
   const workingFetch = globalThis.fetch;

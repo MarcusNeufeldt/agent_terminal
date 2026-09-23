@@ -102,3 +102,33 @@ test("the modal shows screen value, book walk, fee and the real result, and neve
   assert.match(renderToStaticMarkup(React.createElement(ClosePreviewModal, { symbol: "PF_BCHUSD", onClose() {} })),
     /class="cp-confirm buy">Buy to close at market/);
 });
+
+test("size beyond the visible book is valued at the worst visible level, never left out", () => {
+  const p = closePreview({ position: { side: "long", size: 10, price: 100 }, book: { bids: [[102, 4], [101, 2]] }, feeRate: 0.001 });
+  assert.equal(p.unfilled, 4);
+  const walked = 4 * 2 + 2 * 1 - 0.001 * (4 * 102 + 2 * 101);
+  close(p.net, walked);
+  close(p.netFull, walked + 4 * (101 - 100) - 0.001 * 4 * 101);
+});
+
+test("discipline rules ratchet on net PnL under a fresh storage key", async t => {
+  const { createServer } = await import("vite");
+  const saved = new Map();
+  const original = globalThis.localStorage;
+  globalThis.localStorage = { getItem: k => saved.get(k) ?? null, setItem: (k, v) => saved.set(k, v) };
+  t.after(() => { globalThis.localStorage = original; });
+  const vite = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
+  t.after(() => vite.close());
+  const { default: store } = await vite.ssrLoadModule("/src/store.js");
+  const position = { symbol: "PF_BCHUSD", side: "long", size: 51.8, price: 341.18, unrealizedFunding: 0 };
+  store.setState({ exchange: "kraken", instruments: [{ symbol: "PF_BCHUSD", contractSize: 1 }], positions: [position],
+    dataStatus: { positions: { state: "current" } }, rulePeaks: {}, tickers: {},
+    books: { PF_BCHUSD: { bids: [[342.25, 10], [342.0, 30], [341.71, 40]], asks: [[342.5, 50]], at: Date.now() } } });
+  const netValue = store.getState().computeUpnl(position);
+  const expected = closePreview({ position, book: store.getState().books.PF_BCHUSD, feeRate: TAKER_FEE.kraken }).netFull;
+  close(netValue, expected);
+  store.getState().updateRulePeaks();
+  assert.equal(saved.has("kt.rulePeaks"), false, "gross-era peaks are not reused");
+  const peaks = JSON.parse(saved.get("kt.rulePeaks.net"));
+  close(Object.values(peaks)[0], netValue);
+});

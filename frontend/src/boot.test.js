@@ -38,17 +38,19 @@ test("boot owns one live feed and releases pollers/listeners on remount or inter
     loadChart: async () => {}, loadChatHistory: async () => {},
     refreshAccount: () => {}, refreshTables: () => {}, refreshFills: () => {},
     refreshSignal: () => {}, pollMarketList: () => {}, toast: () => {},
-    refreshStats: () => {},
+    refreshStats: () => {}, refreshPositionBooks: () => {},
   });
   for (let mount = 0; mount < 2; mount++) {
     const controller = new AbortController();
     await bootTerminal(controller.signal);
     assert.equal(sources.size, 1);
-    assert.equal(pollers.size, 10);
+    assert.equal(pollers.size, 11, "includes the position-book poller behind net PnL");
     assert.equal(listeners.size, 2);
     const source = [...sources][0];
     source.handlers.ticker({ data: JSON.stringify({ symbol, last: 110 + mount, markPrice: 150 }) });
-    assert.equal(store.getState().totalUpnl(), 20 + 2 * mount, "non-selected position gets streamed last price");
+    // Net of the Kraken taker fee at the streamed last price (no book in this fixture).
+    assert.ok(Math.abs(store.getState().totalUpnl() - (20 + 2 * mount - 0.0005 * 2 * (110 + mount))) < 1e-9,
+      "non-selected position gets streamed last price");
     controller.abort();
     assert.equal(sources.size, 0, "unmount must close the stream instead of leaving a stale subscription");
     assert.equal(pollers.size, 0);

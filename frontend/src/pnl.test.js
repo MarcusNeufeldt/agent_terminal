@@ -6,7 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 globalThis.localStorage = { getItem: () => null, setItem: () => {} };
 
-test("display PnL uses the exit side of the book, never mark or account PnL, without changing risk state", async t => {
+test("display PnL is net if closed: exit side of the book less the taker fee plus Kraken funding, never mark or account PnL", async t => {
   const vite = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
   t.after(() => vite.close());
   const oldFetch = globalThis.fetch;
@@ -29,17 +29,23 @@ test("display PnL uses the exit side of the book, never mark or account PnL, wit
     Object.assign(store.getInitialState(), store.getState());
     return renderToStaticMarkup(createElement(Component));
   };
-  const pnl = p => store.getState().computeUpnl(p);
+  // Price-basis checks read the gross value; totals and rendered cells are net.
+  const pnl = p => store.getState().computeUpnl(p, { mode: "gross" });
+  // Kraken net at a price with no book: gross - 5bp taker on the exit notional + unsettled funding.
+  const net = (gross, price, size = 2, funding = 3) => gross - 0.0005 * size * price + funding;
+  const near = (a, b, label) => assert.ok(Math.abs(a - b) < 1e-9, `${label}: ${a} != ${b}`);
   const total = () => store.getState().totalUpnl();
   assert.equal(pnl(position), 20);
   assert.equal(pnl({ ...position, side: "short" }), -20);
-  assert.equal(total(), 20);
+  near(total(), net(20, 110), "total is net");
+  near(store.getState().computeUpnl(position), 22.89, "net = 20 - 0.11 fee + 3 funding");
   const sidebar = render(Sidebar);
   const table = render(BottomTabs);
-  assert.ok(sidebar.includes("Unrealized PnL · exit"));
-  assert.ok(sidebar.includes(">+$20.00<"));
-  assert.ok(table.includes("Unrealized PnL · exit"));
-  assert.ok(table.includes(">+20.00<"));
+  assert.ok(sidebar.includes("Net if closed"));
+  assert.ok(sidebar.includes(">+$22.89<"));
+  assert.ok(table.includes("Net if closed"));
+  assert.ok(table.includes(">+22.89<"));
+  assert.ok(table.includes("→ +20.00 before depth and fees"), "the gross value stays in the tooltip");
   assert.ok(table.includes("Kraken last: 110"));
   assert.ok(table.includes(">Exit</th>"), "quote column is labelled by the basis it shows");
   assert.ok(table.includes('title="Mark for risk: 150">110</td>'), "quote column must match the PnL price basis");
@@ -69,13 +75,13 @@ test("display PnL uses the exit side of the book, never mark or account PnL, wit
   store.getState().onTicker({ symbol, last: 112, markPrice: 151 });
   store.getState().onTicker({ symbol: otherSymbol, last: 90, markPrice: 80 });
   assert.equal(notifications, 2, "both unselected position tickers notify React subscribers");
-  assert.equal(total(), 44);
-  assert.ok(render(Sidebar).includes(">+$44.00<"));
+  near(total(), net(24, 112) + net(20, 90), "both positions, net");
+  assert.ok(render(Sidebar).includes(">+$49.80<"));
   const updatedTable = render(BottomTabs);
   assert.ok(updatedTable.includes('title="Mark for risk: 151">112</td>'));
   assert.ok(updatedTable.includes('title="Mark for risk: 80">90</td>'));
-  assert.ok(updatedTable.includes(">+24.00<"));
-  assert.ok(updatedTable.includes(">+20.00<"));
+  assert.ok(updatedTable.includes(">+26.89<"));
+  assert.ok(updatedTable.includes(">+22.91<"));
   unsubscribe();
   store.setState({ positions: [position], instruments: [instrument] });
 
@@ -107,7 +113,7 @@ test("display PnL uses the exit side of the book, never mark or account PnL, wit
     tickers: { [symbol]: { symbol, last: 130, bid: 109, ask: 111, markPrice: 150 } } });
   assert.equal(pnl(position), 18,
     "a long is valued at the bid it would sell into, not the stale last (130) or mark (150)");
-  assert.equal(store.getState().computeUpnl({ ...position, side: "short" }), -22,
+  assert.equal(store.getState().computeUpnl({ ...position, side: "short" }, { mode: "gross" }), -22,
     "a short is valued at the ask it would buy back at");
   assert.equal(store.getState().computeUpnl(position, { mode: "mid" }), 20,
     "mid stays available for callers that explicitly want the untraded middle");

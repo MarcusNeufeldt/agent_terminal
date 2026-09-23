@@ -69,7 +69,9 @@ export async function bootTerminal(signal) {
   every(() => useStore.getState().refreshAccount(), 5000);
   every(() => useStore.getState().refreshTables(), 5000);
   every(() => s.readOnly ? useStore.getState().refreshFills() : useStore.getState().checkFills(), 5000);
-  if (s.readOnly) every(() => useStore.getState().refreshPositionBooks(), 5000);
+  // Position books drive net-if-closed PnL on both venues.
+  useStore.getState().refreshPositionBooks();
+  every(() => useStore.getState().refreshPositionBooks(), 2000);
   if (!s.readOnly) {
     every(() => useStore.getState().updateRulePeaks(), 5000);
     useStore.getState().refreshStats();

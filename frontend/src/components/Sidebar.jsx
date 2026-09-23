@@ -155,7 +155,7 @@ export default function Sidebar() {
         {readOnly && !unified && <div className="acct-row"><span className="k" title="Separate spot balance; perp orders need funds moved to perp">Spot USDC</span><span className="v">{Number.isFinite(spot) ? "$" + fmt(spot) : "–"}</span></div>}
         {!(readOnly && avail === null) && <div className="acct-row"><span className="k">{readOnly ? "Perp withdrawable" : "Avail margin"}</span><span className="v">{avail === null ? "–" : "$" + fmt(avail)}</span></div>}
         <div className="acct-row">
-          <span className="k" title={`${exchangeName} price each position closes into: the bid for a long, the ask for a short, excluding fees and funding. Without a book it uses the last trade, or the mark price once that trade is over a minute old.`}>Unrealized PnL · exit</span>
+          <span className="k" title={`What closing every position at market on ${exchangeName} would add right now: the order book walked for each full position, less the taker fee${exchangeName === "Kraken" ? ", plus funding settled on close" : ""}. Without a fresh book it uses the best bid/ask less the fee. Entry fees already paid are not included.`}>Net if closed</span>
           {totalUpnl === null
             ? <span className="v muted" title="Book PnL unavailable until valid position and quote data arrive">{fmt(null)}</span>
             : <span className={"v " + (totalUpnl >= 0 ? "up" : "down")}>{(totalUpnl >= 0 ? "+$" : "-$") + fmt(Math.abs(totalUpnl), 2)}</span>}

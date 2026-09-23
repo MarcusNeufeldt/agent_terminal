@@ -120,7 +120,7 @@ function PositionsTable() {
       {native && <caption className="muted">Stop snapshots only. Execution is not guaranteed; combined ladder coverage is not assessed.</caption>}
       <thead><tr>
         <th>Symbol</th><th>Side</th><th className="num">Size</th><th className="num">Entry</th>
-        <th className="num" title={`${exchangeName} price this position closes into: the bid for a long, the ask for a short. Falls back to the last trade only if the book is unavailable.`}>Exit</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`${exchangeName} price this position closes into, excluding fees and funding`}>Unrealized PnL · exit</th>
+        <th className="num" title={`${exchangeName} price this position closes into: the bid for a long, the ask for a short. Falls back to the last trade only if the book is unavailable.`}>Exit</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`What a market close on ${exchangeName} would add right now: book walked for the full size, less the taker fee${readOnly ? "" : ", plus funding settled on close"}`}>Net if closed</th>
         <th className="num">{readOnly ? "Cum funding" : "Funding"}</th><th>Liq Δ</th>{native && <th>Stop observation</th>}<th></th>
       </tr></thead>
       <tbody>
@@ -132,6 +132,7 @@ function PositionsTable() {
           const displayQuote = Number.isFinite(quote) && quote > 0 ? quote : null;
           const staleLast = isLastStale(t);
           const pnl = computeUpnl(p);
+          const gross = computeUpnl(p, { mode: "gross" });
           const protection = native ? hyperliquidProtection(p, orders, status?.state, orderState) : null;
           return (
             <tr key={p.symbol}>
@@ -143,7 +144,7 @@ function PositionsTable() {
               <td className="num" style={{ color: "var(--warn)" }}>{p.liqPriceEstimate ? fmt(p.liqPriceEstimate) : "–"}</td>
               <td className={"num " + (pnl === null ? "muted" : pnl >= 0 ? "up" : "down")}
                 title={pnl === null ? "Book PnL unavailable"
-                  : `${readOnly ? "Hyperliquid" : "Kraken"} ${basis}: ${fmt(quote)} · last: ${fmt(t?.last)}${staleLast ? " (stale, outside book)" : ""} · mark: ${fmt(t?.markPrice)}`}>{pnl !== null && pnl >= 0 ? "+" : ""}{fmt(pnl, 2)}</td>
+                  : `${exchangeName} ${basis}: ${fmt(quote)} → ${gross === null ? "–" : (gross >= 0 ? "+" : "") + fmt(gross, 2)} before depth and fees · last: ${fmt(t?.last)}${staleLast ? " (stale, outside book)" : ""} · mark: ${fmt(t?.markPrice)}`}>{pnl !== null && pnl >= 0 ? "+" : ""}{fmt(pnl, 2)}</td>
               <td className="num">{fmt(readOnly ? p.fundingSinceOpen : p.unrealizedFunding, 4)}</td>
               <LiqDistCell liq={p.liqPriceEstimate} mark={t && t.markPrice} atr={p.atr14d} />
               {protection && <td title={protection.detail} className={protection.state === "missing" ? "down" : "muted"}>

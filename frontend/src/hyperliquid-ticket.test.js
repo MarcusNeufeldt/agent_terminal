@@ -1029,30 +1029,49 @@ test("Market orders sized in contracts still carry a USD ceiling and show it bef
   assert.match(prompts.at(-1), /\$12\.06/, "the dollar ceiling is shown alongside it");
 });
 
-test("Open Hyperliquid positions get their own book, so PnL is never valued off a quiet tape", async t => {
-  const { store, reads } = await harness(t, resting);
-  store.setState({ readOnly: true, symbol: SYMBOL, positions: [
-    { symbol: SYMBOL, side: "long", size: 1, sizeExact: "1" },
-    { symbol: "HL_CHIP", side: "long", size: 1598, sizeExact: "1598" },
-    { symbol: "HL_CHIP", side: "long", size: 1598, sizeExact: "1598" },
-    { error: "positions unavailable" },
-  ] });
+test("Every open position gets its full book, so PnL is what a market close really returns", async t => {
+  const book = { bids: [[0.6, 1], [0.59, 1000]], asks: [[0.61, 1000]] };
+  const { store, reads } = await harness(t, resting, url => url.includes("/api/orderbook")
+    ? { state: "current", exchange: "hyperliquid", orderBook: book, time: Date.now() }
+    : { state: "current", orders: [], positions: [], items: [] });
+  store.setState({ readOnly: true, exchange: "hyperliquid", symbol: SYMBOL, books: {},
+    tickers: { HL_CHIP: { symbol: "HL_CHIP", bid: 0.6, ask: 0.61 } },
+    instruments: [{ symbol: SYMBOL, contractValueTradePrecision: 2 }, { symbol: "HL_CHIP", contractValueTradePrecision: 0 }],
+    positions: [
+      { symbol: SYMBOL, side: "long", size: 1, sizeExact: "1", price: 0.5 },
+      { symbol: "HL_CHIP", side: "long", size: 1598, sizeExact: "1598", price: 0.5 },
+      { symbol: "HL_CHIP", side: "long", size: 1598, sizeExact: "1598", price: 0.5 },
+      { error: "positions unavailable" },
+    ] });
   reads.length = 0;
   await store.getState().refreshPositionBooks();
-  assert.equal(reads.length, 1, "the selected symbol is already polled, and duplicates collapse");
-  assert.match(reads[0], /\/api\/orderbook\?symbol=HL_CHIP/);
+  assert.deepEqual(reads.map(url => url.match(/symbol=([A-Z_]+)/)[1]), ["HL_CHIP", SYMBOL],
+    "largest position first, the selected symbol included, duplicates collapsed");
+  assert.ok(store.getState().books.HL_CHIP.at > 0);
 
-  // A failing book must not break the poller for the rest of the positions.
+  // 1598 CHIP walks past the 1-contract best bid; the net shows it and pays the fee.
+  const chip = store.getState().positions[1];
+  const net = store.getState().computeUpnl(chip);
+  const expected = 1 * (0.6 - 0.5) + 1597 * (0.59 - 0.5) - 0.00045 * (0.6 + 1597 * 0.59);
+  assert.ok(Math.abs(net - expected) < 1e-9, `${net} != ${expected}`);
+  assert.ok(net < store.getState().computeUpnl(chip, { mode: "gross" }), "net is below the best-bid value");
+
+  // A failing read keeps the last book; a stale book falls back to best bid less the fee.
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => { throw new Error("book unavailable"); };
   await store.getState().refreshPositionBooks();
   globalThis.fetch = originalFetch;
+  assert.ok(store.getState().books.HL_CHIP, "a failed read does not erase the last book");
+  store.setState({ books: { HL_CHIP: { ...book, at: Date.now() - 60000 } } });
+  const fallback = store.getState().computeUpnl(chip);
+  assert.ok(Math.abs(fallback - (1598 * 0.1 - 0.00045 * 1598 * 0.6)) < 1e-9, "stale book: best bid less the fee");
 
-  // Kraken populates bid/ask on its own tickers, so it does not pay for this.
-  store.setState({ readOnly: false });
+  // Kraken now pays for books too: its tickers carry only the best price.
+  store.setState({ readOnly: false, exchange: "kraken", positions: [{ symbol: "PF_APTUSD", side: "long", size: 3, price: 1 }] });
   reads.length = 0;
   await store.getState().refreshPositionBooks();
-  assert.deepEqual(reads, []);
+  assert.deepEqual(reads.map(url => url.match(/symbol=([A-Z_]+)/)[1]), ["PF_APTUSD"]);
+  assert.deepEqual(Object.keys(store.getState().books), ["PF_APTUSD"], "books for closed positions are dropped");
 });
 
 const gridOk = () => ({

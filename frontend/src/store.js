@@ -9,6 +9,7 @@ import { buildProtectionAction } from "./protection-action";
 import { buildChartOverlays } from "./chart-overlays";
 import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { valuationPrice } from "./pricing.js";
+import { closePreview, TAKER_FEE } from "./close-preview.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
@@ -16,6 +17,33 @@ let chart = null; // chart controller (set by ChartPanel on mount)
 let audioCtx = null;
 let lastFillSig = null;
 const chartCancelPending = new Set();
+
+const PEAKS_KEY = "kt.rulePeaks.net";
+const MAX_POSITION_BOOKS = 8;
+const BOOK_STALE_MS = 15000;
+
+// Net value of closing `p` at market now. Walks the stored book when it is fresh;
+// otherwise the best bid/ask less the taker fee, which ignores depth but not cost.
+function netIfClosed(s, p, inst) {
+  const side = String(p.side).toLowerCase();
+  const size = Number(p.size), entry = Number(p.price), mult = Number(inst.contractSize ?? 1);
+  if (!["long", "short"].includes(side) || ![size, entry, mult].every(v => Number.isFinite(v) && v > 0)) return null;
+  const feeRate = TAKER_FEE[s.exchange] ?? TAKER_FEE.kraken;
+  // Kraken settles accrued funding into realized PnL on close; Hyperliquid pays it hourly.
+  const funding = s.exchange === "kraken" && Number.isFinite(Number(p.unrealizedFunding)) ? Number(p.unrealizedFunding) : 0;
+  const inverse = inst.type === "futures_inverse";
+  const book = s.books?.[p.symbol];
+  if (!inverse && book && Date.now() - book.at < BOOK_STALE_MS) {
+    const preview = closePreview({ position: p, book, contractSize: mult, feeRate, funding });
+    if (preview && Number.isFinite(preview.netFull)) return preview.netFull;
+  }
+  const { price } = valuationPrice(s.tickers[p.symbol], { mode: "exit", side });
+  if (!(Number.isFinite(price) && price > 0)) return null;
+  const dir = side === "short" ? -1 : 1;
+  if (inverse) return dir * size * mult * (1 / entry - 1 / price);
+  const net = dir * size * mult * (price - entry) - feeRate * size * mult * price + funding;
+  return Number.isFinite(net) ? net : null;
+}
 
 const useStore = create((set, get) => ({
   // ---- state ----
@@ -59,6 +87,9 @@ const useStore = create((set, get) => ({
   prevPrice: null,
   account: {},
   positions: [],
+  // Full order books for open positions: {symbol: {bids, asks, at}}. They value a
+  // position at what a market close would really return, not at the best price.
+  books: {},
   orders: [],
   dataStatus: {},
   ticketBusy: false,
@@ -72,7 +103,9 @@ const useStore = create((set, get) => ({
   statsState: "loading",
   rulePeaks: (() => {
     try {
-      const stored = JSON.parse(localStorage.getItem("kt.rulePeaks") || "{}");
+      // Net peaks. The old "kt.rulePeaks" held gross values that net PnL can never
+      // reach, which would read as an instant give-back on every open position.
+      const stored = JSON.parse(localStorage.getItem(PEAKS_KEY) || "{}");
       return stored && typeof stored === "object" ? stored : {};
     } catch { return {}; }
   })(),
@@ -522,17 +555,21 @@ const useStore = create((set, get) => ({
   // One basis everywhere: the side of the book this position closes into, so the
   // number on screen is what closing right now would actually realise. "mid" stays
   // available for callers that want the untraded middle.
-  computeUpnl(p, { mode = "exit" } = {}) {
+  // Default "net": what closing at market right now would add to the balance. The
+  // book is walked for the full size, the taker fee is paid, and Kraken's unsettled
+  // funding is realized. "gross" is the old best-bid/ask value, "mid" the book middle.
+  computeUpnl(p, { mode = "net" } = {}) {
     const s = get();
     if (!p?.symbol || p.error) return null;
     const inst = s.instruments.find(i => i.symbol === p.symbol);
     if (!inst) return null;
+    if (mode === "net") return netIfClosed(s, p, inst);
     const side = String(p.side).toLowerCase();
     // Value against the live book, not the tape. On thin pairs the last trade
     // drifts outside the bid/ask and invents PnL that could never be realised;
     // the book keeps updating even when nothing trades. Falls back to last only
     // when the book is unusable, never to mark, which is not a tradeable price.
-    const { price } = valuationPrice(s.tickers[p.symbol], { mode, side });
+    const { price } = valuationPrice(s.tickers[p.symbol], { mode: mode === "gross" ? "exit" : mode, side });
     const mult = Number(inst.contractSize ?? 1);
     const size = Number(p.size), entry = Number(p.price);
     if (![price, mult, size, entry].every(v => Number.isFinite(v) && v > 0)
@@ -601,7 +638,7 @@ const useStore = create((set, get) => ({
       .map(p => ({ key: peakKey(p), upnl: s.computeUpnl(p) }));
     const peaks = nextPeaks(s.rulePeaks, entries);
     set({ rulePeaks: peaks });
-    try { localStorage.setItem("kt.rulePeaks", JSON.stringify(peaks)); } catch { /* private mode or quota */ }
+    try { localStorage.setItem(PEAKS_KEY, JSON.stringify(peaks)); } catch { /* private mode or quota */ }
   },
 
   // Realized ledger lines drive the post-loss cooldown. The ledger is tens of
@@ -647,14 +684,26 @@ const useStore = create((set, get) => ({
   // last trade that can be minutes old on a thin coin. Fetching the book publishes a
   // ticker over SSE, which keeps the exit price a real one. The selected symbol is
   // already polled by the order book component.
+  // Books for the largest open positions, both venues. A failed read keeps the last
+  // book; netIfClosed stops using it once it is stale.
   async refreshPositionBooks() {
     const s = get();
-    if (!s.readOnly) return;
-    const symbols = [...new Set(s.positions
-      .filter(p => p && !p.error && typeof p.symbol === "string" && p.symbol && p.symbol !== s.symbol)
-      .map(p => p.symbol))].slice(0, 8);
-    await Promise.all(symbols.map(symbol =>
-      api(`/api/orderbook?symbol=${encodeURIComponent(symbol)}`).catch(() => {})));
+    const ranked = s.positions
+      .filter(p => p && !p.error && typeof p.symbol === "string" && p.symbol)
+      .map(p => ({ symbol: p.symbol, notional: Math.abs(Number(p.size) * Number(p.price)) || 0 }))
+      .sort((a, b) => b.notional - a.notional);
+    const symbols = [...new Set(ranked.map(r => r.symbol))].slice(0, MAX_POSITION_BOOKS);
+    const fetched = await Promise.all(symbols.map(symbol =>
+      api(`/api/orderbook?symbol=${encodeURIComponent(symbol)}`)
+        .then(r => (r?.orderBook ? [symbol, { bids: r.orderBook.bids, asks: r.orderBook.asks, at: Date.now() }] : null))
+        .catch(() => null)));
+    const fresh = fetched.filter(Boolean);
+    if (!fresh.length) return;
+    const open = new Set(ranked.map(r => r.symbol));
+    set(state => ({ books: Object.fromEntries([
+      ...Object.entries(state.books).filter(([symbol]) => open.has(symbol)),
+      ...fresh,
+    ]) }));
   },
 
   // ---- orders ----

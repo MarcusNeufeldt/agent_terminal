@@ -55,6 +55,14 @@ export function closePreview({ position, book, contractSize = 1, inverse = false
   const bookWalkCost = dir * walk.filled * mult * (best - walk.avgPrice);
   const exitFee = feeRate * walk.filled * mult * walk.avgPrice;
   const fund = Number.isFinite(Number(funding)) ? Number(funding) : 0;
+  const net = pnlWalked - exitFee + fund;
+  // Whole-position value for display: size beyond the visible book is priced at the
+  // worst visible level, so the figure can be too kind only if the book is thinner
+  // past the snapshot, never because size was left out.
+  const rest = walk.unfilled;
+  const netFull = rest > 1e-12 && walk.worstPrice
+    ? net + dir * rest * mult * (walk.worstPrice - entry) - feeRate * rest * mult * walk.worstPrice
+    : net;
   return {
     side, qty, entry, best, limit,
     avgPrice: walk.avgPrice, worstPrice: walk.worstPrice, levelsUsed: walk.levelsUsed, levels: levels.length,
@@ -62,6 +70,6 @@ export function closePreview({ position, book, contractSize = 1, inverse = false
     // Why part would not fill: the IOC price bound, or the end of the book snapshot.
     unfilledReason: walk.unfilled > 1e-12 ? (walk.stoppedByLimit ? "bound" : "depth") : null,
     pnlAtBest, pnlWalked, bookWalkCost, exitFee, funding: fund,
-    net: pnlWalked - exitFee + fund,
+    net, netFull,
   };
 }
