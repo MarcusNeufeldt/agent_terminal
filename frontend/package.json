@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/api.test.js src/flatten.test.js src/grid.test.js src/pricing.test.js src/risk-preview.test.js src/rules.test.js src/stats.test.js src/size-precision.test.js src/protection-action.test.js src/chart-overlays.test.js src/vela-provider.test.js src/vela-overlays.test.js src/vite-config.test.js src/alt-btc.test.js src/pnl.test.js src/boot.test.js src/exchange.test.js src/hyperliquid-ticket.test.js src/hyperliquid-protection.test.js",
+    "test": "node --test src/api.test.js src/flatten.test.js src/grid.test.js src/pricing.test.js src/risk-preview.test.js src/rules.test.js src/stats.test.js src/close-preview.test.js src/size-precision.test.js src/protection-action.test.js src/chart-overlays.test.js src/vela-provider.test.js src/vela-overlays.test.js src/vite-config.test.js src/alt-btc.test.js src/pnl.test.js src/boot.test.js src/exchange.test.js src/hyperliquid-ticket.test.js src/hyperliquid-protection.test.js",
     "lint": "oxlint",
     "preview": "vite preview"
   },

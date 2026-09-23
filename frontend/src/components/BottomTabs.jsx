@@ -1,7 +1,9 @@
+import { useState } from "react";
 import { fmt } from "../api";
 import useStore from "../store";
 import { hyperliquidProtection } from "../hyperliquid-protection";
 import { isLastStale, valuationPrice } from "../pricing.js";
+import ClosePreviewModal from "./ClosePreviewModal";
 
 export default function BottomTabs() {
   const tab = useStore(s => s.tab);
@@ -106,12 +108,14 @@ function PositionsTable() {
   const computeUpnl = useStore(s => s.computeUpnl);
   const openGrid = useStore(s => s.openGrid);
   const ticketBusy = useStore(s => s.ticketBusy);
-  const closePosition = useStore(s => s.closePosition);
   const flattenAll = useStore(s => s.flattenAll);
   const bulkBusy = useStore(s => s.bulkBusy);
   const selectSymbol = useStore(s => s.selectSymbol);
+  // Close opens a live preview of what a market close returns; the close itself runs from there.
+  const [previewSymbol, setPreviewSymbol] = useState(null);
   if (!positions.length) return <div className="empty">{status?.state === "current" ? "No open positions" : status?.error || "Position data unavailable"}</div>;
   return (
+    <>
     <table className="data">
       {native && <caption className="muted">Stop snapshots only. Execution is not guaranteed; combined ladder coverage is not assessed.</caption>}
       <thead><tr>
@@ -147,7 +151,7 @@ function PositionsTable() {
               </td>}
               <td className="num">
                 <button className="row-btn sell" disabled={bulkBusy || (readOnly && (!canTrade || ticketBusy || status?.state !== "current"))}
-                  onClick={() => closePosition(p.symbol)}>Close</button>{" "}
+                  onClick={() => setPreviewSymbol(p.symbol)}>Close</button>{" "}
                 <button className="row-btn" disabled={bulkBusy || readOnly}
                   title={`Soft close ${p.symbol} with a reduce-only Chase`}
                   aria-label={`Soft close ${p.symbol} with a reduce-only Chase`}
@@ -161,6 +165,8 @@ function PositionsTable() {
         })}
       </tbody>
     </table>
+    {previewSymbol && <ClosePreviewModal symbol={previewSymbol} onClose={() => setPreviewSymbol(null)} />}
+    </>
   );
 }
 
