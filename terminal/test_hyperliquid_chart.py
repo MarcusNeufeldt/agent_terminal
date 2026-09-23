@@ -34,6 +34,9 @@ class Backend:
     def orders(self, *, fresh=False):
         assert fresh
         return {'orders': deepcopy(self.open)}
+    def quote(self, symbol):
+        return self.orderbook(symbol, fresh=True)
+
     def orderbook(self, symbol, *, fresh=False):
         assert fresh
         return {'time': int(time.time()*1000), 'orderBook': {'bids': [[0.99, 100]], 'asks': [[1.01, 100]]}}

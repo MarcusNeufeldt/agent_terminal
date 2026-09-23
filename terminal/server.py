@@ -310,7 +310,7 @@ def hyperliquid_order_action(body: dict[str, Any]) -> dict[str, Any]:
         if body.get("limitPrice") is not None:
             raise hyperliquid_trading.HyperliquidError("Market price is derived from fresh quotes, not a supplied limit")
         return hyperliquid_trading.market_action_for(instrument, side, size,
-            hyperliquid.orderbook(symbol, fresh=True), body.get("slippagePercent", 0.5),
+            hyperliquid.quote(symbol), body.get("slippagePercent", 0.5),
             cloid=body.get("cloid"), reduce_only=reduce_only, maximum=body.get("maxNotional"))
     price = _as_float(body.get("limitPrice"))
     if price is None or price <= 0:

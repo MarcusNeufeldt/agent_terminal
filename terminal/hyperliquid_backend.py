@@ -15,8 +15,11 @@ from hyperliquid_fills import decimal_text
 READ_ONLY_MESSAGE = "Hyperliquid is read-only. Signed trading, Grid, Chase, and AI execution are not enabled."
 
 
-# A streamed book older than this is not used for an order's price bound.
+# A streamed book received longer ago than this is not used for an order's price bound.
 STREAM_BOOK_MAX_AGE = 1.5
+# The exchange stamp only guards against a frozen upstream. It is compared with the
+# local clock, which can run a second or more off, so its window is wider.
+STREAM_STAMP_TOLERANCE_MS = 5000
 
 class HyperliquidBackend:
     def __init__(self, publish, *, client=None, account_address=None, network=None, enable_feed=True):
@@ -28,6 +31,7 @@ class HyperliquidBackend:
         self._markets = None
         self._tickers = {}
         self._books = {}  # coin -> (monotonic receipt, parsed book) from the l2Book stream
+        self._bbo = {}    # coin -> (monotonic receipt, top-of-book) from the bbo stream
         self._coins = {}
         self._watch = set()
         self._config_error = None
@@ -201,9 +205,26 @@ class HyperliquidBackend:
             entry = self._books.get(coin)
         if not entry or time.monotonic() - entry[0] > max_age:
             return None
-        if abs(time.time() * 1000 - entry[1]["time"]) > max_age * 1000 + 1000:
+        if abs(time.time() * 1000 - entry[1]["time"]) > STREAM_STAMP_TOLERANCE_MS:
             return None
         return deepcopy(entry[1])
+
+    def quote(self, symbol):
+        """Best bid and ask for pricing a market order or a Chase peg: the live bbo
+        stream when fresh, otherwise a fresh full book. Book-shaped, top level only."""
+        coin = self.coin(symbol)
+        if self.feed:
+            try:
+                self.watch([symbol])
+            except ValueError:
+                pass
+        with self._state_lock:
+            entry = self._bbo.get(coin)
+        if (entry and time.monotonic() - entry[0] <= STREAM_BOOK_MAX_AGE
+                and abs(time.time() * 1000 - entry[1]["time"]) <= STREAM_STAMP_TOLERANCE_MS):
+            top = entry[1]
+            return {"orderBook": {"bids": [top["bid"]], "asks": [top["ask"]]}, "time": top["time"], "source": "bbo"}
+        return self.orderbook(symbol, fresh=True)
 
     def orderbook(self, symbol, *, fresh=False):
         coin = self.coin(symbol)
@@ -540,6 +561,21 @@ class HyperliquidBackend:
                 with self._state_lock:
                     self._books[data["coin"]] = (time.monotonic(), book)
                 self._publish_quote(self._coins[data["coin"]], book)
+            elif channel == "bbo" and isinstance(data, dict) and data.get("coin") in self._coins:
+                levels = data.get("bbo")
+                if not isinstance(levels, list) or len(levels) != 2 or not all(isinstance(l, dict) for l in levels):
+                    return  # one side empty: keep the last quote, the stale check retires it
+                try:
+                    bid = (number(levels[0].get("px"), positive=True), number(levels[0].get("sz"), minimum=0))
+                    ask = (number(levels[1].get("px"), positive=True), number(levels[1].get("sz"), minimum=0))
+                    stamp = number(data.get("time"), positive=True)
+                except HyperliquidError:
+                    return
+                if not bid[0] < ask[0]:
+                    return
+                with self._state_lock:
+                    self._bbo[data["coin"]] = (time.monotonic(), {"bid": bid, "ask": ask, "time": stamp})
+                self._publish_quote(self._coins[data["coin"]], {"orderBook": {"bids": [bid], "asks": [ask]}})
             elif channel == "candle":
                 for row in rows(data if isinstance(data, list) else [data]):
                     coin = row.get("s")

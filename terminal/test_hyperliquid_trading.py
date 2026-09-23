@@ -570,7 +570,7 @@ class WriteDecisionTests(unittest.TestCase):
                 self.write("/api/order", {**body, "side": side, "limitPrice": price})
 
     def test_market_close_reuses_quote_bound_and_checks_arm_and_exact_snapshot(self):
-        self.ns['hyperliquid'].orderbook = Mock(return_value={'time': int(time.time()*1000),
+        self.ns['hyperliquid'].quote = Mock(return_value={'time': int(time.time()*1000),
             'orderBook': {'bids': [[0.59, 100]], 'asks': [[0.61, 100]]}})
         position = {'side': 'short', 'sizeExact': '2', 'price': 0.8}
         body = self.order(orderType='mkt', limitPrice=None, size=2, reduceOnly=True, closePosition=True,
@@ -737,7 +737,7 @@ class WriteDecisionTests(unittest.TestCase):
 
     def test_market_buy_sell_use_fresh_quotes_and_conservative_bounds(self):
         book = {"time": time.time() * 1000, "orderBook": {"bids": [[0.63, 10]], "asks": [[0.6345, 10]]}}
-        self.ns["hyperliquid"].orderbook = Mock(return_value=book)
+        self.ns["hyperliquid"].quote = Mock(return_value=book)
         for side, quote in (("buy", "0.6345"), ("sell", "0.63")):
             body = self.order(orderType="mkt", side=side, limitPrice=None, slippagePercent=0.5,
                               maxNotional="1", cloid="0x" + "a" * 32)
@@ -749,7 +749,7 @@ class WriteDecisionTests(unittest.TestCase):
             self.assertEqual(wire["t"], {"limit": {"tif": "Ioc"}})
             self.assertEqual(wire["c"], body["cloid"])
             self.assertEqual(self.trader.calls, [])
-        self.ns["hyperliquid"].orderbook.assert_called_with("HL_APT", fresh=True)
+        self.ns["hyperliquid"].quote.assert_called_with("HL_APT")
         self.ns["armed"] = True
         live = self.write("/api/order", body)
         self.assertEqual(live["action"], preview["action"])
@@ -757,7 +757,7 @@ class WriteDecisionTests(unittest.TestCase):
 
     def test_market_rejects_bad_slippage_stale_or_missing_quotes_and_manual_price(self):
         book = {"time": time.time() * 1000, "orderBook": {"bids": [[0.63, 10]], "asks": [[0.64, 10]]}}
-        self.ns["hyperliquid"].orderbook = Mock(return_value=book)
+        self.ns["hyperliquid"].quote = Mock(return_value=book)
         for slip in (True, 0, -1, 6, "bad", float("nan")):
             with self.assertRaises(HyperliquidError):
                 self.write("/api/order", self.order(orderType="mkt", limitPrice=None, slippagePercent=slip))
@@ -765,7 +765,7 @@ class WriteDecisionTests(unittest.TestCase):
             self.write("/api/order", self.order(orderType="mkt"))
         for bad in ({}, {**book, "time": 1}, {**book, "orderBook": {"bids": [], "asks": []}},
                     {**book, "orderBook": {"bids": [[1, 1]], "asks": [[0.5, 1]]}}):
-            self.ns["hyperliquid"].orderbook.return_value = bad
+            self.ns["hyperliquid"].quote.return_value = bad
             with self.assertRaises(HyperliquidError):
                 self.write("/api/order", self.order(orderType="mkt", limitPrice=None))
         self.assertEqual(self.trader.calls, [])

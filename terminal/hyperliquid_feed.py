@@ -62,9 +62,11 @@ class HyperliquidFeed:
                     now = time.monotonic()
                     with self._lock:
                         coins = {coin for coin, seen in self._watch.items() if now - seen < 300}
-                    # l2Book streams the order book, so orders and net PnL read a live quote
-                    # instead of fetching the book over REST first.
-                    wanted = {(kind, coin) for coin in coins for kind in ("trades", "activeAssetCtx", "candle", "l2Book")}
+                    # bbo pushes every best bid/ask change (several a second), so market orders
+                    # price off a live quote instead of a REST fetch. l2Book carries depth but
+                    # is pushed only every few seconds.
+                    wanted = {(kind, coin) for coin in coins
+                              for kind in ("trades", "activeAssetCtx", "candle", "l2Book", "bbo")}
                     for method, targets in (("unsubscribe", subscribed - wanted), ("subscribe", wanted - subscribed)):
                         for kind, coin in sorted(targets):
                             subscription = {"type": kind, "coin": coin}

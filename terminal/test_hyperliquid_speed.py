@@ -140,3 +140,40 @@ class StreamedBookTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BboQuoteTests(StreamedBookTests):
+    """Market orders price off the bbo stream: several pushes a second, top of book."""
+
+    def bbo(self, bid, ask, *, stamp=None, sides=None):
+        levels = sides if sides is not None else [{"px": str(bid), "sz": "2", "n": 1}, {"px": str(ask), "sz": "3", "n": 1}]
+        self.backend.on_message({"channel": "bbo", "data": {"coin": "APT", "time": stamp or time.time() * 1000,
+                                                            "bbo": levels}})
+
+    def test_a_live_bbo_prices_the_order_without_any_rest_call(self):
+        self.bbo(0.6, 0.62)
+        quote = self.backend.quote("HL_APT")
+        self.assertEqual(quote["orderBook"], {"bids": [(0.6, 2.0)], "asks": [(0.62, 3.0)]})
+        self.assertEqual(quote["source"], "bbo")
+        self.assertEqual(self.info_calls, [])
+
+    def test_a_stale_or_skewed_bbo_falls_back_to_a_fresh_book(self):
+        self.bbo(0.6, 0.62)
+        coin, (received, top) = next(iter(self.backend._bbo.items()))
+        self.backend._bbo[coin] = (received - 2.0, top)
+        self.assertEqual(self.backend.quote("HL_APT")["orderBook"]["bids"][0], (0.59, 10.0))
+        self.assertEqual(self.info_calls, ["l2Book"])
+        self.bbo(0.6, 0.62, stamp=time.time() * 1000 - 6000)
+        self.backend.quote("HL_APT")
+        self.assertEqual(self.info_calls, ["l2Book", "l2Book"], "a frozen upstream is not trusted")
+
+    def test_a_clock_a_second_off_still_uses_the_stream(self):
+        self.bbo(0.6, 0.62, stamp=time.time() * 1000 - 1300)  # this PC runs ~1.2 s ahead of Hyperliquid
+        self.assertEqual(self.backend.quote("HL_APT")["source"], "bbo")
+
+    def test_one_sided_or_crossed_bbo_frames_are_skipped_quietly(self):
+        self.bbo(0.6, 0.62)
+        self.bbo(0, 0, sides=[None, {"px": "0.63", "sz": "1", "n": 1}])
+        self.bbo(0.7, 0.65)
+        self.assertEqual(self.backend.quote("HL_APT")["orderBook"]["bids"], [(0.6, 2.0)])
+        self.assertNotIn("status", [kind for kind, _ in self.published])

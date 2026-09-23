@@ -87,7 +87,7 @@ def _peg(book: dict[str, Any], side: str) -> Decimal:
 def preview(spec: dict[str, Any], backend) -> dict[str, Any]:
     """The first post-only order a live Chase would place, for DISARMED review."""
     instrument = _instrument(backend, spec["symbol"])
-    price = _peg(backend.orderbook(spec["symbol"], fresh=True), spec["side"])
+    price = _peg(backend.quote(spec["symbol"]), spec["side"])
     action = order_action_for(instrument, spec["side"], spec["size"], price, tif="alo",
                               reduce_only=spec["reduceOnly"], cloid=chase_cloid())
     return {"action": action, "spec": spec}
@@ -230,7 +230,7 @@ class HyperliquidChaseWorker(ChaseWorker):
             return
         try:
             self.ctx.verify_signer()
-            book = self.ctx.backend.orderbook(self.spec["symbol"], fresh=True)
+            book = self.ctx.backend.quote(self.spec["symbol"])
             action = market_action_for(self._instrument_row, self.spec["side"], quantity, book, MARKET_FINISH_SLIPPAGE,
                                        cloid=chase_cloid(), reduce_only=True)
         except HyperliquidError as exc:
@@ -317,7 +317,7 @@ class HyperliquidChaseWorker(ChaseWorker):
                 if self._base >= self._size_total:
                     self._finish("filled", "full size filled")
                     break
-                price = _peg(self.ctx.backend.orderbook(self.spec["symbol"], fresh=True), self.spec["side"])
+                price = _peg(self.ctx.backend.quote(self.spec["symbol"]), self.spec["side"])
                 if self._active and price == self._active["price"]:
                     self._wait(repeg_sec)
                     continue

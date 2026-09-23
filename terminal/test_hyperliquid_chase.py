@@ -18,6 +18,9 @@ class FakeBackend:
     def markets(self):
         return {SYMBOL: {"instrument": {"assetId": 1, "contractValueTradePrecision": 3, "tradeable": True}}}
 
+    def quote(self, symbol):
+        return self.orderbook(symbol, fresh=True)
+
     def orderbook(self, symbol, fresh=False):
         bid, ask = self.books.pop(0) if len(self.books) > 1 else self.books[0]
         return {"orderBook": {"bids": [(bid, 5.0)], "asks": [(ask, 5.0)]}, "time": time.time() * 1000}
