@@ -65,6 +65,7 @@ class ExchangeRoutingTests(unittest.TestCase):
                    "sse": Mock(), "hyperliquid_sse": Mock(), "hyperliquid": self.hl, "chase_manager": self.chases,
                    "hl_chase_manager": self.hl_chases, "hyperliquid_chase_start": self.chase_start,
                    "_hl_chase_unresolved": self.chase_unresolved,
+                   "hyperliquid_prefetch": lambda path, body: {},
                    "get_account": self.account, "_account_payload": account_payload,
                    "hyperliquid_write": self.hl_write, "hyperliquid_trading": hyperliquid_trading,
                    "hyperliquid_order_action": Mock(return_value={"type": "order", "orders": []}),
@@ -246,7 +247,7 @@ class ExchangeRoutingTests(unittest.TestCase):
         status, _ = self.request("/api/chart-order?exchange=hyperliquid", body, 0)
         self.assertEqual(status, 409)
         prepare.assert_not_called()
-        def dispatch(path, received, *, prepared_action):
+        def dispatch(path, received, *, prepared_action, prefetched=None):
             self.db.prepare_hyperliquid_order.assert_called_once_with(body["requestId"], prepared)
             self.assertEqual(path, "/api/chart-order")
             return {"type": "batchModify", "action": prepared_action["action"], "outcome": "simulated", "live": False}
@@ -260,7 +261,7 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.switch("hyperliquid")
         body = {"symbol": "HL_APT", "leverage": 5, "expectedLeverage": 3, "cross": True,
                 "expectedArmed": False, "requestId": "leverage-fixture"}
-        def dispatch(path, received, *, prepared_action):
+        def dispatch(path, received, *, prepared_action, prefetched=None):
             self.db.prepare_hyperliquid_order.assert_called_once_with(body["requestId"], prepared_action)
             self.assertEqual(path, "/api/leverage")
             return {"exchange": "hyperliquid", "type": "updateLeverage", "outcome": "simulated",
@@ -281,7 +282,7 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.ns["hyperliquid_grid"] = Mock()
         self.ns["hyperliquid_grid"].prepare.return_value = prepared
 
-        def dispatch(path, received, *, prepared_action):
+        def dispatch(path, received, *, prepared_action, prefetched=None):
             # The exact signed batch must be journalled before anything is sent.
             self.db.prepare_hyperliquid_order.assert_called_once_with(body["requestId"], prepared)
             self.assertEqual(path, "/api/grid")

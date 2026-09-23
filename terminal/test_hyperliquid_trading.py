@@ -481,10 +481,18 @@ def server_write_helpers():
     """Extract the venue write helpers from server.py without importing it (it starts threads)."""
     source = ast.parse(Path(__file__).with_name("server.py").read_text(encoding="utf-8"))
     wanted = {"_hl_instrument", "hyperliquid_trader", "hyperliquid_order_action", "hyperliquid_leverage_intent",
-              "hyperliquid_cancel_action", "hyperliquid_write", "_as_float", "hyperliquid_gate"}
+              "hyperliquid_cancel_action", "hyperliquid_write", "_as_float", "hyperliquid_gate",
+              "ensure_agent", "forget_agent_if_refused", "_agent_fresh"}
     body = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     assert len(body) == len(wanted), "server write helpers were renamed; update this test"
-    return ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
+    # The signer-approval cache state those helpers share, fresh for every namespace.
+    state = ast.parse("\n".join([
+        "import threading",
+        "AGENT_CHECK_TTL = 300.0",
+        "_agent_checked = {'signer': None, 'at': 0.0}",
+        "_agent_lock = threading.Lock()",
+    ])).body
+    return ast.fix_missing_locations(ast.Module(body=state + body, type_ignores=[]))
 
 
 class WriteDecisionTests(unittest.TestCase):
@@ -547,7 +555,7 @@ class WriteDecisionTests(unittest.TestCase):
         body = {**self.order(), "orderType": "ioc", "reduceOnly": True, "closePosition": True, "size": 2.009, "limitPrice": 0.6}
         result = self.write("/api/order", body)
         self.assertTrue(result["simulated"])
-        self.ns["hyperliquid"].validate_close.assert_called_with("HL_APT", body["side"], "2")
+        self.ns["hyperliquid"].validate_close.assert_called_with("HL_APT", body["side"], "2", positions=None)
         self.assertEqual(self.trader.calls, [])
         self.ns["armed"] = True
         self.ns["hyperliquid"].validate_close.side_effect = HyperliquidError("position changed")
@@ -569,7 +577,7 @@ class WriteDecisionTests(unittest.TestCase):
                           position=position, expectedArmed=False, slippagePercent=0.5)
         result = self.write('/api/order', body)
         self.assertTrue(result['simulated'])
-        self.ns['hyperliquid'].validate_close.assert_called_with('HL_APT', 'buy', '2', position)
+        self.ns['hyperliquid'].validate_close.assert_called_with('HL_APT', 'buy', '2', position, positions=None)
         wire = result['action']['orders'][0]
         self.assertTrue(wire['r'])
         self.assertEqual(wire['t'], {'limit': {'tif': 'Ioc'}})

@@ -15,6 +15,9 @@ from hyperliquid_fills import decimal_text
 READ_ONLY_MESSAGE = "Hyperliquid is read-only. Signed trading, Grid, Chase, and AI execution are not enabled."
 
 
+# A streamed book older than this is not used for an order's price bound.
+STREAM_BOOK_MAX_AGE = 1.5
+
 class HyperliquidBackend:
     def __init__(self, publish, *, client=None, account_address=None, network=None, enable_feed=True):
         self.publish = publish
@@ -24,6 +27,7 @@ class HyperliquidBackend:
         self._views = {}
         self._markets = None
         self._tickers = {}
+        self._books = {}  # coin -> (monotonic receipt, parsed book) from the l2Book stream
         self._coins = {}
         self._watch = set()
         self._config_error = None
@@ -170,23 +174,53 @@ class HyperliquidBackend:
             return {"symbol": symbol, "resolution": resolution, "source": "hyperliquid", "candles": candles}
         return self._cached(f"candles:{coin}:{resolution}", 5, load)
 
+    def _parse_book(self, raw, coin):
+        if not isinstance(raw, dict) or raw.get("coin") != coin or not isinstance(raw.get("levels"), list) or len(raw["levels"]) != 2:
+            raise HyperliquidError("Invalid Hyperliquid order book")
+        bids, asks = [[(number(level.get("px"), positive=True), number(level.get("sz"), minimum=0))
+                       for level in rows(side)] for side in raw["levels"]]
+        bids, asks = sorted(bids, reverse=True), sorted(asks)
+        if not bids or not asks or bids[0][0] >= asks[0][0]:
+            raise HyperliquidError("Hyperliquid order book is empty or crossed")
+        return {"orderBook": {"bids": bids, "asks": asks}, "time": number(raw.get("time"), positive=True)}
+
+    def _publish_quote(self, symbol, book):
+        bid, ask = book["orderBook"]["bids"][0][0], book["orderBook"]["asks"][0][0]
+        with self._state_lock:
+            previous = self._tickers.get(symbol, {})
+            if previous.get("bid") == bid and previous.get("ask") == ask:
+                return
+            ticker = {**previous, "bid": bid, "ask": ask}
+            self._tickers[symbol] = ticker
+        self.publish("ticker", ticker)
+
+    def streamed_book(self, coin, max_age=STREAM_BOOK_MAX_AGE):
+        """The live book if it arrived within max_age seconds and its exchange stamp is
+        current. None means use REST."""
+        with self._state_lock:
+            entry = self._books.get(coin)
+        if not entry or time.monotonic() - entry[0] > max_age:
+            return None
+        if abs(time.time() * 1000 - entry[1]["time"]) > max_age * 1000 + 1000:
+            return None
+        return deepcopy(entry[1])
+
     def orderbook(self, symbol, *, fresh=False):
         coin = self.coin(symbol)
+        # Keep streaming this market so the next read is already live.
+        if self.feed:
+            try:
+                self.watch([symbol])
+            except ValueError:
+                pass
+        streamed = self.streamed_book(coin, STREAM_BOOK_MAX_AGE if fresh else 3.0)
+        if streamed is not None:
+            return streamed
 
         def load():
-            raw = self.client.info("l2Book", coin=coin)
-            if not isinstance(raw, dict) or raw.get("coin") != coin or not isinstance(raw.get("levels"), list) or len(raw["levels"]) != 2:
-                raise HyperliquidError("Invalid Hyperliquid order book")
-            bids, asks = [[(number(level.get("px"), positive=True), number(level.get("sz"), minimum=0))
-                           for level in rows(side)] for side in raw["levels"]]
-            bids, asks = sorted(bids, reverse=True), sorted(asks)
-            if not bids or not asks or bids[0][0] >= asks[0][0]:
-                raise HyperliquidError("Hyperliquid order book is empty or crossed")
-            with self._state_lock:
-                ticker = {**self._tickers[symbol], "bid": bids[0][0], "ask": asks[0][0]}
-                self._tickers[symbol] = ticker
-            self.publish("ticker", ticker)
-            return {"orderBook": {"bids": bids, "asks": asks}, "time": number(raw.get("time"), positive=True)}
+            book = self._parse_book(self.client.info("l2Book", coin=coin), coin)
+            self._publish_quote(symbol, book)
+            return book
         return load() if fresh else self._cached(f"book:{coin}", 2, load)
 
     def trading_capacity(self, symbol):
@@ -304,8 +338,10 @@ class HyperliquidBackend:
         self.watch([position["symbol"] for position in positions])
         return {"positions": positions}
 
-    def validate_close(self, symbol, side, size, expected=None):
-        matches = [p for p in self.positions(fresh=True)["positions"] if p["symbol"] == symbol]
+    def validate_close(self, symbol, side, size, expected=None, *, positions=None):
+        # positions: a fresh read the caller already started in parallel with its other checks.
+        current = positions if positions is not None else self.positions(fresh=True)["positions"]
+        matches = [p for p in current if p["symbol"] == symbol]
         if len(matches) != 1:
             raise HyperliquidError("Close requires one current open position; refresh positions")
         position = matches[0]
@@ -496,6 +532,14 @@ class HyperliquidBackend:
                     ticker = {"last": None, **self._tickers.get(symbol, {}), **ctx}
                     self._tickers[symbol] = ticker
                 self.publish("ticker", ticker)
+            elif channel == "l2Book" and isinstance(data, dict) and data.get("coin") in self._coins:
+                try:
+                    book = self._parse_book(data, data["coin"])
+                except HyperliquidError:
+                    return  # a crossed or empty frame: keep the last good book, the feed is fine
+                with self._state_lock:
+                    self._books[data["coin"]] = (time.monotonic(), book)
+                self._publish_quote(self._coins[data["coin"]], book)
             elif channel == "candle":
                 for row in rows(data if isinstance(data, list) else [data]):
                     coin = row.get("s")

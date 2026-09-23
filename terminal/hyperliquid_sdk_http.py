@@ -32,23 +32,41 @@ def bounded_response(response, *args, max_bytes, **kwargs):
 
 
 class SDKTransport:
+    # Idle SDK sessions kept warm between requests. Each request checks one out, so
+    # concurrent handlers never share a mutable requests Session, while the next
+    # request reuses the open connection instead of paying a new TCP+TLS handshake.
+    MAX_IDLE = 8
+
     def __init__(self, base_url, *, timeout, max_bytes):
         self.base_url, self.timeout, self.max_bytes = base_url, timeout, max_bytes
-        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._idle = []
+
+    def _new_api(self):
+        api = API(self.base_url, timeout=self.timeout)
+        api.session.headers["User-Agent"] = "AgentTerminal/1"
+        api.session.hooks["response"].append(partial(bounded_response, max_bytes=self.max_bytes))
+        return api
 
     def post(self, path, payload):
-        # A terminal info client is shared by concurrent handlers. Never share a
-        # mutable requests Session between those threads.
-        api = getattr(self._local, "api", None)
-        if api is None:
-            api = API(self.base_url, timeout=self.timeout)
-            api.session.headers["User-Agent"] = "AgentTerminal/1"
-            api.session.hooks["response"].append(partial(bounded_response, max_bytes=self.max_bytes))
-            self._local.api = api
-        return api.post(path, payload)
+        with self._lock:
+            api = self._idle.pop() if self._idle else None
+        api = api or self._new_api()
+        try:
+            result = api.post(path, payload)
+        except BaseException:
+            # A failed exchange can leave the connection in an unknown state: drop it.
+            api.session.close()
+            raise
+        with self._lock:
+            if len(self._idle) < self.MAX_IDLE:
+                self._idle.append(api)
+                return result
+        api.session.close()
+        return result
 
     def close(self):
-        api = getattr(self._local, "api", None)
-        if api is not None:
+        with self._lock:
+            idle, self._idle = self._idle, []
+        for api in idle:
             api.session.close()
-            del self._local.api

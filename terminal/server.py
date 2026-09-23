@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -194,6 +195,53 @@ def hyperliquid_trader() -> tuple[Any, str | None]:
     return _hl_trader["trader"], _hl_trader["reason"]
 
 
+# ---- pre-trade checks: in parallel, and the signer approval cached -------------
+# Every Hyperliquid read costs ~250 ms from here, so the checks an order needs start
+# together when the request arrives rather than one after another.
+HL_PREFETCH = ThreadPoolExecutor(max_workers=8, thread_name_prefix="hl-prefetch")
+AGENT_CHECK_TTL = 300.0
+_agent_checked: dict[str, Any] = {"signer": None, "at": 0.0}
+_agent_lock = threading.Lock()
+
+
+def _agent_fresh(signer: str) -> bool:
+    with _agent_lock:
+        return _agent_checked["signer"] == signer and time.monotonic() - _agent_checked["at"] < AGENT_CHECK_TTL
+
+
+def ensure_agent(trader: Any, prefetched: Any = None) -> None:
+    """The API wallet is still approved for this account. A pass is trusted for five
+    minutes: a revoked wallet is refused by the exchange anyway, which clears it."""
+    if _agent_fresh(trader.address):
+        return
+    if prefetched is not None:
+        prefetched.result()
+    else:
+        hyperliquid.require_agent(trader.address)
+    with _agent_lock:
+        _agent_checked.update(signer=trader.address, at=time.monotonic())
+
+
+def forget_agent_if_refused(result: dict[str, Any]) -> None:
+    text = str(result.get("error") or "") + " " + json.dumps(result.get("response") or {}, default=str)
+    if "does not exist" in text.lower():
+        with _agent_lock:
+            _agent_checked.update(signer=None, at=0.0)
+
+
+def hyperliquid_prefetch(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Start the reads an order will need, in parallel with building it."""
+    if path != "/api/order":
+        return {}
+    futures: dict[str, Any] = {}
+    trader, _ = hyperliquid_trader()
+    if trader is not None and not _agent_fresh(trader.address):
+        futures["agent"] = HL_PREFETCH.submit(hyperliquid.require_agent, trader.address)
+    if body.get("closePosition") is True and str(body.get("orderType", "")).strip().lower() == "mkt":
+        futures["positions"] = HL_PREFETCH.submit(lambda: hyperliquid.positions(fresh=True)["positions"])
+    return futures
+
+
 def hyperliquid_leverage_intent(body):
     instrument = _hl_instrument(str(body.get("symbol") or "").strip().upper())
     leverage, previous, cross = body.get("leverage"), body.get("expectedLeverage"), body.get("cross")
@@ -320,8 +368,10 @@ def hyperliquid_cancel_action(body: dict[str, Any]) -> dict[str, Any]:
     return {"type": "cancel", "cancels": [{"a": asset, "o": oid}]}
 
 
-def hyperliquid_write(path: str, body: dict[str, Any], *, prepared_action=None) -> dict[str, Any]:
+def hyperliquid_write(path: str, body: dict[str, Any], *, prepared_action=None, prefetched=None) -> dict[str, Any]:
     """Validate, then simulate or sign. Mirrors the Kraken DISARMED contract."""
+    prefetched = prefetched or {}
+    close_positions = (lambda: prefetched["positions"].result()) if "positions" in prefetched else (lambda: None)
     expires_after = None
     if path == "/api/chart-order":
         intent = prepared_action if prepared_action is not None else hyperliquid_chart.prepare(body, hyperliquid)
@@ -362,7 +412,7 @@ def hyperliquid_write(path: str, body: dict[str, Any], *, prepared_action=None) 
         if path == "/api/chart-order" and (not armed or trader is None):
             hyperliquid_chart.validate(intent, hyperliquid)
         if close_target and (not armed or trader is None):
-            hyperliquid.validate_close(*close_target)
+            hyperliquid.validate_close(*close_target, positions=close_positions())
         if not armed:
             return {"exchange": "hyperliquid", "type": action["type"], "outcome": "simulated", "simulated": True,
                     "live": False, "action": action, "rows": [],
@@ -373,12 +423,13 @@ def hyperliquid_write(path: str, body: dict[str, Any], *, prepared_action=None) 
                     "message": f"Not signed: {reason}"}
         if trader.network != hyperliquid.network or trader.account_address != hyperliquid.account_address.lower():
             raise hyperliquid_trading.HyperliquidError("Read and signing account identities disagree")
-        hyperliquid.require_agent(trader.address)
+        ensure_agent(trader, prefetched.get("agent"))
         if path == "/api/chart-order":
             hyperliquid_chart.validate(intent, hyperliquid)
         if close_target:
-            hyperliquid.validate_close(*close_target)
+            hyperliquid.validate_close(*close_target, positions=close_positions())
         result = trader.submit(action, count=count, expires_after=expires_after) if expires_after is not None else trader.submit(action, count=count)
+    forget_agent_if_refused(result)
     return {"exchange": "hyperliquid", "type": action["type"], "live": True, **result}
 
 
@@ -788,7 +839,7 @@ class _HyperliquidChaseContext:
         trader, reason = hyperliquid_trader()
         if trader is None:
             raise hyperliquid_trading.HyperliquidError(reason or "Hyperliquid signed trading is off")
-        hyperliquid.require_agent(trader.address)
+        ensure_agent(trader)
 
     def submit(self, action: dict[str, Any], *, placement: bool) -> dict[str, Any]:
         trader, reason = hyperliquid_trader()
@@ -837,7 +888,7 @@ def hyperliquid_chase_start(body: dict[str, Any]) -> dict[str, Any]:
                 "spec": spec, "message": f"Not signed: {reason}"}
     if trader.network != hyperliquid.network or trader.account_address != hyperliquid.account_address.lower():
         raise hyperliquid_trading.HyperliquidError("Read and signing account identities disagree")
-    hyperliquid.require_agent(trader.address)
+    ensure_agent(trader)
     hyperliquid.watch([spec["symbol"]])
     with arm_lock:
         if not armed:
@@ -1633,6 +1684,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 self._send_json(hl_chase_manager.acknowledge(chase_id) if body.get("acknowledge") is True
                                 else hl_chase_manager.abort(chase_id))
                 return
+            prefetched = hyperliquid_prefetch(path, body)
             prepared = None
             if path in {"/api/order", "/api/leverage", "/api/chart-order", "/api/grid"}:
                 if _hl_chase_unresolved():
@@ -1652,7 +1704,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     db.prepare_hyperliquid_order(self._write_request_id, prepared)
                 except ValueError as exc:
                     raise hyperliquid_trading.HyperliquidError(str(exc)) from exc
-            result = hyperliquid_write(path, body, prepared_action=prepared)
+            result = hyperliquid_write(path, body, prepared_action=prepared, prefetched=prefetched)
         except hyperliquid_trading.HyperliquidError as exc:
             self._send_json({"outcome": "rejected", "error": str(exc), "exchange": "hyperliquid"}, 400)
             return

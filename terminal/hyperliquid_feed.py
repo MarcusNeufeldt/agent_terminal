@@ -62,7 +62,9 @@ class HyperliquidFeed:
                     now = time.monotonic()
                     with self._lock:
                         coins = {coin for coin, seen in self._watch.items() if now - seen < 300}
-                    wanted = {(kind, coin) for coin in coins for kind in ("trades", "activeAssetCtx", "candle")}
+                    # l2Book streams the order book, so orders and net PnL read a live quote
+                    # instead of fetching the book over REST first.
+                    wanted = {(kind, coin) for coin in coins for kind in ("trades", "activeAssetCtx", "candle", "l2Book")}
                     for method, targets in (("unsubscribe", subscribed - wanted), ("subscribe", wanted - subscribed)):
                         for kind, coin in sorted(targets):
                             subscription = {"type": kind, "coin": coin}

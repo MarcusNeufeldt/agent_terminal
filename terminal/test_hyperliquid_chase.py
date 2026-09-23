@@ -313,7 +313,8 @@ class ChaseStartRouteTests(unittest.TestCase):
         self.db.venue_unresolved.return_value = {"items": []}
         self.ns = {"Any": Any, "hyperliquid_chase": hc, "hyperliquid_trading": hyperliquid_trading, "hyperliquid": backend,
                    "db": self.db, "arm_lock": threading.RLock(), "armed": False, "hl_chase_manager": self.manager,
-                   "hl_chase_ctx": object(), "HL_CHASE_LIMIT": 5, "hyperliquid_trader": Mock(return_value=(trader, None))}
+                   "hl_chase_ctx": object(), "HL_CHASE_LIMIT": 5, "hyperliquid_trader": Mock(return_value=(trader, None)),
+                   "ensure_agent": lambda trader, prefetched=None: backend.require_agent(trader.address)}
         module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
         exec(compile(module, "isolated_chase_start", "exec"), self.ns)
         self.start = self.ns["hyperliquid_chase_start"]

@@ -63,8 +63,8 @@ class SDKHTTPTests(unittest.TestCase):
         self.assertEqual(path, "/exchange")
         self.assertEqual(body["action"], self.action)
         self.assertEqual(set(body), {"action", "nonce", "signature"})
-        self.assertIsInstance(self.http._local.api, API)
-        self.assertEqual(self.http._local.api.session.get_adapter("https://").max_retries.total, 0)
+        self.assertIsInstance(self.http._idle[-1], API)
+        self.assertEqual(self.http._idle[-1].session.get_adapter("https://").max_retries.total, 0)
 
     def test_dropped_response_is_unknown_and_never_retried(self):
         self.drop = True
@@ -107,20 +107,36 @@ class SDKHTTPTests(unittest.TestCase):
         self.assertEqual(self.trader.submit(self.action)["outcome"], "rejected")
 
     def test_concurrent_handlers_use_separate_sdk_sessions(self):
+        # Hold both requests open at once: each must have checked out its own session.
         barrier = threading.Barrier(2)
-        def read(_):
-            try:
-                barrier.wait(timeout=2)
-                self.http.post("/info", {"type": "metaAndAssetCtxs"})
-                session = self.http._local.api.session
-                barrier.wait(timeout=2)
-                return session
-            finally:
-                self.http.close()
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            sessions = list(pool.map(read, range(2)))
-        self.assertIsNot(sessions[0], sessions[1])
+        seen = []
+        original = API.post
+        def post(api, path, payload):
+            seen.append(api.session)
+            barrier.wait(timeout=2)
+            return original(api, path, payload)
+        API.post = post
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(lambda _: self.http.post("/info", {"type": "metaAndAssetCtxs"}), range(2)))
+        finally:
+            API.post = original
+        self.assertIsNot(seen[0], seen[1])
         self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.http._idle), 2, "both sessions stay warm for the next requests")
+
+    def test_the_next_request_reuses_a_warm_session_from_any_thread(self):
+        self.http.post("/info", {"type": "allMids"})
+        first = self.http._idle[-1]
+        worker = threading.Thread(target=lambda: self.http.post("/info", {"type": "allMids"}))
+        worker.start(); worker.join(timeout=2)
+        self.assertEqual(self.http._idle, [first], "a new handler thread reuses the open connection")
+
+    def test_a_failed_request_never_returns_its_session_to_the_pool(self):
+        self.drop = True
+        with self.assertRaises(Exception):
+            self.http.post("/exchange", {"x": 1})
+        self.assertEqual(self.http._idle, [])
 
 
 if __name__ == "__main__":
