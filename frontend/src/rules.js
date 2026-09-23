@@ -102,7 +102,7 @@ export function evaluateSize({ notional, equity, config = RULES }) {
   return { notional, multiple, cap: config.sizeCapX, breach: multiple > config.sizeCapX };
 }
 
-// /api/stats rows are ledger lines: {t, info, contract, pnl, funding, fee}. One
+// /api/stats rows are ledger lines: {t, info, contract, pnl, funding, fee, liqFee}. One
 // close produces several, so lines for the same contract inside `windowSeconds` are
 // summed into a single realized event. `fee` is a positive cost (verified against
 // the executions endpoint), and contracts arrive lowercase.
@@ -121,9 +121,10 @@ export function realizedEvents(rows, { windowSeconds = 60, sinceMs = null } = {}
     const pnl = Number(row?.pnl);
     const funding = Number(row?.funding);
     const fee = Number(row?.fee);
-    const parts = [pnl, funding, fee].map(value => (Number.isFinite(value) ? value : 0));
+    const liqFee = Number(row?.liqFee);
+    const parts = [pnl, funding, fee, liqFee].map(value => (Number.isFinite(value) ? value : 0));
     if (!Number.isFinite(pnl) && !Number.isFinite(funding)) continue;
-    const net = parts[0] + parts[1] - parts[2];
+    const net = parts[0] + parts[1] - parts[2] - parts[3];
     if (!Number.isFinite(net)) continue;
     if (!byContract.has(contract)) byContract.set(contract, []);
     byContract.get(contract).push({ t, net });

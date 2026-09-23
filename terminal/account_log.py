@@ -81,7 +81,8 @@ def _row_ms(row: dict) -> int:
 
 
 def compact_rows(client) -> list[dict]:
-    # Projected rows for stats: {t (epoch s), info, contract, pnl, funding, fee}.
+    # Projected rows for stats: {t (epoch s), info, contract, pnl, funding, fee, liqFee}.
+    # liqFee is the liquidation penalty, which Kraken books apart from `fee`.
     import calendar
     out = []
     for r in full_log(client):
@@ -97,6 +98,7 @@ def compact_rows(client) -> list[dict]:
             "pnl": r.get("realized_pnl"),
             "funding": r.get("realized_funding"),
             "fee": r.get("fee"),
+            "liqFee": r.get("liquidation_fee"),
         })
     return out
 
@@ -124,6 +126,7 @@ def trade_history(client, symbol: str, limit: int = 50, force: bool = False) -> 
             "realizedPnl": 0.0,
             "realizedFunding": 0.0,
             "fee": 0.0,
+            "liquidationFee": 0.0,
             "liquidation": row.get("info") == "futures partial liquidation",
             "_id": row.get("id") or 0,
         })
@@ -140,12 +143,14 @@ def trade_history(client, symbol: str, limit: int = 50, force: bool = False) -> 
         item["realizedPnl"] += float(row.get("realized_pnl") or 0)
         item["realizedFunding"] += float(row.get("realized_funding") or 0)
         item["fee"] += float(row.get("fee") or 0)
+        item["liquidationFee"] += float(row.get("liquidation_fee") or 0)
 
     rows = sorted(executions.values(), key=lambda item: (str(item["date"]), item["_id"]), reverse=True)[:limit]
     for item in rows:
         item["realizedPnl"] = round(item["realizedPnl"], 10)
         item["realizedFunding"] = round(item["realizedFunding"], 10)
         item["fee"] = round(item["fee"], 10)
-        item["netPnl"] = round(item["realizedPnl"] + item["realizedFunding"] - item["fee"], 10)
+        item["liquidationFee"] = round(item["liquidationFee"], 10)
+        item["netPnl"] = round(item["realizedPnl"] + item["realizedFunding"] - item["fee"] - item["liquidationFee"], 10)
         del item["_id"]
     return rows

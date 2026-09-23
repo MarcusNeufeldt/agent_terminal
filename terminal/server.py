@@ -1872,26 +1872,46 @@ def _perf_summary() -> dict:
     }
     trade_infos = ("futures trade", "futures partial liquidation")
 
+    def num(value):
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def row_net(r):
+        # Wallet effect, same rule as the Stats modal (frontend/src/stats.js).
+        info = r.get("info")
+        if info in trade_infos:
+            return num(r.get("pnl")) + num(r.get("funding")) - num(r.get("fee")) - num(r.get("liqFee"))
+        if info == "funding rate change":
+            return num(r.get("funding"))
+        if info == "interest payment":
+            return -num(r.get("fee"))
+        return 0.0
+
     def agg(cutoff):
-        trades = [r for r in rows if r.get("info") in trade_infos and r.get("t", 0) >= cutoff and r.get("pnl") not in (None, 0)]
-        pnl = sum(r.get("pnl") or 0 for r in trades)
-        liq = sum(r.get("pnl") or 0 for r in trades if r.get("info") == "futures partial liquidation")
-        funding = sum(r.get("funding") or 0 for r in rows if r.get("info") == "funding rate change" and r.get("t", 0) >= cutoff)
-        wins = [r for r in trades if (r.get("pnl") or 0) > 0]
-        wr = round(100 * len(wins) / len(trades), 1) if trades else None
+        window = [r for r in rows if r.get("t", 0) >= cutoff]
+        fills = [r for r in window if r.get("info") in trade_infos]
+        closes = [r for r in fills if num(r.get("pnl")) != 0]
+        liquidations = [r for r in fills if r.get("info") == "futures partial liquidation"]
+        wins = [r for r in closes if num(r.get("pnl")) > 0]
         return {
-            "net": round(pnl, 2),
-            "liquidationLosses": round(liq, 2),
-            "funding": round(funding, 2),
-            "closingFills": len(trades),
-            "winRatePct": wr,
+            "net": round(sum(row_net(r) for r in window), 2),
+            "pricePnlBeforeCosts": round(sum(num(r.get("pnl")) for r in fills), 2),
+            "tradingFees": round(sum(num(r.get("fee")) for r in fills), 2),
+            "liquidationPenalties": round(sum(num(r.get("liqFee")) for r in fills), 2),
+            "liquidationsAllIn": round(sum(row_net(r) for r in liquidations), 2),
+            "funding": round(sum(num(r.get("funding")) for r in window
+                                 if r.get("info") in trade_infos or r.get("info") == "funding rate change"), 2),
+            "closingFills": len(closes),
+            "winRatePctBeforeFees": round(100 * len(wins) / len(closes), 1) if closes else None,
         }
 
     by_sym = {}
     for r in rows:
         if r.get("info") in trade_infos and r.get("contract"):
             c = r["contract"]
-            by_sym[c] = by_sym.get(c, 0) + (r.get("pnl") or 0)
+            by_sym[c] = by_sym.get(c, 0) + row_net(r)
     ranked = sorted(by_sym.items(), key=lambda kv: kv[1])
     fmt_list = lambda pairs: [{ "symbol": s, "pnl": round(v, 2)} for s, v in pairs]
     out = {tf: agg(c) for tf, c in cutoffs.items()}

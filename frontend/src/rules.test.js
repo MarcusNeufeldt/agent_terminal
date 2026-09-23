@@ -121,6 +121,12 @@ test("ledger lines for one close collapse into a single realized event", () => {
   assert.equal(events.find(e => e.contract === "PF_UNIUSD").net, 38);
 });
 
+test("a liquidation's penalty counts toward the realized loss", () => {
+  // Kraken books the penalty in liquidation_fee, apart from the trading fee.
+  const events = realizedEvents([{ t: 1000, contract: "pf_ethusd", pnl: -100, funding: 0, fee: 0.5, liqFee: 60 }]);
+  assert.equal(events[0].net, -160.5);
+});
+
 test("realized events ignore unusable and non-contract ledger lines", () => {
   const rows = [
     { t: 1, contract: null, pnl: null, funding: null, fee: 0.0009 },

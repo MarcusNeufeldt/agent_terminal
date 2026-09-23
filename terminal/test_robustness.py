@@ -1315,6 +1315,18 @@ class RobustnessTests(unittest.TestCase):
             account_log._page_cache, account_log._cache_ts = old_cache, old_ts
 
     @patch("account_log.full_log")
+    def test_liquidation_penalty_reaches_stats_rows_and_trade_history(self, full_log):
+        # Kraken books the penalty in liquidation_fee, apart from the trading fee.
+        full_log.return_value = [
+            {"id": 1, "date": "2026-08-23T09:30:45.000Z", "info": "futures partial liquidation", "contract": "pf_ethusd", "execution": "liq-1", "asset": "pf_ethusd", "old_balance": 2, "new_balance": 1, "trade_price": 3000},
+            {"id": 2, "date": "2026-08-23T09:30:45.000Z", "info": "futures partial liquidation", "contract": "pf_ethusd", "execution": "liq-1", "asset": "usd", "realized_pnl": -100, "realized_funding": 0, "fee": 0.5, "liquidation_fee": 60},
+        ]
+        self.assertEqual([row["liqFee"] for row in account_log.compact_rows(None)], [None, 60])
+        row = account_log.trade_history(None, "PF_ETHUSD", 10)[0]
+        self.assertEqual(row["liquidationFee"], 60)
+        self.assertAlmostEqual(row["netPnl"], -160.5)
+
+    @patch("account_log.full_log")
     def test_trade_history_combines_execution_rows(self, full_log):
         full_log.return_value = [
             {"id": 1, "date": "2026-09-03T12:00:00.000Z", "info": "futures trade", "contract": "pf_trumpusd", "execution": "exec-1", "asset": "pf_trumpusd", "old_balance": 200, "new_balance": 100, "trade_price": 2.4, "mark_price": 2.4},

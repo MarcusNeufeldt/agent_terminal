@@ -159,8 +159,8 @@ You have live data tools: get_market_data (ticker/orderbook/candles for ANY symb
 get_positions, get_account, get_orders, get_fills, get_instrument (tickSize/contractSize),
 get_chases, get_trade_history, and scan_markets. Use them whenever the snapshot lacks data you
 need — NEVER ask the user for prices, balances, fills, order state, or contract specs you can fetch.
-get_performance gives realized-PnL aggregates (today/week/month/all-time, liquidation losses,
-worst symbols); get_trade_history gives exact recent per-symbol executions.
+get_performance gives net-after-costs aggregates (today/week/month/all-time: price PnL, trading fees,
+liquidation penalties, funding, worst symbols); get_trade_history gives exact recent per-symbol executions.
 
 TOOLS — WRITE (ARM-GATED):
 place_order, place_ladder, close_position, replace_tp, replace_sl, cancel_order, cancel_all_for_symbol
@@ -305,7 +305,8 @@ TOOLS: list[dict[str, Any]] = [
             "name": "get_performance",
             "description": (
                 "The user's realized trading performance from the Kraken account log: "
-                "net PnL, liquidation losses, funding, win rate and best/worst symbols "
+                "net after all costs, price PnL before costs, trading fees, liquidation penalties, "
+                "funding, win rate and best/worst symbols "
                 "for today / this week / this month / all-time. Use it when the user asks "
                 "how they are doing, about their stats or leaks, or when judging whether a "
                 "planned trade repeats a past costly pattern."
