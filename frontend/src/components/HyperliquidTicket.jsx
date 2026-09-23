@@ -7,6 +7,7 @@ import { unresolvedReceipt } from "../hyperliquid-receipt.js";
 import { contractsForNotional, normalizeContractSize } from "../size-precision";
 import { linearExitPreview } from "../risk-preview";
 import GridTicket from "./GridTicket";
+import { TAKER_FEE } from "../close-preview";
 
 const TYPES = [["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["chase", "Chase"], ["ioc", "IOC"], ["stp", "Stop"], ["take_profit", "Take profit"], ["grid", "Grid preview"]];
 // The venue rejects these with a minimum order value, so warn before submitting.
@@ -14,13 +15,16 @@ const MIN_ORDER_VALUE = 10;
 
 export function HyperliquidRiskPreview({ position, quantity, price, current }) {
   const preview = current ? linearExitPreview({ position, quantity, exitPrice: price }) : null;
+  // A trigger fills as a market order, so the taker fee is certain.
+  const net = preview ? preview.pnl - TAKER_FEE.hyperliquid * preview.coveredSize * Number(price) : null;
   return <div className="ticket-note" role="status">
     {preview ? <>
-      <div>For a {preview.side.toUpperCase()} reduction, if filled at the trigger: gross PnL ≈ {preview.pnl >= 0 ? "+" : "-"}${Math.abs(preview.pnl).toFixed(2)}.</div>
+      <div>For a {preview.side.toUpperCase()} reduction, if filled at the trigger: gross PnL ≈ {preview.pnl >= 0 ? "+" : "-"}${Math.abs(preview.pnl).toFixed(2)},
+        {" "}after the {(TAKER_FEE.hyperliquid * 100).toFixed(3)}% taker fee ≈ {net >= 0 ? "+" : "-"}${Math.abs(net).toFixed(2)}.</div>
       <div>{preview.coveredSize} contracts · {preview.coveragePct.toFixed(1)}% of the current position.</div>
       {preview.oversized && <div>Requested size exceeds this position. The venue may reject or reduce the order.</div>}
     </> : <div>Estimate unavailable. Current position data, a valid trigger price and size are required.</div>}
-    <div>Excludes fees and funding. This is not a loss cap. Execution may differ, and a trigger-limit order may remain unfilled.</div>
+    <div>Excludes slippage and funding. This is not a loss cap. Execution may differ, and a trigger-limit order may remain unfilled.</div>
   </div>;
 }
 

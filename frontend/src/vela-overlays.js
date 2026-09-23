@@ -1,5 +1,6 @@
 import { registerNativeIndicator, registerRendererLayer } from "@luxalgo/vela/plugin";
 import { mirroredRisk } from "./risk-preview.js";
+import { exitAfterFee } from "./close-preview.js";
 
 const TYPE = "terminal-overlays";
 const channels = new Map();
@@ -52,8 +53,10 @@ export function previewProtection(line, rawPrice) {
   const source = line.protection || line.tp || line.position;
   if (!source) return null;
   const price = snapOverlayPrice(rawPrice, source.tick);
-  const pnl = source.dir * (price - source.entry) * source.size * (source.mult || 1);
-  const kind = line.protection?.kind || (line.tp ? "tp" : price === source.entry ? "be" : pnl > 0 ? "tp" : "sl");
+  // After the taker fee a TP/SL is certain to pay; slippage past the trigger is unknowable.
+  const { gross, fee, net: pnl } = exitAfterFee({ dir: source.dir, entry: source.entry, price, size: source.size,
+    mult: source.mult || 1, feeRate: source.feeRate || 0 }) || { gross: NaN, fee: 0, net: NaN };
+  const kind = line.protection?.kind || (line.tp ? "tp" : price === source.entry ? "be" : gross > 0 ? "tp" : "sl");
   const type = kind === "sl" ? "SL" : kind === "tp" ? "TP" : "BE";
   const color = kind === "sl" ? "#ef5350" : kind === "tp" ? "#26a69a" : "#f0b90b";
   return {
@@ -61,8 +64,8 @@ export function previewProtection(line, rawPrice) {
     price,
     color,
     dashed: true,
-    title: `${type} ${price.toFixed(decimals(source.tick))} (${pnl >= 0 ? "+" : "-"}$${money(pnl)})`,
-    drop: { symbol: source.symbol, kind, price, pnl, order: source.order || line.order || null, positionSnapshot: source.snapshot },
+    title: `${type} ${price.toFixed(decimals(source.tick))} (${pnl >= 0 ? "+" : "-"}$${money(pnl)}${fee > 0 ? " after fee" : ""})`,
+    drop: { symbol: source.symbol, kind, price, pnl, gross, fee, order: source.order || line.order || null, positionSnapshot: source.snapshot },
   };
 }
 
@@ -88,7 +91,8 @@ export function riskOverlays(lines) {
       color: "#ef5350",
       dashed: true,
       risk: true,
-      title: `RISK ${risk.price.toFixed(decimals(line.tp.tick))} (-$${money(risk.pnl)}) · 1:${ratio}`,
+      // The stop would also pay the taker fee, so the loss shown includes it.
+      title: `RISK ${risk.price.toFixed(decimals(line.tp.tick))} (-$${money(Math.abs(risk.pnl) + (line.tp.feeRate || 0) * line.tp.size * (line.tp.mult || 1) * risk.price)}${line.tp.feeRate ? " after fee" : ""}) · 1:${ratio}`,
     };
   });
 }

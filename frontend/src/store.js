@@ -9,7 +9,7 @@ import { buildProtectionAction } from "./protection-action";
 import { buildChartOverlays } from "./chart-overlays";
 import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { valuationPrice } from "./pricing.js";
-import { closePreview, TAKER_FEE } from "./close-preview.js";
+import { closePreview, exitAfterFee, TAKER_FEE } from "./close-preview.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
@@ -265,11 +265,12 @@ const useStore = create((set, get) => ({
       const pos = s.positions.find(p => !p.error && p.symbol === symbol);
       const inst = s.instruments.find(i => i.symbol === symbol) || {};
       if (pos) {
-        const dir = String(pos.side).toLowerCase() === "short" ? -1 : 1;
-        pnl = dir * (Number(stopPrice) - Number(pos.price)) * Number(pos.size) * Number(inst.contractSize || 1);
+        pnl = exitAfterFee({ dir: String(pos.side).toLowerCase() === "short" ? -1 : 1, entry: pos.price, price: stopPrice,
+          size: pos.size, mult: inst.contractSize || 1, feeRate: TAKER_FEE.kraken })?.net;
       }
     }
-    const pnlText = Number.isFinite(pnl) ? ` (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })})` : "";
+    // Chart drags pass the after-fee value; slippage past the trigger is not included.
+    const pnlText = Number.isFinite(pnl) ? ` (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} after fee, before slippage)` : "";
     if (get().armed && !confirm(`${label} ${symbol} at ${fmt(stopPrice)}${pnlText}?\n\nThis will change a LIVE reduce-only protection order.`)) return false;
     try {
       const action = buildProtectionAction(kind, symbol, stopPrice, order);
@@ -322,7 +323,12 @@ const useStore = create((set, get) => ({
       : "Creates a full-size reduce-only market trigger. Fills are not guaranteed.";
     const sizing = fullPosition ? " Entire-position mode: Hyperliquid follows future position increases and decreases, even while this terminal is closed. The displayed quantity and profit are current estimates, not a fixed exit size." : " Fixed-size protection; future position increases are not covered.";
     const limit = (target && !target.triggerMarket ? ` Stop-limit price stays ${target.limitPrice}.` : "") + sizing;
-    if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} ${kind.toUpperCase()} ${symbol}: ${quantity} contracts at ${price}. ${target ? `Move exact order ${target.order_id}.` : "Create protection."}\n\n${risk}${limit}\n\nContinue?`)) return false;
+    const result = exitAfterFee({ dir: position.side === "short" ? -1 : 1, entry: position.price, price, size: quantity,
+      feeRate: TAKER_FEE.hyperliquid });
+    const outcome = result && Number.isFinite(result.net)
+      ? `\n\nIf filled at ${price}: ${result.net >= 0 ? "+" : "-"}$${Math.abs(result.net).toFixed(2)} after the ${(TAKER_FEE.hyperliquid * 100).toFixed(3)}% taker fee ($${result.fee.toFixed(2)}), before slippage.`
+      : "";
+    if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} ${kind.toUpperCase()} ${symbol}: ${quantity} contracts at ${price}. ${target ? `Move exact order ${target.order_id}.` : "Create protection."}${outcome}\n\n${risk}${limit}\n\nContinue?`)) return false;
     const requestId = newRequestId(), cloid = newCloid();
     const body = { requestId, cloid, symbol, kind, price, expectedArmed: s.armed,
       position: { side: position.side, sizeExact: position.sizeExact, price: position.price },

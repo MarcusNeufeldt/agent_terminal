@@ -73,3 +73,18 @@ export function closePreview({ position, book, contractSize = 1, inverse = false
     net, netFull,
   };
 }
+
+// PnL if a TP/SL fills exactly at `price`. Triggers execute as market orders, so the
+// taker fee is certain; the slippage past the trigger is not knowable in advance.
+export function exitAfterFee({ dir, entry, price, size, mult = 1, feeRate = 0 }) {
+  const values = [dir, entry, price, size, mult, feeRate].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  const [d, e, p, s, m, f] = values;
+  const gross = d * (p - e) * s * m;
+  const fee = f * Math.abs(s) * m * p;
+  return { gross, fee, net: gross - fee };
+}
+
+export function feeRateFor(readOnly) {
+  return readOnly ? TAKER_FEE.hyperliquid : TAKER_FEE.kraken;
+}

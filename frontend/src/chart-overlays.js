@@ -1,3 +1,5 @@
+import { exitAfterFee, feeRateFor } from "./close-preview.js";
+
 export function buildChartOverlays(symbol, positions, orders, instruments, readOnly = false, canCancel = false, canProtect = false) {
   const overlays = [];
   const position = (positions || []).find(p => !p.error && p.symbol === symbol && p.size);
@@ -5,6 +7,8 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
   const instrument = (instruments || []).find(i => i.symbol === symbol) || {};
   const tick = Number(instrument.tickSize) || 0.01;
   const mult = Number(instrument.contractSize || 1);
+  // TP and SL both fill as market orders: every dollar figure is after the taker fee.
+  const feeRate = feeRateFor(readOnly);
 
   for (const p of positions || []) {
     if (p.error || p.symbol !== symbol || !p.size) continue;
@@ -15,7 +19,7 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
       color: p.side === "long" ? "#26a69a" : "#ef5350",
       title: `${p.side} ${Number(p.size)}`,
       dashed: false,
-      position: { symbol, entry: Number(p.price), size: Number(p.size), mult, dir, tick, side: p.side, snapshot: { ...p } },
+      position: { symbol, entry: Number(p.price), size: Number(p.size), mult, dir, tick, feeRate, side: p.side, snapshot: { ...p } },
     });
     if (p.liqPriceEstimate) {
       overlays.push({
@@ -77,12 +81,12 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
     const orderSize = nativeFullPosition ? positionSize : Number(o.unfilledSize ?? o.size ?? positionSize);
     const coveredSize = Math.min(positionSize, orderSize);
     const coverage = positionSize > 0 ? Math.round(orderSize / positionSize * 100) : 0;
-    const pnl = dir * (Number(o.stopPrice) - Number(position.price)) * coveredSize * mult;
+    const { net: pnl } = exitAfterFee({ dir, entry: Number(position.price), price: Number(o.stopPrice), size: coveredSize, mult, feeRate }) || { net: NaN };
     overlays.push({
       key: `order-stop:${identity}`,
       price: Number(o.stopPrice),
       color: isTp ? "#26a69a" : "#ef5350",
-      title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) · ${coverage}%${nativeFullPosition ? " · auto size" : ""}`,
+      title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} after fee) · ${coverage}%${nativeFullPosition ? " · auto size" : ""}`,
       dashed: true,
       ...(isTp ? {
         tp: {
@@ -92,6 +96,7 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
           mult,
           dir,
           tick,
+          feeRate,
           fullPosition: orderSize === positionSize,
           order,
         },
@@ -110,6 +115,7 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
           mult,
           dir,
           tick,
+          feeRate,
           order,
           snapshot: { ...position },
         },
@@ -129,7 +135,7 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
           ["tp", "sl"].includes(order.triggerKind) && typeof order.triggerMarket === "boolean") {
         line.protection = { symbol, kind: order.triggerKind, entry: Number(position.price),
           size: protectionSize, mult, dir: position.side === "long" ? 1 : -1,
-          tick, order: line.order, snapshot: { ...position } };
+          tick, feeRate, order: line.order, snapshot: { ...position } };
       }
       if (!canCancel) delete line.order;
       if (line.protection?.kind === "tp") {

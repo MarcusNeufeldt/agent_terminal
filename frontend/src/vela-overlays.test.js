@@ -73,3 +73,29 @@ test("builds all three display-only mirrored risk levels", () => {
     "risk:order-stop:tp-1:3",
   ]);
 });
+
+test("TP/SL drags show the result after the taker fee, and the drop carries it", () => {
+  const position = { key: "position:PF_BCHUSD", price: 341.18,
+    position: { symbol: "PF_BCHUSD", entry: 341.18, size: 51.8, mult: 1, dir: 1, tick: 0.01, feeRate: 0.0005 } };
+  const tp = previewProtection(position, 342.61);
+  const gross = 51.8 * (342.61 - 341.18), fee = 0.0005 * 51.8 * 342.61;
+  assert.ok(Math.abs(tp.drop.pnl - (gross - fee)) < 1e-9);
+  assert.ok(Math.abs(tp.drop.gross - gross) < 1e-9);
+  assert.ok(tp.title.includes(`+$${(gross - fee).toFixed(2)} after fee`), tp.title);
+  assert.equal(tp.drop.kind, "tp", "kind follows the price move, not the fee");
+  // Barely above entry: the fee makes the result negative, but it is still a take profit.
+  assert.equal(previewProtection(position, 341.2).drop.kind, "tp");
+  const sl = previewProtection(position, 340);
+  assert.ok(sl.drop.pnl < 51.8 * (340 - 341.18), "a stop's loss grows by the fee");
+  // Without a fee rate (older lines) nothing changes and nothing claims a fee.
+  const plain = previewProtection({ ...position, position: { ...position.position, feeRate: undefined } }, 342.61);
+  assert.doesNotMatch(plain.title, /after fee/);
+});
+
+test("mirrored risk lines add the stop's fee to the loss", () => {
+  const line = { key: "tp", price: 110, tp: { entry: 100, dir: 1, tick: 0.5, size: 2, mult: 1, feeRate: 0.0005, fullPosition: true } };
+  const [one] = riskOverlays([line]);
+  // 1:1 stop at 90: price loss $20 plus 5bp of 2 x 90.
+  assert.equal(one.price, 90);
+  assert.match(one.title, /-\$20\.09 after fee/);
+});

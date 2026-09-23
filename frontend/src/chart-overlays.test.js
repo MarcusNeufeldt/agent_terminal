@@ -48,7 +48,7 @@ test("Kraken stop-loss lines are draggable, so a stop can be moved into profit",
       stopPrice: 110, size: 2, unfilledSize: 2, reduceOnly: true },
   ], instruments).find(line => line.key === "order-stop:sl-2");
   assert.equal(inProfit.protection.kind, "sl");
-  assert.match(inProfit.title, /\+\$20\.00/, "a stop in profit shows the gain it locks in");
+  assert.match(inProfit.title, /\+\$19\.89 after fee/, "a stop in profit shows the gain it locks in, less the 5bp taker fee");
 });
 
 test("take profit keeps its own drag path and a stop without a position is not draggable", () => {
@@ -112,7 +112,8 @@ test("native whole-position TP profit follows size and entry changes while fixed
     assert.equal(line.tp.size, size);
     assert.equal(line.tp.fullPosition, true);
     assert.match(line.title, /100% · auto size/);
-    assert.ok(line.title.includes(((native.stopPrice - entry) * size).toFixed(2)));
+    const net = (native.stopPrice - entry) * size - 0.00045 * size * native.stopPrice;
+    assert.ok(line.title.includes(`${net.toFixed(2)} after fee`), `${line.title} lacks ${net.toFixed(2)}`);
     assert.equal(riskOverlays([line]).length, 3);
     const fixed = { ...native, positionTpsl: false, size: 1238, unfilledSize: 1238, unfilledSizeExact: "1238" };
     const fixedLine = buildChartOverlays(symbol, pos, [fixed], [], true, true, true).find(l => l.key.startsWith("order-stop:"));
