@@ -9,48 +9,67 @@ import { closePreview, TAKER_FEE, HL_CLOSE_SLIPPAGE } from "../close-preview";
 
 const POLL_MS = 1000;
 const signed = v => (v >= 0 ? "+$" : "-$") + fmt(Math.abs(v), 2);
+const cost = v => (v > 0.005 ? "-$" + fmt(v, 2) : "$0.00");
 
 function bookTime(book) {
   const t = Number(book?.time) || Date.parse(book?.serverTime || "");
   return Number.isFinite(t) && t > 0 ? t : null;
 }
 
+function Row({ label, detail, value, tone = "" }) {
+  return (
+    <div className="cp-row">
+      <div className="cp-label">{label}{detail && <span className="cp-detail">{detail}</span>}</div>
+      <div className={"cp-value " + tone}>{value}</div>
+    </div>
+  );
+}
+
 export function ClosePreviewBody({ preview, venue, book, now = Date.now() }) {
-  if (!preview) return <div className="empty">Book unavailable — no estimate. The close still works.</div>;
+  if (!preview) return <div className="cp-empty">Book unavailable — no estimate. The close still works.</div>;
   const fee = TAKER_FEE[venue];
   const age = bookTime(book) === null ? null : Math.max(0, (now - bookTime(book)) / 1000);
   const into = preview.side === "long" ? "bid" : "ask";
-  const rows = [
-    ["Screen value (all at best " + into + " " + fmt(preview.best) + ")", signed(preview.pnlAtBest), ""],
-    ["Walking the book → avg " + fmt(preview.avgPrice) + " over " + preview.levelsUsed + " level" + (preview.levelsUsed === 1 ? "" : "s")
-      + (preview.worstPrice ? ", worst " + fmt(preview.worstPrice) : ""), preview.bookWalkCost > 0 ? "-$" + fmt(preview.bookWalkCost, 2) : "$0.00", "down"],
-    ["Taker fee " + (fee * 100).toFixed(3) + "%", "-$" + fmt(preview.exitFee, 2), "down"],
-  ];
-  if (venue === "kraken") rows.push(["Unrealized funding, settled on close", signed(preview.funding), preview.funding >= 0 ? "up" : "down"]);
+  const hidden = preview.net === null ? null : preview.pnlAtBest - preview.net;
   return (
     <>
-      <table className="data close-preview">
-        <tbody>
-          {rows.map(([label, value, cls]) => (
-            <tr key={label}><td>{label}</td><td className={"num " + cls}>{value}</td></tr>
-          ))}
-          <tr className="total">
-            <td><b>You'd get closing now</b></td>
-            <td className={"num " + (preview.net >= 0 ? "up" : "down")}><b>{preview.net === null ? "–" : signed(preview.net)}</b></td>
-          </tr>
-        </tbody>
-      </table>
+      <div className="cp-hero">
+        <div className="cp-hero-label">You'd get closing now</div>
+        <div className={"cp-hero-value " + (preview.net === null ? "" : preview.net >= 0 ? "up" : "down")}>
+          {preview.net === null ? "–" : signed(preview.net)}
+        </div>
+        <div className="cp-hero-sub">
+          Screen shows <b>{signed(preview.pnlAtBest)}</b>
+          {hidden !== null && Math.abs(hidden) >= 0.005 && <> · <span className="down">{signed(-hidden)} in costs</span></>}
+        </div>
+      </div>
+
+      <div className="cp-list">
+        <Row label="Screen value" detail={`all at best ${into} ${fmt(preview.best)}`} value={signed(preview.pnlAtBest)} />
+        <Row label="Walking the book"
+          detail={`→ avg ${fmt(preview.avgPrice)} over ${preview.levelsUsed} level${preview.levelsUsed === 1 ? "" : "s"}`
+            + (preview.worstPrice ? `, worst ${fmt(preview.worstPrice)}` : "")}
+          value={cost(preview.bookWalkCost)} tone={preview.bookWalkCost > 0.005 ? "down" : ""} />
+        <Row label="Taker fee" detail={`${(fee * 100).toFixed(3)}%`} value={cost(preview.exitFee)} tone="down" />
+        {venue === "kraken" && (
+          <Row label="Funding" detail="settled on close" value={signed(preview.funding)}
+            tone={preview.funding >= 0 ? "up" : "down"} />
+        )}
+      </div>
+
       {preview.unfilled > 1e-9 && (
-        <div className="ticket-note" role="alert">
+        <div className="cp-warn" role="alert">
           {preview.unfilledReason === "bound"
             ? `Only ${fmt(preview.filled)} of ${fmt(preview.qty)} fills within the ${(HL_CLOSE_SLIPPAGE * 100).toFixed(1)}% price bound; the rest would stay open.`
             : `The visible book only covers ${fmt(preview.filled)} of ${fmt(preview.qty)}${venue === "hyperliquid" ? " (Hyperliquid shows 20 levels)" : ""}. `
               + "The rest fills beyond it, at worse prices than shown."}
         </div>
       )}
-      <div className="ticket-note">
-        Estimate from the book {age === null ? "" : `${age.toFixed(1)}s ago`}, updated every second. Excludes the entry fee already paid.
-        {venue === "hyperliquid" ? " Funding is settled hourly, so none is due on close." : ""} Actual fills can differ as the book moves.
+
+      <div className="cp-foot">
+        <span className={"cp-live" + (age !== null && age < 5 ? " on" : "")} />
+        {age === null ? "Waiting for the book" : `Book ${age.toFixed(1)}s ago`} · updates every second.
+        {" "}Excludes the entry fee already paid{venue === "hyperliquid" ? "; funding settles hourly, none due on close" : ""}.
       </div>
     </>
   );
@@ -102,22 +121,31 @@ export default function ClosePreviewModal({ symbol, onClose }) {
     onClose();
     await closePosition(symbol);
   };
+  // Closing a long sells, closing a short buys: colour the action by the order it sends.
+  const sells = position?.side !== "short";
 
   return (
     <div className="modal-overlay" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="modal">
-        <div className="modal-head">
-          <h3>Market close {symbol}</h3>
+      <div className="modal close-modal" role="dialog" aria-label={`Market close ${symbol}`}>
+        <div className="cp-head">
+          <div>
+            <div className="cp-title">Market close</div>
+            <div className="cp-market">
+              <span className="cp-symbol">{symbol}</span>
+              {position && <span className={"cp-side " + (position.side === "short" ? "short" : "long")}>{position.side}</span>}
+              {position && <span className="cp-size">{fmt(position.size)} @ {fmt(position.price)}</span>}
+            </div>
+          </div>
           <button className="modal-x" title="Close (Esc)" onClick={onClose}>×</button>
         </div>
-        {!position ? <div className="empty">Position no longer open.</div> : <>
-          <div className="ticket-note">{position.side} {fmt(position.size)} @ {fmt(position.price)}</div>
+        {!position ? <div className="cp-empty">Position no longer open.</div> : <>
           <ClosePreviewBody preview={preview} venue={venue} book={book} now={now} />
-          {error && <div className="ticket-note">Book read failed: {error}. Retrying every second.</div>}
+          {error && <div className="cp-warn">Book read failed: {error}. Retrying every second.</div>}
         </>}
-        <div className="side-btns">
-          <button className="btn-sell" disabled={!position || ticketBusy} onClick={close}>Close at market</button>
-          <button onClick={onClose}>Cancel</button>
+        <div className="cp-actions">
+          <button type="button" className="cp-cancel" onClick={onClose}>Cancel</button>
+          <button type="button" className={"cp-confirm " + (sells ? "sell" : "buy")} disabled={!position || ticketBusy}
+            onClick={close}>{sells ? "Sell" : "Buy"} to close at market</button>
         </div>
       </div>
     </div>

@@ -77,11 +77,12 @@ test("the modal shows screen value, book walk, fee and the real result, and neve
   const preview = closePreview({ position: { side: "long", size: 51.8, price: 341.18 }, book, feeRate: TAKER_FEE.kraken, funding: 0 });
   const html = renderToStaticMarkup(React.createElement(ClosePreviewBody, { preview, venue: "kraken", book,
     now: Date.parse("2026-09-23T15:57:06.000Z") }));
-  assert.match(html, /Screen value \(all at best bid 342.25\)/);
-  assert.match(html, /Walking the book → avg 341\.982\d* over 3 levels, worst 341.71/);
-  assert.match(html, /Taker fee 0.050%/);
+  assert.match(html, /Screen value<span class="cp-detail">all at best bid 342.25<\/span>/);
+  assert.match(html, /Walking the book<span class="cp-detail">→ avg 341\.982\d* over 3 levels, worst 341.71<\/span>/);
+  assert.match(html, /Taker fee<span class="cp-detail">0.050%<\/span>/);
+  assert.match(html, /Screen shows <b>\+\$\d+\.\d\d<\/b>.*in costs/, "the hero names the gap");
   assert.match(html, /You&#x27;d get closing now/);
-  assert.match(html, /1.0s ago/);
+  assert.match(html, /Book 1.0s ago/);
   assert.match(renderToStaticMarkup(React.createElement(ClosePreviewBody, { preview: null, venue: "hyperliquid" })),
     /Book unavailable — no estimate\. The close still works\./);
   const hl = closePreview({ position: { side: "long", size: 10, price: 100 }, book: { bids: [[101, 4]] }, feeRate: TAKER_FEE.hyperliquid });
@@ -94,5 +95,10 @@ test("the modal shows screen value, book walk, fee and the real result, and neve
   Object.assign(store.getInitialState(), store.getState());
   const modal = renderToStaticMarkup(React.createElement(ClosePreviewModal, { symbol: "PF_BCHUSD", onClose() {} }));
   assert.match(modal, /Market close PF_BCHUSD/);
-  assert.match(modal, /<button class="btn-sell">Close at market<\/button>/);
+  assert.match(modal, /<button type="button" class="cp-confirm sell">Sell to close at market<\/button>/,
+    "closing a long sells, in red, and is live before any book arrives");
+  store.setState({ positions: [{ symbol: "PF_BCHUSD", side: "short", size: 5, price: 341 }] });
+  Object.assign(store.getInitialState(), store.getState());
+  assert.match(renderToStaticMarkup(React.createElement(ClosePreviewModal, { symbol: "PF_BCHUSD", onClose() {} })),
+    /class="cp-confirm buy">Buy to close at market/);
 });
