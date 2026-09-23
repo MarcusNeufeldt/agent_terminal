@@ -52,6 +52,7 @@ import scanner  # noqa: E402
 import chase as chase_mod  # noqa: E402
 import db as db_mod  # noqa: E402
 import account_log  # noqa: E402
+import close_preview  # noqa: E402
 import binance_candles  # noqa: E402
 import alt_btc  # noqa: E402
 import binance_ws as binance_ws_mod  # noqa: E402
@@ -560,6 +561,53 @@ def get_instruments() -> dict[str, Any]:
     result = {"instruments": payload.get("instruments", [])} if isinstance(payload, dict) else {"instruments": []}
     cache.put("instruments", result)
     return result
+
+
+AI_NET_BOOKS = 8
+
+
+def with_net_if_closed(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Kraken positions for the AI, valued like the screen's "Net if closed": the book
+    walked for the full size, less the taker fee, plus funding that settles on close.
+    Kraken's own unrealizedPnl is mark-based and is passed on only as krakenMarkPnl."""
+    instruments = {str(i.get("symbol")): i for i in get_instruments().get("instruments", [])}
+    ranked = sorted((p for p in positions if isinstance(p, dict) and not p.get("error")),
+                    key=lambda p: -abs((_as_float(p.get("size")) or 0) * (_as_float(p.get("price")) or 0)))
+    booked = {str(p.get("symbol")) for p in ranked[:AI_NET_BOOKS]}
+    out = []
+    for position in positions:
+        if not isinstance(position, dict) or position.get("error"):
+            out.append(position)
+            continue
+        row = {key: value for key, value in position.items() if key != "unrealizedPnl"}
+        if position.get("unrealizedPnl") is not None:
+            row["krakenMarkPnl"] = position.get("unrealizedPnl")
+        symbol = str(position.get("symbol") or "")
+        instrument = instruments.get(symbol) or {}
+        funding = _as_float(position.get("unrealizedFunding")) or 0.0
+        preview, basis = None, "unavailable"
+        if instrument.get("type") != "futures_inverse":
+            fee = close_preview.TAKER_FEE["kraken"]
+            mult = _as_float(instrument.get("contractSize")) or 1.0
+            if symbol in booked:
+                try:
+                    book = client.get("/orderbook", params={"symbol": symbol}).get("orderBook") or {}
+                    preview = close_preview.close_preview(position, book, fee_rate=fee, contract_size=mult, funding=funding)
+                    basis = "book" if preview else basis
+                except Exception:
+                    preview = None
+            if preview is None:
+                ticker = hub.ticker(symbol) or {}
+                best = ticker.get("bid") if position.get("side") == "long" else ticker.get("ask")
+                if _as_float(best):
+                    preview = close_preview.close_preview(position, {"bids": [[best, 1e18]], "asks": [[best, 1e18]]},
+                                                          fee_rate=fee, contract_size=mult, funding=funding)
+                    basis = "best_price_no_depth" if preview else basis
+        if preview:
+            row.update({key: round(value, 4) if isinstance(value, float) else value for key, value in preview.items()})
+        row["netBasis"] = basis
+        out.append(row)
+    return out
 
 
 def get_ticker_rest(symbol: str) -> dict[str, Any] | None:
@@ -1817,7 +1865,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
         positions_state = _rows_payload("positions", get_positions())
         orders_state = _rows_payload("orders", get_orders())
         account = {key: value for key, value in account_state.items() if key not in {"state", "error", "ageSeconds"}}
-        positions = positions_state["positions"]
+        positions = with_net_if_closed(positions_state["positions"])
         orders = orders_state["orders"]
         ticker = _ticker_payload(symbol)
         candles = hub.candles_1m(symbol)
@@ -2063,7 +2111,8 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         return out
     if name == "get_positions":
-        return _rows_payload("positions", get_positions())
+        payload = _rows_payload("positions", get_positions())
+        return {**payload, "positions": with_net_if_closed(payload.get("positions") or [])}
     if name == "get_account":
         return _account_payload(get_account())
     if name == "get_orders":

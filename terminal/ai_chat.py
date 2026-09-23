@@ -62,7 +62,7 @@ def build_context_snapshot(
                     for k in (
                         "balanceValue", "portfolioValue", "collateralValue",
                         "pnl", "availableMargin", "initialMargin", "maintenanceMargin",
-                        "totalUnrealized", "type",
+                        "type",
                     )
                     if account.get(k) is not None
                 }
@@ -74,12 +74,17 @@ def build_context_snapshot(
         slim = [
             {
                 k: p.get(k)
-                for k in ("symbol", "side", "size", "price", "unrealizedPnl", "pnlCurrency", "liqPriceEstimate", "atr14d")
+                for k in ("symbol", "side", "size", "price", "netIfClosed", "grossAtBest", "bookWalkCost", "exitFee",
+                          "fundingOnClose", "avgExitPrice", "beyondVisibleBook", "netBasis", "krakenMarkPnl",
+                          "liqPriceEstimate", "atr14d")
                 if p.get(k) is not None
             }
             for p in positions
         ]
         lines.append(f"OPEN POSITIONS: {json.dumps(slim)}")
+        nets = [p.get("netIfClosed") for p in positions]
+        if nets and all(isinstance(n, (int, float)) for n in nets):
+            lines.append(f"NET IF CLOSED, ALL POSITIONS: {round(sum(nets), 2)}")
     else:
         lines.append("OPEN POSITIONS: none")
     if orders:
@@ -161,6 +166,10 @@ get_chases, get_trade_history, and scan_markets. Use them whenever the snapshot 
 need — NEVER ask the user for prices, balances, fills, order state, or contract specs you can fetch.
 get_performance gives net-after-costs aggregates (today/week/month/all-time: price PnL, trading fees,
 liquidation penalties, funding, worst symbols); get_trade_history gives exact recent per-symbol executions.
+POSITION PnL: always quote netIfClosed, the same "Net if closed" the user sees on screen: what closing
+at market right now would add after walking the order book, the taker fee and funding settled on close.
+grossAtBest is the pre-cost value at the best bid/ask, bookWalkCost and exitFee are the gap between them.
+krakenMarkPnl is Kraken's mark-price figure; never present it as the position's profit.
 
 TOOLS — WRITE (ARM-GATED):
 place_order, place_ladder, close_position, replace_tp, replace_sl, cancel_order, cancel_all_for_symbol
@@ -361,7 +370,9 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_positions",
-            "description": "Your current open positions: symbol, side, size, entry price, unrealized PnL, liquidation estimate.",
+            "description": ("Your current open positions: symbol, side, size, entry price, netIfClosed (what closing at "
+                            "market now would add, after book depth, taker fee and funding) with its breakdown, "
+                            "krakenMarkPnl (Kraken's mark-based figure, not realizable), liquidation estimate."),
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -369,7 +380,8 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_account",
-            "description": "Account state: portfolio/collateral value, available margin, margin used, total unrealized PnL.",
+            "description": ("Account state: portfolio/collateral value, available margin, margin used. For position "
+                            "PnL use get_positions netIfClosed, not the account's mark-based unrealized total."),
             "parameters": {"type": "object", "properties": {}},
         },
     },
