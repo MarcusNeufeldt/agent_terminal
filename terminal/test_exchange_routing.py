@@ -493,6 +493,16 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.chases.abort.assert_not_called()
         self.kraken.post.assert_not_called()
 
+    def test_kraken_chase_acknowledge_reaches_the_kraken_manager(self):
+        self.chases.acknowledge.return_value = {"ok": True}
+        status, data = self.request("/api/chase/abort?exchange=kraken",
+                                    {"requestId": "fixture-chase-ack", "chaseId": "k1", "acknowledge": True}, 0)
+        self.assertEqual((status, data), (200, {"ok": True}))
+        self.chases.acknowledge.assert_called_once_with("k1")
+        self.chases.abort.assert_not_called()
+        self.hl_chases.acknowledge.assert_not_called()
+        self.kraken.post.assert_not_called()
+
     def test_an_unknown_hyperliquid_chase_blocks_new_orders(self):
         self.switch("hyperliquid")
         self.chase_unresolved.return_value = True

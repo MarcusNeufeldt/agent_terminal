@@ -1870,7 +1870,10 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"chase": snapshot})
             elif path == "/api/chase/abort":
-                self._send_json(chase_manager.abort(str(body.get("chaseId", ""))))
+                chase_id = str(body.get("chaseId", ""))
+                # acknowledge: the user checked an unknown Chase on Kraken; nothing is sent.
+                self._send_json(chase_manager.acknowledge(chase_id) if body.get("acknowledge") is True
+                                else chase_manager.abort(chase_id))
             elif path == "/api/chat/note":
                 # store-only message (e.g. execution reports) — never triggers the LLM
                 content = str(body.get("content") or "").strip()

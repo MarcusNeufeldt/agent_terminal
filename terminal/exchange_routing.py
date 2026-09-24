@@ -71,7 +71,11 @@ class ExchangeRouting:
             if not isinstance(workers, list):
                 raise ExchangeRoutingError("Chase state unavailable. Exchange switch blocked.", 503)
             if workers:
-                raise ExchangeRoutingError("Finish or reconcile active Chase workers before switching exchanges.")
+                names = ", ".join(f"{w.get('side', '')} {w.get('symbol', '')} ({w.get('status', '')})".strip()
+                                  for w in workers[:3] if isinstance(w, dict))
+                raise ExchangeRoutingError(
+                    f"Finish or reconcile active Chase workers before switching exchanges: {names}. "
+                    "A stuck one has a Mark checked button in the order ticket.")
             if disarm is not None:
                 disarm()
             self.active = target

@@ -1162,7 +1162,8 @@ const useStore = create((set, get) => ({
   },
 
   async abortChase(chaseId, { acknowledge = false } = {}) {
-    if (acknowledge && !confirm("Mark this Chase as checked?\n\nOnly do this after confirming on Hyperliquid that no chase order is still open and the position is what you expect. Nothing is sent.")) return;
+    const venue = get().chases?.[chaseId]?.exchange === "hyperliquid" ? "Hyperliquid" : "Kraken";
+    if (acknowledge && !confirm(`Mark this Chase as checked?\n\nOnly do this after confirming on ${venue} that no chase order is still open and the position is what you expect. Nothing is sent.`)) return;
     try {
       const r = await api("/api/chase/abort", { method: "POST",
         body: { chaseId, ...(acknowledge ? { acknowledge: true } : {}), requestId: newRequestId() } });

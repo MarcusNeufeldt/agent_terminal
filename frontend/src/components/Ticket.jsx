@@ -20,6 +20,11 @@ export default function Ticket() {
   const submitOrder = useStore(s => s.submitOrder);
   const sizeFromPct = useStore(s => s.sizeFromPct);
   const instruments = useStore(s => s.instruments);
+  const chases = useStore(s => s.chases);
+  const abortChase = useStore(s => s.abortChase);
+  // A Kraken Chase whose outcome is unknown blocks exchange switching until checked.
+  const stuckChases = Object.values(chases || {}).filter(c => c.exchange !== "hyperliquid" &&
+    ["unknown", "orphaned"].includes(c.status));
   const t = tickers[symbol] || {};
   // The slider position belongs to the symbol it sized, so it resets on a switch.
   const [sized, setSized] = useState({ symbol, pct: 0 });
@@ -115,6 +120,13 @@ export default function Ticket() {
             : (armed ? `LIVE: orders go straight to Kraken (${window.__env || "live"}).` : "SIMULATION: arm the terminal to send real orders.")}
         </div>
         </>}
+        {stuckChases.map(c => (
+          <div key={c.id} className="ticket-note" role="alert">
+            Chase {c.side} {c.symbol}: {c.status} · filled {fmt(c.filled)}/{fmt(c.size)}.
+            {" "}{c.unknownReason || "Needs a manual check on Kraken."} Exchange switching is blocked until it is checked.
+            {" "}<button type="button" onClick={() => abortChase(c.id, { acknowledge: true })}>Mark checked</button>
+          </div>
+        ))}
       </div>
     </div>
   );
