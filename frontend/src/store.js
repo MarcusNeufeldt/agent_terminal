@@ -148,11 +148,12 @@ const useStore = create((set, get) => ({
       return;
     }
     const name = exchange === "kraken" ? "Kraken Futures" : "Hyperliquid";
-    if (!confirm(`Switch to ${name}?\n\nThe terminal will be DISARMED and ticket drafts cleared. Open ${s.exchangeName} orders and positions stay live. Automatic protection resizing and TP cleanup pause while disarmed. Active Chase workers must finish first.`)) return;
+    if (!confirm(`Switch to ${name}?\n\n${s.armed ? `The terminal stays ARMED: orders on ${name} will be LIVE. ` : ""}Ticket drafts are cleared. Open ${s.exchangeName} orders and positions stay live. Active Chase workers must finish first.`)) return;
     set({ exchangeBusy: true });
     try {
       const result = await api("/api/exchange", { method: "POST", body: { exchange } });
-      if (result.exchange !== exchange || result.armed !== false || result.exchangeRouting !== 1) {
+      // A switch keeps the ARM state now, so only the venue and routing are confirmed.
+      if (result.exchange !== exchange || typeof result.armed !== "boolean" || result.exchangeRouting !== 1) {
         throw new Error("Exchange switch was not confirmed. Reload to reconcile the current selection.");
       }
       reloadExchange(exchange);

@@ -104,8 +104,8 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.hl_client.info.assert_not_called()
         status, selected = self.switch("hyperliquid")
         self.assertEqual(status, 200)
-        self.assertFalse(selected["armed"])
-        self.assertFalse(self.ns["armed"])
+        self.assertTrue(selected["armed"], "a switch keeps the ARM state; the UI shows it")
+        self.assertTrue(self.ns["armed"])
         self.chases.abort_all.assert_not_called()
         status, account = self.request("/api/account?exchange=hyperliquid")
         self.assertEqual((status, account["state"]), (200, "unavailable"))
@@ -190,7 +190,7 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.db.claim_write_request.assert_not_called()
         self.hl_write.assert_not_called()
         self.kraken.post.assert_not_called()
-        self.assertFalse(self.ns["armed"])
+        self.assertTrue(self.ns["armed"], "a read-only recovery route never changes ARM")
         self.db.venue_unresolved.return_value = {"items": [], "hasMore": False}
         status, result = self.request("/api/execution-recovery?exchange=hyperliquid")
         self.assertEqual((status, result["state"]), (200, "current"))
@@ -350,7 +350,7 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.db.claim_write_request.assert_not_called()
         self.hl_write.assert_not_called()
         self.kraken.post.assert_not_called()
-        self.assertFalse(self.ns["armed"])
+        self.assertTrue(self.ns["armed"], "a read-only fill route never changes ARM")
 
     def test_lifecycle_route_is_read_only_and_keeps_unknown_unresolved(self):
         self.switch("hyperliquid")
@@ -529,6 +529,7 @@ class ExchangeRoutingTests(unittest.TestCase):
         self.db.claim_write_request.assert_not_called()
 
     def test_switch_back_still_rejects_old_epoch_and_legacy_writes(self):
+        self.ns["armed"] = False
         self.switch("hyperliquid")
         self.assertEqual(self.switch("kraken", "hyperliquid", 1)[0], 200)
         for epoch in (0, 1, None):
@@ -571,7 +572,7 @@ class ExchangeRoutingTests(unittest.TestCase):
                    "Content-Type": "application/json", "X-Terminal-Token": security.token}
         status, _ = self.request("/api/exchange?exchange=kraken", {"exchange": "hyperliquid"}, 0, headers)
         self.assertEqual(status, 200)
-        self.assertFalse(self.ns["armed"])
+        self.assertTrue(self.ns["armed"], "the switch itself leaves ARM alone")
 
     def test_hyperliquid_sse_uses_only_its_bus_and_stops_on_switch(self):
         self.switch("hyperliquid")

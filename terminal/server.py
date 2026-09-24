@@ -1590,13 +1590,11 @@ class TerminalHandler(BaseHTTPRequestHandler):
             exchange = requested_exchange(parsed.query)
             epoch = self.headers.get("X-Terminal-Exchange-Epoch")
             if path == "/api/exchange":
-                def disarm():
-                    global armed
-                    armed = False
+                # A switch keeps the ARM state: switching while ARMED means the next order
+                # on the new venue is live. Active Chase workers still block a switch.
                 with arm_lock:
                     selected = exchange_routing.switch(exchange, epoch, body.get("exchange"),
-                                                        active_chases=lambda: chase_manager.active() + hl_chase_manager.active(),
-                                                        disarm=disarm)
+                                                        active_chases=lambda: chase_manager.active() + hl_chase_manager.active())
                     if selected["exchange"] != exchange:
                         sse.publish("armed", {"armed": armed})
                         sse.publish("exchange", selected)

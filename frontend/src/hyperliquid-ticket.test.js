@@ -1242,3 +1242,18 @@ test("Soft close on Hyperliquid starts one confirmed reduce-only Chase per posit
   await store.getState().softCloseHyperliquid();
   assert.equal(posts.length, 3, "stale positions: nothing sent");
 });
+
+test("An exchange switch keeps the ARM state and says so before switching", async t => {
+  const { store, posts, postPaths, prompts, toasts } = await harness(t,
+    () => ({ exchange: "kraken", exchangeEpoch: 2, exchangeRouting: 1, armed: true }));
+  let reloaded = 0;
+  globalThis.location = { reload() { reloaded++; } };
+  store.setState({ exchangeRouting: true, exchangeBusy: false, armed: true, ticketBusy: false });
+  await store.getState().switchExchange("kraken");
+  assert.match(prompts[0], /stays ARMED: orders on Kraken Futures will be LIVE/);
+  assert.match(postPaths[0], /^\/api\/exchange/);
+  assert.equal(posts[0].exchange, "kraken");
+  assert.equal(reloaded, 1, "an armed switch is accepted, not treated as unconfirmed");
+  assert.equal(globalThis.localStorage.getItem("kt.exchange"), "kraken");
+  assert.equal(toasts.filter(([kind]) => kind === "err").length, 0);
+});

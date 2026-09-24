@@ -53,7 +53,9 @@ class ExchangeRouting:
             with self.lock:
                 self.pending -= 1
 
-    def switch(self, exchange, epoch, target, *, active_chases, disarm):
+    def switch(self, exchange, epoch, target, *, active_chases, disarm=None):
+        # disarm: optional hook run on a real switch. The terminal no longer passes one:
+        # ARM stays as it was, at the user's request, and the UI keeps showing it.
         with self.lock:
             self.check(exchange, epoch, write=True)
             if target not in EXCHANGES:
@@ -70,7 +72,8 @@ class ExchangeRouting:
                 raise ExchangeRoutingError("Chase state unavailable. Exchange switch blocked.", 503)
             if workers:
                 raise ExchangeRoutingError("Finish or reconcile active Chase workers before switching exchanges.")
-            disarm()
+            if disarm is not None:
+                disarm()
             self.active = target
             self.epoch += 1
             return self.snapshot()
