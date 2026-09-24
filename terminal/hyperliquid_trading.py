@@ -123,7 +123,7 @@ def client_order_id():
     return "0x" + secrets.token_hex(16)
 
 
-SUCCESS_STATES = {"resting", "filled", "ok"}
+SUCCESS_STATES = {"resting", "filled", "ok", "waiting"}
 
 
 def build_order(action_asset, side, size, price, tif, reduce_only, *, trigger=None, cloid=None, grouping="na"):
@@ -239,8 +239,11 @@ def parse_exchange_response(payload):
     rows = []
     for entry in data["statuses"]:
         if isinstance(entry, str):
-            # cancel/cancelByCloid answer with "success" strings
-            rows.append({"state": "ok"} if entry == "success" else {"state": "error", "error": entry})
+            # cancel/cancelByCloid answer with "success" strings; an accepted TP/SL trigger
+            # answers "waitingForTrigger" (resting until its trigger price, no oid given).
+            rows.append({"state": "ok"} if entry == "success"
+                        else {"state": "waiting"} if entry == "waitingForTrigger"
+                        else {"state": "error", "error": entry})
             continue
         if not isinstance(entry, dict):
             raise HyperliquidError("Invalid exchange status row")
@@ -385,7 +388,7 @@ class HyperliquidTrader:
             outcome = "confirmed" if parsed["type"] == "default" and not parsed["rows"] else "unknown"
         elif parsed["type"] != expected_type or any(
                 row["state"] not in ({"ok", "error"} if expected_type == "cancel"
-                                     else {"resting", "filled", "error"})
+                                     else {"resting", "filled", "waiting", "error"})
                 for row in parsed["rows"]):
             outcome = "unknown"
         else:

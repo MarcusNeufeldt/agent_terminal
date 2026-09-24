@@ -207,8 +207,11 @@ export class TerminalOverlayLayer {
   onPointerMove(event) {
     if (this.drag || !this.args) return;
     const point = this.point(event);
-    const interactive = this.rowAt(point, "cancel") || this.rowAt(point, "protection") || this.rowAt(point, "drag");
-    this.plot.style.cursor = interactive ? (interactive.cancel ? "pointer" : "ns-resize") : "";
+    // A draggable line that also has a cancel button is one hit object, so test the
+    // button itself: only the button is a pointer, the rest of the line drags.
+    const cancel = this.rowAt(point, "cancel");
+    const drag = !cancel && (this.rowAt(point, "protection") || this.rowAt(point, "drag"));
+    this.plot.style.cursor = cancel ? "pointer" : drag ? "ns-resize" : "";
   }
 
   onDragMove(event) {

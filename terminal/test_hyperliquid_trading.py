@@ -130,6 +130,13 @@ class ResponseTests(unittest.TestCase):
         self.assertEqual(filled["rows"], [{"state": "filled", "oid": 123, "totalSize": "0.02",
                                            "averagePrice": "1891.4"}])
 
+    def test_an_accepted_trigger_waiting_for_its_price_is_a_success(self):
+        # Hyperliquid answers a placed TP/SL with the bare string "waitingForTrigger".
+        parsed = parse_exchange_response({"status": "ok", "response": {"type": "order", "data": {
+            "statuses": ["waitingForTrigger"]}}})
+        self.assertEqual(parsed["rows"], [{"state": "waiting"}])
+        self.assertEqual(classify(parsed["rows"], 1), "confirmed")
+
     def test_error_status_keeps_the_exchange_message(self):
         parsed = parse_exchange_response({"status": "ok", "response": {"type": "order", "data": {
             "statuses": [{"error": "Order must have minimum value of $10."}]}}})
