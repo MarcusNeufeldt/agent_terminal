@@ -7,11 +7,14 @@ import { unresolvedReceipt } from "../hyperliquid-receipt.js";
 import { contractsForNotional, normalizeContractSize } from "../size-precision";
 import { linearExitPreview } from "../risk-preview";
 import GridTicket from "./GridTicket";
+import { OrderTypeSelect, SizeSlider } from "./TicketControls";
+import { leverageChoices } from "../leverage";
 import { TAKER_FEE } from "../close-preview";
 
 const TYPES = [["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["chase", "Chase"], ["ioc", "IOC"], ["stp", "Stop"], ["take_profit", "Take profit"], ["grid", "Grid preview"]];
 // The venue rejects these with a minimum order value, so warn before submitting.
 const MIN_ORDER_VALUE = 10;
+let capacityRefreshPending = false;
 
 export function HyperliquidRiskPreview({ position, quantity, price, current }) {
   const preview = current ? linearExitPreview({ position, quantity, exitPrice: price }) : null;
@@ -67,7 +70,6 @@ export default function HyperliquidTicket() {
   const clearClose = useStore(s => s.clearHyperliquidClose);
 
   const [size, setSize] = useState(closeDraft?.size || "");
-  const [usd, setUsd] = useState("");
   const [sizingSource, setSizingSource] = useState("contracts");
   const [limit, setLimit] = useState("");
   const [stop, setStop] = useState("");
@@ -91,7 +93,6 @@ export default function HyperliquidTicket() {
   // A Chase prices itself from the book, so sizing uses the current quote.
   const chase = !closeDraft && otype === "chase";
   const explicitPrice = market || chase ? (ticker.ask || ticker.last || ticker.markPrice) : trigger ? stop : limit;
-  const validPrice = Number.isFinite(Number(explicitPrice)) && Number(explicitPrice) > 0;
   const price = Number(explicitPrice) || Number(ticker.last ?? ticker.markPrice) || 0;
   const lotDecimals = instrument.contractValueTradePrecision ?? 0;
   const capacityCurrent = capacity?.scopeKey === recoveryKey && capacity?.symbol === symbol &&
@@ -104,21 +105,25 @@ export default function HyperliquidTicket() {
     const quantity = contractsForNotional(available, 1, lotDecimals, percent);
     return Number(quantity) > 0 ? quantity : "";
   };
-  const contracts = sizingSource === "percent" ? percentQuantity("buy") || percentQuantity("sell")
-    : sizingSource === "usd" ? contractsForNotional(usd, explicitPrice, lotDecimals) : size;
+  const contracts = sizingSource === "percent" ? percentQuantity("buy") || percentQuantity("sell") : size;
   const estimate = Number(contracts) * price;
   const notional = Number(contracts) > 0 && price > 0 && Number.isFinite(estimate) ? estimate : null;
   const belowMinimum = notional !== null && notional < MIN_ORDER_VALUE;
-  const usdDisplay = sizingSource === "usd" ? usd : notional === null ? "" : String(Number(notional.toFixed(8)));
   const maxLeverage = Number.isFinite(instrument.maxLeverage) && instrument.maxLeverage >= 1 ? instrument.maxLeverage : null;
   const quickLeverage = capacityCurrent ? capacity.leverage.value : null;
   const pctDisabled = !!closeDraft || (reducing ? positionState !== "current" || matchingPositions.length !== 1
     : !capacityCurrent || !Object.values(capacity.maxTradeSizes).some(value => Number(value) > 0));
   const sizePercent = pct => {
-    if (pctDisabled || (!reducing && Date.now() - capacity.fetchedAt >= 15000)) { refreshCapacity(); return; }
+    if (pctDisabled || (!reducing && Date.now() - capacity.fetchedAt >= 15000)) {
+      // A slider drag fires on every step, so ask for fresh capacity once.
+      if (!capacityRefreshPending) { capacityRefreshPending = true; Promise.resolve(refreshCapacity()).finally(() => { capacityRefreshPending = false; }); }
+      return;
+    }
     setPercent(pct);
-    setSizingSource("percent");
+    setSizingSource(pct > 0 ? "percent" : "contracts");
+    if (pct === 0) setSize("");
   };
+  const levChoices = leverageChoices(maxLeverage);
 
   const liveChases = Object.values(chases || {}).filter(c => c.exchange === "hyperliquid" &&
     ["running", "unknown", "orphaned"].includes(c.status));
@@ -130,9 +135,8 @@ export default function HyperliquidTicket() {
     expectedLeverage: sizingSource === "percent" && capacityCurrent ? capacity.leverage.value : undefined,
     expectedMarginMode: sizingSource === "percent" && capacityCurrent ? capacity.leverage.type : undefined,
     // A market order's price comes from the server's fresh quote, so bound the
-    // dollar value to what was on screen. USD sizing already states that budget.
-    maxNotional: sizingSource === "usd" ? usd
-      : market && notional !== null
+    // dollar value to what was on screen.
+    maxNotional: market && notional !== null
         ? String(Number((notional * (1 + (Number(slippage) || 0) / 100)).toFixed(8)))
         : undefined,
     limitPrice: trigger ? (stopLimit ? Number(limit) : undefined) : market ? undefined : Number(limit),
@@ -157,12 +161,7 @@ export default function HyperliquidTicket() {
           {" IOC may fill only part of the position; it does not guarantee a flat account."}
           <button disabled={ticketBusy} onClick={clearClose}>Regular ticket</button>
         </div>}
-        <div className="ord-tabs">
-          {TYPES.map(([value, label]) => (
-            <button key={value} disabled={ticketBusy || !!closeDraft} className={"ord-tab" + (otype === value ? " active" : "")}
-              aria-pressed={otype === value} data-otype={value} onClick={() => setOtype(value)}>{label}</button>
-          ))}
-        </div>
+        {!closeDraft && <OrderTypeSelect types={TYPES} value={otype} disabled={ticketBusy} onChange={setOtype} />}
         {otype === "grid" && !closeDraft ? <GridTicket symbol={symbol} /> : <>
         {chase ? <div className="ticket-note">
           Rests post-only at the best bid (buy) or ask (sell) and re-pegs as the book moves, so every fill pays the maker fee.
@@ -172,7 +171,7 @@ export default function HyperliquidTicket() {
           <label htmlFor="hl-slippage">Market slippage limit (%)</label>
           <input id="hl-slippage" type="number" min="0.01" max="5" step="0.01" value={slippage}
             onChange={e => setSlippage(e.target.value)} />
-          <div className="ticket-note">Price is set automatically from fresh exchange quotes. Uses an IOC limit within your slippage bound; partial or no fill is possible. USD caps the prepared limit-price notional, excluding fees. Actual sell fill notional can differ with price improvement; lot rounding may leave budget unused. Allow some room above the $10 minimum.</div>
+          <div className="ticket-note">Priced from a fresh exchange quote and sent as an IOC limit within this bound, so a partial or no fill is possible.</div>
         </div> : trigger ? (
           <div className="field" id="f-stop">
             <label htmlFor="hl-stop">Trigger price <span id="trigger-signal-note">(mark)</span></label>
@@ -200,27 +199,18 @@ export default function HyperliquidTicket() {
           </div>
         )}
         <div className="field ticket-sizing">
-          <label htmlFor="hl-size">Order size <span className="ticket-unit">Contracts{lotDecimals ? ` · ${lotDecimals} dp` : ""}</span></label>
-          <input id="hl-size" type="number" step="any" placeholder="0.0" value={contracts}
-            onChange={e => { setSize(e.target.value); setSizingSource("contracts"); }} />
-          <div className="size-quick">
-            {[25, 50, 75, 100].map(pct => (
-              <button key={pct} disabled={pctDisabled} data-pct={pct} onClick={() => sizePercent(pct)}>{pct}%</button>
-            ))}
+          <label htmlFor="hl-size">Size <span className="ticket-unit">Contracts{lotDecimals ? ` · ${lotDecimals} dp` : ""}</span></label>
+          <div className="size-input-row">
+            <input id="hl-size" type="number" step="any" placeholder="0.0" value={contracts}
+              onChange={e => { setSize(e.target.value); setSizingSource("contracts"); setPercent(0); }} />
+            <span className={"usd-equiv" + (belowMinimum ? " warn" : "")}>{notional === null ? "" : `≈ $${notional.toFixed(2)}`}</span>
           </div>
-          <label htmlFor="hl-usd" className="ticket-sub-label">Or enter USD notional</label>
-          <div className="size-usd-row">
-            <span className="usd-prefix">$</span>
-            <input id="hl-usd" type="number" step="any" placeholder="size in USD" value={usdDisplay}
-              onChange={e => { setUsd(e.target.value); setSizingSource("usd"); }} />
-          </div>
-          {!validPrice && (
-            <div className="ticket-note">{market ? "USD sizing needs a current price estimate. Contract sizing does not require entering a price." : "USD sizing requires an explicit limit or trigger price."}</div>
-          )}
+          <SizeSlider value={sizingSource === "percent" ? percent : 0} disabled={pctDisabled} onChange={sizePercent}
+            title={reducing ? "Percent of the current position" : "Percent of the exchange trading capacity at the current leverage"} />
           {sizingSource === "percent" && <div className="ticket-note">{percent}% of {reducing ? "the current position" : "exchange trading capacity"}: Buy {percentQuantity("buy") || "0"}, Sell {percentQuantity("sell") || "0"} contracts. Final size is rechecked before submission.</div>}
-          <div className="ticket-sub-label">Exchange leverage <span>{quickLeverage ? `${quickLeverage}x · ${capacity.leverage.type}` : "Loading current setting"}</span></div>
-          <div className="size-quick" title="Changes actual exchange leverage. Margin mode stays unchanged. Live changes require ARM and confirmation.">
-            {[1, 2, 3, 5, 10].map(value => (
+          <div className="ticket-sub-label">Exchange leverage <span>{quickLeverage ? `${quickLeverage}x · ${capacity.leverage.type}` : "Loading current setting"}{maxLeverage ? ` · pair max ${maxLeverage}x` : ""}</span></div>
+          <div className="lev-chips" title="Changes actual exchange leverage. Margin mode stays unchanged. Live changes require ARM and confirmation.">
+            {levChoices.map(value => (
               <button key={value} disabled={!!closeDraft || !maxLeverage || value > maxLeverage || !capacityCurrent || !canTrade || ticketBusy || reconciling || recoveryBlocked || value === quickLeverage} data-lev={value}
                 className={quickLeverage === value ? "active" : ""} onClick={() => applyLeverage(value)}>{value}x</button>
             ))}
@@ -233,11 +223,9 @@ export default function HyperliquidTicket() {
             onChange={e => setReduce(e.target.checked)} />
           <label htmlFor="hl-reduce">Reduce-only{trigger ? " (required for triggers)" : ""}</label>
         </div>
-        <div className="ticket-note" style={{ color: belowMinimum ? "var(--red)" : "var(--muted)" }}>
-          {notional === null
-            ? `Minimum order value $${MIN_ORDER_VALUE}`
-            : `≈ $${notional.toFixed(2)} notional${belowMinimum ? ` — below the $${MIN_ORDER_VALUE} venue minimum` : ""}`}
-        </div>
+        {(notional === null || belowMinimum) && <div className="ticket-note" style={{ color: belowMinimum ? "var(--red)" : "var(--muted)" }}>
+          {belowMinimum ? `Below the $${MIN_ORDER_VALUE} venue minimum` : `Minimum order value $${MIN_ORDER_VALUE}`}
+        </div>}
         {trigger && <HyperliquidRiskPreview position={matchingPositions[0]}
           quantity={normalizeContractSize(contracts, lotDecimals)} price={stop}
           current={positionState === "current" && matchingPositions.length === 1} />}

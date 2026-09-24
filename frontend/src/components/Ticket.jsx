@@ -1,8 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { fmt } from "../api";
-import { contractsForNotional } from "../size-precision";
+import { leverageChoices, pairMaxLeverage } from "../leverage";
 import useStore from "../store";
 import GridTicket from "./GridTicket";
+import { OrderTypeSelect, SizeSlider } from "./TicketControls";
+
+const TYPES = [["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["stp", "Stop"], ["take_profit", "Take profit"], ["chase", "Chase"], ["grid", "Grid"]];
 
 export default function Ticket() {
   const symbol = useStore(s => s.symbol);
@@ -16,7 +19,15 @@ export default function Ticket() {
   const gridSeed = useStore(s => s.gridSeed);
   const submitOrder = useStore(s => s.submitOrder);
   const sizeFromPct = useStore(s => s.sizeFromPct);
+  const instruments = useStore(s => s.instruments);
   const t = tickers[symbol] || {};
+  // The slider position belongs to the symbol it sized, so it resets on a switch.
+  const [sized, setSized] = useState({ symbol, pct: 0 });
+  const pct = sized.symbol === symbol ? sized.pct : 0;
+  const setPct = value => setSized({ symbol, pct: value });
+  // The % sizing multiplier never exceeds 10x or the pair's own maximum.
+  const maxLev = pairMaxLeverage(instruments.find(i => i.symbol === symbol));
+  const levChoices = leverageChoices(Math.min(maxLev || 10, 10), [1, 2, 3, 5, 10]);
 
   useEffect(() => {
     const limit = document.getElementById("in-limit");
@@ -25,12 +36,11 @@ export default function Ticket() {
     if (t && ["stp", "take_profit"].includes(otype) && stop && !stop.value) stop.placeholder = fmt(t.markPrice);
   }, [otype, t, symbol]);
 
-  // live $ notional <-> contracts sync (source of truth stays contracts)
+  // live notional readout for the typed contract size
   useEffect(() => {
     const sizeEl = document.getElementById("in-size");
-    const usdEl = document.getElementById("in-usd");
     const equiv = document.getElementById("usd-equiv");
-    if (!sizeEl || !usdEl || !equiv) return;
+    if (!sizeEl || !equiv) return;
     const price = () => {
       const lv = Number(document.getElementById("in-limit") && document.getElementById("in-limit").value);
       return lv > 0 ? lv : Number(t.last || t.markPrice || 0);
@@ -40,22 +50,15 @@ export default function Ticket() {
       const isInverse = inst.type === "futures_inverse";
       return isInverse ? Number(inst.contractSize || 1) : Number(inst.contractSize || 1) * price();
     };
-    const prec = () => Number((useStore.getState().instruments.find(i => i.symbol === symbol) || {}).contractValueTradePrecision ?? 2);
     const syncEquiv = () => {
       const n = Number(sizeEl.value || 0);
       const m = mult();
-      equiv.textContent = n > 0 && m > 0 ? `≈ $${(n * m).toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "–";
+      equiv.textContent = n > 0 && m > 0 ? `≈ $${(n * m).toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "";
     };
     sizeEl.addEventListener("input", syncEquiv);
-    const syncSize = () => {
-      const usd = Number(usdEl.value || 0);
-      const m = mult();
-      if (usd > 0 && m > 0) sizeEl.value = contractsForNotional(usdEl.value, m, prec());
-      syncEquiv();
-    };
-    usdEl.addEventListener("input", syncSize);
-    const iv = setInterval(syncEquiv, 1000); // keep ≈ label fresh as price moves
-    return () => { sizeEl.removeEventListener("input", syncEquiv); usdEl.removeEventListener("input", syncSize); clearInterval(iv); };
+    syncEquiv(); // ticker updates re-run this effect, so refresh now rather than wait for the interval
+    const iv = setInterval(syncEquiv, 1000); // keep the readout fresh as price moves and after % sizing
+    return () => { sizeEl.removeEventListener("input", syncEquiv); clearInterval(iv); };
   }, [symbol, t, otype]);
 
   const isLimit = ["lmt", "post", "ioc"].includes(otype);
@@ -69,11 +72,7 @@ export default function Ticket() {
         <span className={`ticket-mode${armed ? " live" : ""}`}>{armed ? "Live trading" : "Simulation"}</span>
       </div>
       <div className="ticket-body">
-        <div className="ord-tabs">
-          {[["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["stp", "Stop"], ["take_profit", "Take profit"], ["chase", "Chase"], ["grid", "Grid"]].map(([v, label]) => (
-            <button key={v} disabled={ticketBusy} className={"ord-tab" + (otype === v ? " active" : "")} aria-pressed={otype === v} data-otype={v} onClick={() => setOtype(v)}>{label}</button>
-          ))}
-        </div>
+        <OrderTypeSelect types={TYPES} value={otype} disabled={ticketBusy} onChange={setOtype} />
         {otype === "grid" ? <GridTicket key={`${symbol}:${gridSeed?.id || ""}`} symbol={symbol} /> : <>
         {isLimit && (
           <div className="field" id="f-limit">
@@ -88,23 +87,17 @@ export default function Ticket() {
           </div>
         )}
         <div className="field ticket-sizing">
-          <label htmlFor="in-size">Order size <span className="ticket-unit">Contracts</span></label>
-          <input id="in-size" type="number" step="any" placeholder="0.0" />
-          <div className="size-quick">
-            {[25, 50, 75, 100].map(p => (
-              <button key={p} data-pct={p} onClick={() => sizeFromPct(p)}>{p}%</button>
-            ))}
+          <label htmlFor="in-size">Size <span className="ticket-unit">Contracts</span></label>
+          <div className="size-input-row">
+            <input id="in-size" type="number" step="any" placeholder="0.0" onInput={() => setPct(0)} />
+            <span id="usd-equiv" className="usd-equiv"></span>
           </div>
-          <label htmlFor="in-usd" className="ticket-sub-label">Or enter USD notional</label>
-          <div className="size-usd-row" title="Type a dollar notional — converts to contracts at the current mark">
-            <span className="usd-prefix">$</span>
-            <input id="in-usd" type="number" step="any" placeholder="size in USD" />
-            <span id="usd-equiv" className="usd-equiv">–</span>
-          </div>
-          <div className="ticket-sub-label">Quick-size leverage <span>For the % buttons</span></div>
-          <div className="size-quick" id="lev-quick" title="Leverage applied to the % size buttons">
-            {[1, 2, 3, 5, 10].map(l => (
-              <button key={l} data-lev={l} className={lev === l ? "active" : ""} onClick={() => setLev(l)}>{l}x</button>
+          <SizeSlider value={pct} onChange={p => { setPct(p); if (p > 0) sizeFromPct(p); }}
+            title={`Percent of available margin at ${lev}x`} />
+          <div className="ticket-sub-label">Sizing leverage <span>{maxLev ? `pair max ${maxLev}x · ` : ""}for the % sizing only</span></div>
+          <div className="lev-chips" id="lev-quick" title="Leverage applied to the % sizing. It does not change anything on Kraken.">
+            {levChoices.map(l => (
+              <button key={l} data-lev={l} className={lev === l ? "active" : ""} onClick={() => { setLev(l); if (pct > 0) setTimeout(() => useStore.getState().sizeFromPct(pct)); }}>{l}x</button>
             ))}
           </div>
         </div>

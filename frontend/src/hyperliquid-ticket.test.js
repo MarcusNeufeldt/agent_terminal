@@ -531,14 +531,18 @@ test("Percentage buttons use current exchange capacity without guessing from bal
   store.setState({ account: { balanceValue: 10000, withdrawable: 10000, availableMargin: null },
     instruments: [{ symbol: SYMBOL, contractValueTradePrecision: 2, maxLeverage: 5 }] });
   let markup = render();
-  assert.match(markup, /id="hl-usd"/);
+  assert.doesNotMatch(markup, /id="hl-usd"/);
+  assert.match(markup, /type="range"/);
+  assert.doesNotMatch(markup, /data-lev="10"/, "a 5x pair offers no 10x button");
+  assert.match(markup, /pair max 5x/);
   assert.match(markup, /disabled="" data-pct="25"/);
   store.setState({ hlCapacity: { symbol: SYMBOL, scopeKey: store.getState().hlReceiptKey, fetchedAt: Date.now(), maxTradeSizes: { buy: "20", sell: "30" }, leverage: { value: 3, type: "cross" } } });
   markup = render();
   assert.doesNotMatch(markup, /disabled="" data-pct="25"/);
   assert.match(markup, /Exchange maximum: Buy 20, Sell 30/);
   assert.match(markup, /Changes actual exchange leverage/);
-  assert.match(markup, /disabled="" data-lev="10"/);
+  assert.match(markup, /data-lev="5"/);
+  assert.doesNotMatch(markup, /data-lev="10"/);
   store.setState({ hlCapacity: { ...store.getState().hlCapacity, fetchedAt: Date.now() - 20000 } });
   assert.match(render(), /disabled="" data-pct="100"/);
   assert.equal(localStorage.getItem("kt.lev"), null);

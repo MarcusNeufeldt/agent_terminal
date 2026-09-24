@@ -10,6 +10,7 @@ import { buildChartOverlays } from "./chart-overlays";
 import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { valuationPrice } from "./pricing.js";
 import { closePreview, exitAfterFee, TAKER_FEE } from "./close-preview.js";
+import { pairMaxLeverage } from "./leverage.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
@@ -1756,7 +1757,8 @@ const useStore = create((set, get) => ({
     const inst = s.instruments.find(i => i.symbol === s.symbol) || {};
     const mult = Number(inst.contractSize || 1);
     const isInverse = inst.type === "futures_inverse";
-    const notional = avail * (pct / 100) * s.lev;
+    const maxLev = pairMaxLeverage(inst);
+    const notional = avail * (pct / 100) * (maxLev ? Math.min(s.lev, maxLev) : s.lev);
     const size = isInverse ? notional / mult : notional / (mult * Number(t.last));
     const el = document.getElementById("in-size");
     if (el) el.value = formatContractSize(size, inst.contractValueTradePrecision ?? 2);
