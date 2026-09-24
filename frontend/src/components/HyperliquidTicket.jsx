@@ -8,6 +8,7 @@ import { contractsForNotional, normalizeContractSize } from "../size-precision";
 import { linearExitPreview } from "../risk-preview";
 import GridTicket from "./GridTicket";
 import { OrderTypeSelect, SizeSlider } from "./TicketControls";
+import ChaseStatus from "./ChaseStatus";
 import { leverageChoices } from "../leverage";
 import { TAKER_FEE } from "../close-preview";
 
@@ -58,8 +59,6 @@ export default function HyperliquidTicket() {
     serverUnresolved.length > 0 || recoveryHasMore || unresolvedReceipt(receipt);
   const submitHyperliquidOrder = useStore(s => s.submitHyperliquidOrder);
   const submitHyperliquidChase = useStore(s => s.submitHyperliquidChase);
-  const abortChase = useStore(s => s.abortChase);
-  const chases = useStore(s => s.chases);
   const tickers = useStore(s => s.tickers);
   const instruments = useStore(s => s.instruments);
   const capacity = useStore(s => s.hlCapacity);
@@ -129,8 +128,6 @@ export default function HyperliquidTicket() {
   };
   const levChoices = leverageChoices(maxLeverage);
 
-  const liveChases = Object.values(chases || {}).filter(c => c.exchange === "hyperliquid" &&
-    ["running", "unknown", "orphaned"].includes(c.status));
   const submit = side => chase ? submitHyperliquidChase(side, {
     size: Number(sizingSource === "percent" ? percentQuantity(side) : contracts), reduceOnly: reduce,
   }) : submitHyperliquidOrder(side, {
@@ -244,6 +241,7 @@ export default function HyperliquidTicket() {
           </>}
         </div>
         </>}
+        <ChaseStatus exchange="hyperliquid" />
         <div className="ticket-note" style={{ color: armed ? "var(--red)" : "var(--muted)" }}>
           {!canTrade
             ? "Hyperliquid signed trading is off. Set HYPERLIQUID_TRADING and HYPERLIQUID_SECRET_KEY, then restart the backend."
@@ -251,15 +249,6 @@ export default function HyperliquidTicket() {
               ? "ARMED — a confirmed click signs and sends a real order to Hyperliquid."
               : "DISARMED — the exact order is validated and shown, but nothing is signed or sent."}
         </div>
-        {liveChases.map(c => (
-          <div key={c.id} className="ticket-note" role="status">
-            Chase {c.side} {c.symbol}: {c.status} · filled {fmt(c.filled)}/{fmt(c.size)} · {c.pegs ?? 0} pegs
-            {c.status === "running"
-              ? <button type="button" onClick={() => abortChase(c.id)}>Stop</button>
-              : <div>{c.unknownReason || "Needs a manual check on Hyperliquid."} New orders are blocked until it is checked.
-                  {" "}<button type="button" onClick={() => abortChase(c.id, { acknowledge: true })}>Mark checked</button></div>}
-          </div>
-        ))}
         {recoveryError && <div className="ticket-note" role="alert">Recovery blocked: {recoveryError}</div>}
         {(!recoveryLoaded || serverUnresolved.length > 0) && (
           <div className="ticket-note" role="status">

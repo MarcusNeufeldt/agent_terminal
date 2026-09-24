@@ -224,6 +224,17 @@ class HyperliquidChaseTests(unittest.TestCase):
         self.assertEqual(snap["exchange"], "hyperliquid")
         self.assertEqual(snap["spec"]["exchange"], "hyperliquid")
 
+    def test_published_snapshots_carry_the_resting_peg_price(self):
+        exchange = FakeExchange(script=[{"fill_on_read": 1}])
+        worker = run({}, FakeBackend(exchange, [(100.0, 101.0)]), exchange)
+        snaps = []
+        worker.publish = lambda _kind, snap: snaps.append(snap)
+        worker.run()
+        resting = [s for s in snaps if s["activePrice"] is not None]
+        self.assertTrue(resting)
+        self.assertEqual((resting[0]["activePrice"], resting[0]["activeSize"]), (100.0, 1.0))
+        self.assertIsNone(snaps[-1]["activePrice"])
+
 
 class SpecAndPreviewTests(unittest.TestCase):
     def test_exits_finish_at_market_and_entries_do_not(self):

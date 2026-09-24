@@ -4,6 +4,7 @@ import { leverageChoices, pairMaxLeverage } from "../leverage";
 import useStore from "../store";
 import GridTicket from "./GridTicket";
 import { OrderTypeSelect, SizeSlider } from "./TicketControls";
+import ChaseStatus from "./ChaseStatus";
 
 const TYPES = [["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["stp", "Stop"], ["take_profit", "Take profit"], ["chase", "Chase"], ["grid", "Grid"]];
 
@@ -20,11 +21,6 @@ export default function Ticket() {
   const submitOrder = useStore(s => s.submitOrder);
   const sizeFromPct = useStore(s => s.sizeFromPct);
   const instruments = useStore(s => s.instruments);
-  const chases = useStore(s => s.chases);
-  const abortChase = useStore(s => s.abortChase);
-  // A Kraken Chase whose outcome is unknown blocks exchange switching until checked.
-  const stuckChases = Object.values(chases || {}).filter(c => c.exchange !== "hyperliquid" &&
-    ["unknown", "orphaned"].includes(c.status));
   const t = tickers[symbol] || {};
   // The slider position belongs to the symbol it sized, so it resets on a switch.
   const [sized, setSized] = useState({ symbol, pct: 0 });
@@ -114,19 +110,14 @@ export default function Ticket() {
           <button id="btn-buy" disabled={ticketBusy} onClick={() => submitOrder("buy")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
           <button id="btn-sell" disabled={ticketBusy} onClick={() => submitOrder("sell")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
         </div>
+        <ChaseStatus exchange="kraken" />
         <div className="ticket-note" style={{ color: isChase ? (armed ? "var(--accent)" : "var(--muted)") : (armed ? "var(--red)" : "var(--muted)") }}>
           {isChase
             ? (armed ? "CHASE: reconciled post-only orders at best bid/ask, re-pegged only after confirmed cancellation." : "CHASE requires an armed terminal.")
             : (armed ? `LIVE: orders go straight to Kraken (${window.__env || "live"}).` : "SIMULATION: arm the terminal to send real orders.")}
         </div>
         </>}
-        {stuckChases.map(c => (
-          <div key={c.id} className="ticket-note" role="alert">
-            Chase {c.side} {c.symbol}: {c.status} · filled {fmt(c.filled)}/{fmt(c.size)}.
-            {" "}{c.unknownReason || "Needs a manual check on Kraken."} Exchange switching is blocked until it is checked.
-            {" "}<button type="button" onClick={() => abortChase(c.id, { acknowledge: true })}>Mark checked</button>
-          </div>
-        ))}
+        {otype === "grid" && <ChaseStatus exchange="kraken" />}
       </div>
     </div>
   );

@@ -100,6 +100,9 @@ class ChaseWorker(threading.Thread):
             "filled": self.filled,
             "activeCliOrdId": active.get("cliOrdId"),
             "activeOrderId": active.get("orderId"),
+            # The resting peg, so the UI can draw it without waiting for an order poll.
+            "activePrice": float(active["price"]) if active.get("price") is not None else None,
+            "activeSize": float(active["size"]) if active.get("size") is not None else None,
             "unknownReason": self.unknown_reason,
             "stopReason": self.stop_reason,
             "events": self.events[-8:],

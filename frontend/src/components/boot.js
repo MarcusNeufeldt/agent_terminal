@@ -27,7 +27,8 @@ export async function bootTerminal(signal) {
     s.toast(`Server health check failed: ${e.message}`, "err");
   }
 
-  if (!s.readOnly) try {
+  // Both venues: a Chase started before a reload keeps its status card and chart line.
+  try {
     const data = await api("/api/chase", { signal });
     for (const chase of data.chases || []) useStore.getState().onChaseEvent(chase);
   } catch (e) {}

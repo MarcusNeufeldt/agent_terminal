@@ -404,6 +404,31 @@ body.right-collapsed .right-expand { display: flex; }
 #ticket .side-btns button:hover:not(:disabled) { filter: brightness(1.1); }
 #ticket .side-btns button:active:not(:disabled) { transform: translateY(1px); }
 #ticket .ticket-note { font-size: 10px; line-height: 1.6; }
+
+/* live Chase status under the Buy/Sell buttons */
+.chase-cards { display: flex; flex-direction: column; gap: 8px; }
+.chase-card { display: flex; flex-direction: column; gap: 8px; padding: 11px 12px; border: 1px solid #2c3a52; border-left: 3px solid #b388ff; border-radius: 10px; background: rgba(179, 136, 255, 0.05); }
+.chase-card.status-filled { border-left-color: var(--green); background: var(--green-dim); }
+.chase-card.status-unknown, .chase-card.status-orphaned { border-left-color: var(--warn); background: rgba(240, 185, 11, 0.07); }
+.chase-card.status-rejected, .chase-card.status-cancelled, .chase-card.status-timeout, .chase-card.status-aborted { border-left-color: var(--muted); background: #ffffff04; }
+.chase-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.chase-card-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.chase-card .muted { color: var(--muted); font-weight: 400; }
+.chase-pill { padding: 2px 8px; border-radius: 999px; font-size: 10px; border: 1px solid var(--border2); color: #a9b6cd; white-space: nowrap; }
+.chase-pill.live { color: #d9c4ff; border-color: rgba(179, 136, 255, 0.55); animation: chase-pulse 1.6s ease-in-out infinite; }
+.chase-pill.ok { color: var(--green); border-color: rgba(38, 166, 154, 0.6); }
+.chase-pill.warn { color: var(--warn); border-color: rgba(240, 185, 11, 0.6); }
+@keyframes chase-pulse { 50% { background: rgba(179, 136, 255, 0.16); } }
+.chase-bar { height: 4px; border-radius: 4px; background: #263043; overflow: hidden; }
+.chase-bar-fill { height: 100%; background: #b388ff; transition: width 0.3s ease; }
+.chase-card.status-filled .chase-bar-fill { background: var(--green); }
+.chase-card-grid { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 11px; color: var(--muted); }
+.chase-card-grid b { font: 500 11px var(--mono); color: var(--text); text-align: right; }
+.chase-card-event { font: 10px var(--mono); color: #8d99ad; line-height: 1.5; overflow-wrap: anywhere; }
+.chase-card-event.warn { color: var(--warn); font-family: inherit; }
+.chase-stop { align-self: stretch; padding: 8px 0; border-radius: 8px; border: 1px solid rgba(239, 83, 80, 0.55); background: transparent; color: #ff9693; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.chase-stop:hover:not(:disabled) { background: var(--red-dim); }
+.chase-stop:disabled { opacity: 0.55; cursor: wait; }
 .field { display: flex; flex-direction: column; gap: 3px; }
 .field label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
 .field input, .field select {

@@ -1186,8 +1186,10 @@ test("Chase renders without a price field and sends explicit Hyperliquid values,
   assert.match(prompts[0], /unfilled rest is cancelled/, "an entry never goes to market on timeout");
   assert.equal(posts[1].expectedArmed, true);
   assert.equal(store.getState().chases.c1.status, "running");
-  assert.match(render(), /Chase buy HL_APT: running/);
-  assert.match(render(), />Stop</);
+  const card = render();
+  assert.match(card, /class="chase-card buy status-running"/);
+  assert.match(card, /Chasing/);
+  assert.match(card, />Stop chase</);
 
   await store.getState().abortChase("c1");
   assert.match(postPaths[2], /^\/api\/chase\/abort/);
@@ -1201,7 +1203,8 @@ test("Chase renders without a price field and sends explicit Hyperliquid values,
   store.getState().onChaseEvent({ id: "orphan-0x6368", exchange: "hyperliquid", symbol: SYMBOL, side: "buy",
     size: 20, filled: 0, status: "orphaned", unknownReason: "exchange order exists without a live Chase worker" });
   const orphaned = render();
-  assert.match(orphaned, /orphaned/);
+  assert.match(orphaned, /Needs check/);
+  assert.match(orphaned, /exchange order exists without a live Chase worker/);
   assert.match(orphaned, /Mark checked/);
 });
 

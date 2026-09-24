@@ -11,6 +11,7 @@ import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { valuationPrice } from "./pricing.js";
 import { closePreview, exitAfterFee, TAKER_FEE } from "./close-preview.js";
 import { pairMaxLeverage } from "./leverage.js";
+import { chaseOverlays } from "./chase-view.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
@@ -530,10 +531,18 @@ const useStore = create((set, get) => ({
   },
 
   applyOverlayLines() {
-    const { positions, orders, instruments, symbol, readOnly, canTrade, dataStatus, bulkBusy } = get();
+    const { positions, orders: polledOrders, instruments, symbol, readOnly, canTrade, dataStatus, bulkBusy, chases } = get();
+    // A running Chase draws its own peg (below), so its polled order would be a stale duplicate.
+    const chasePegIds = new Set(Object.values(chases || {})
+      .filter(c => c?.status === "running" && Number(c.activePrice) > 0 && c.activeCliOrdId)
+      .map(c => String(c.activeCliOrdId).toLowerCase()));
+    const orders = (polledOrders || []).filter(o => !chasePegIds.has(String(o.cliOrdId || "").toLowerCase()));
     const symbols = new Set([symbol, ...(chart?.symbols?.() || [])]);
     const bySymbol = Object.fromEntries(
-      [...symbols].map(current => [current, buildChartOverlays(current, positions, orders, instruments, readOnly, canTrade && dataStatus.orders?.state === "current" && !bulkBusy, get().canHyperliquidChart())]),
+      [...symbols].map(current => [current, [
+        ...buildChartOverlays(current, positions, orders, instruments, readOnly, canTrade && dataStatus.orders?.state === "current" && !bulkBusy, get().canHyperliquidChart()),
+        ...chaseOverlays(chases, current, EXCHANGE),
+      ]]),
     );
     const preview = get().gridPreview;
     if (preview && bySymbol[preview.symbol]) {
@@ -1639,6 +1648,7 @@ const useStore = create((set, get) => ({
   onChaseEvent(c) {
     if (!c || !c.id) return;
     set(s => ({ chases: { ...s.chases, [c.id]: { ...c, updated: Date.now() } } }));
+    if (!(chart && chart._drag)) get().applyOverlayLines(); // move the Chase line with each re-peg
   },
 
   onProtectionAlert(alert) {

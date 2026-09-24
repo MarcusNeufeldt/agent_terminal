@@ -193,6 +193,7 @@ test("Hyperliquid boot owns its stream and never loads Kraken automation or chat
     const data = parsed.pathname === "/api/health" ? { ...session, armed: false, env: "live", hasKeys: false,
       network: "mainnet", accountAddress: "0x" + "1".repeat(40) }
       : parsed.pathname === "/api/execution-recovery" ? { state: "current", items: [], hasMore: false }
+      : parsed.pathname === "/api/chase" ? { chases: [{ id: "hl1", exchange: "hyperliquid", status: "running" }] }
       : parsed.pathname === "/api/instruments" ? { instruments: [{ symbol: "HL_BTC", contractSize: 1 }] }
       : parsed.pathname === "/api/tickers" ? { tickers: {}, watchlist: ["HL_BTC"] }
       : assert.fail(`Unexpected boot request ${url}`);
@@ -206,7 +207,9 @@ test("Hyperliquid boot owns its stream and never loads Kraken automation or chat
   });
   const controller = new AbortController();
   await bootTerminal(controller.signal);
-  assert.deepEqual(requests, ["/api/health", "/api/execution-recovery", "/api/instruments", "/api/tickers"]);
+  // The Hyperliquid Chase list loads at boot so a running Chase survives a reload.
+  assert.deepEqual(requests, ["/api/health", "/api/execution-recovery", "/api/chase", "/api/instruments", "/api/tickers"]);
+  assert.equal(store.getState().chases.hl1.status, "running");
   assert.equal(store.getState().hlRecoveryLoaded, true);
   assert.deepEqual(store.getState().chat, []);
   assert.equal(intervals.size, 6);
