@@ -619,7 +619,8 @@ AI_NET_BOOKS = 8
 
 def with_net_if_closed(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Kraken positions for the AI, valued like the screen's "Net if closed": the book
-    walked for the full size, less the taker fee, plus funding that settles on close.
+    walked for the full size, less the exit taker fee and the estimated entry fee, plus
+    funding that settles on close.
     Kraken's own unrealizedPnl is mark-based and is passed on only as krakenMarkPnl."""
     instruments = {str(i.get("symbol")): i for i in get_instruments().get("instruments", [])}
     ranked = sorted((p for p in positions if isinstance(p, dict) and not p.get("error")),
@@ -643,7 +644,8 @@ def with_net_if_closed(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if symbol in booked:
                 try:
                     book = client.get("/orderbook", params={"symbol": symbol}).get("orderBook") or {}
-                    preview = close_preview.close_preview(position, book, fee_rate=fee, contract_size=mult, funding=funding)
+                    preview = close_preview.close_preview(position, book, fee_rate=fee, contract_size=mult, funding=funding,
+                                                          entry_fee_rate=fee)
                     basis = "book" if preview else basis
                 except Exception:
                     preview = None
@@ -652,7 +654,8 @@ def with_net_if_closed(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 best = ticker.get("bid") if position.get("side") == "long" else ticker.get("ask")
                 if _as_float(best):
                     preview = close_preview.close_preview(position, {"bids": [[best, 1e18]], "asks": [[best, 1e18]]},
-                                                          fee_rate=fee, contract_size=mult, funding=funding)
+                                                          fee_rate=fee, contract_size=mult, funding=funding,
+                                                          entry_fee_rate=fee)
                     basis = "best_price_no_depth" if preview else basis
         if preview:
             row.update({key: round(value, 4) if isinstance(value, float) else value for key, value in preview.items()})

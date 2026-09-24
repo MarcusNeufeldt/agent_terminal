@@ -1052,7 +1052,7 @@ test("Every open position gets its full book, so PnL is what a market close real
   // 1598 CHIP walks past the 1-contract best bid; the net shows it and pays the fee.
   const chip = store.getState().positions[1];
   const net = store.getState().computeUpnl(chip);
-  const expected = 1 * (0.6 - 0.5) + 1597 * (0.59 - 0.5) - 0.00045 * (0.6 + 1597 * 0.59);
+  const expected = 1 * (0.6 - 0.5) + 1597 * (0.59 - 0.5) - 0.00045 * (0.6 + 1597 * 0.59) - 0.00045 * 1598 * 0.5;
   assert.ok(Math.abs(net - expected) < 1e-9, `${net} != ${expected}`);
   assert.ok(net < store.getState().computeUpnl(chip, { mode: "gross" }), "net is below the best-bid value");
 
@@ -1064,7 +1064,7 @@ test("Every open position gets its full book, so PnL is what a market close real
   assert.ok(store.getState().books.HL_CHIP, "a failed read does not erase the last book");
   store.setState({ books: { HL_CHIP: { ...book, at: Date.now() - 60000 } } });
   const fallback = store.getState().computeUpnl(chip);
-  assert.ok(Math.abs(fallback - (1598 * 0.1 - 0.00045 * 1598 * 0.6)) < 1e-9, "stale book: best bid less the fee");
+  assert.ok(Math.abs(fallback - (1598 * 0.1 - 0.00045 * 1598 * (0.6 + 0.5))) < 1e-9, "stale book: best bid less both fees");
 
   // Kraken now pays for books too: its tickers carry only the best price.
   store.setState({ readOnly: false, exchange: "kraken", positions: [{ symbol: "PF_APTUSD", side: "long", size: 3, price: 1 }] });

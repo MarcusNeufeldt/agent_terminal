@@ -37,7 +37,10 @@ export function walkBook(levels, qty, { limit = null, side = "bids" } = {}) {
     worstPrice: worst, stoppedByLimit };
 }
 
-export function closePreview({ position, book, contractSize = 1, inverse = false, feeRate, slippageBound = null, funding = 0 }) {
+// entryFeeRate: the fee paid opening the position, estimated at that rate on the entry
+// notional (exact for market entries). With it, net is the whole trade's result.
+export function closePreview({ position, book, contractSize = 1, inverse = false, feeRate, slippageBound = null, funding = 0,
+  entryFeeRate = 0 }) {
   const side = String(position?.side).toLowerCase();
   const qty = Number(position?.size), entry = Number(position?.price), mult = Number(contractSize);
   if (inverse || !["long", "short"].includes(side) || ![qty, entry, mult, feeRate].every(v => Number.isFinite(v) && v >= 0)
@@ -55,7 +58,8 @@ export function closePreview({ position, book, contractSize = 1, inverse = false
   const bookWalkCost = dir * walk.filled * mult * (best - walk.avgPrice);
   const exitFee = feeRate * walk.filled * mult * walk.avgPrice;
   const fund = Number.isFinite(Number(funding)) ? Number(funding) : 0;
-  const net = pnlWalked - exitFee + fund;
+  const entryFee = (Number(entryFeeRate) || 0) * qty * mult * entry;
+  const net = pnlWalked - exitFee + fund - entryFee;
   // Whole-position value for display: size beyond the visible book is priced at the
   // worst visible level, so the figure can be too kind only if the book is thinner
   // past the snapshot, never because size was left out.
@@ -69,7 +73,7 @@ export function closePreview({ position, book, contractSize = 1, inverse = false
     filled: walk.filled, unfilled: walk.unfilled,
     // Why part would not fill: the IOC price bound, or the end of the book snapshot.
     unfilledReason: walk.unfilled > 1e-12 ? (walk.stoppedByLimit ? "bound" : "depth") : null,
-    pnlAtBest, pnlWalked, bookWalkCost, exitFee, funding: fund,
+    pnlAtBest, pnlWalked, bookWalkCost, exitFee, funding: fund, entryFee,
     net, netFull,
   };
 }

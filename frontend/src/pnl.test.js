@@ -31,20 +31,21 @@ test("display PnL is net if closed: exit side of the book less the taker fee plu
   };
   // Price-basis checks read the gross value; totals and rendered cells are net.
   const pnl = p => store.getState().computeUpnl(p, { mode: "gross" });
-  // Kraken net at a price with no book: gross - 5bp taker on the exit notional + unsettled funding.
-  const net = (gross, price, size = 2, funding = 3) => gross - 0.0005 * size * price + funding;
+  // Kraken trade net at a price with no book: gross - 5bp taker on the exit and entry
+  // notionals (entry 100) + unsettled funding.
+  const net = (gross, price, size = 2, funding = 3) => gross - 0.0005 * size * (price + 100) + funding;
   const near = (a, b, label) => assert.ok(Math.abs(a - b) < 1e-9, `${label}: ${a} != ${b}`);
   const total = () => store.getState().totalUpnl();
   assert.equal(pnl(position), 20);
   assert.equal(pnl({ ...position, side: "short" }), -20);
   near(total(), net(20, 110), "total is net");
-  near(store.getState().computeUpnl(position), 22.89, "net = 20 - 0.11 fee + 3 funding");
+  near(store.getState().computeUpnl(position), 22.79, "net = 20 - 0.11 exit fee - 0.10 entry fee + 3 funding");
   const sidebar = render(Sidebar);
   const table = render(BottomTabs);
   assert.ok(sidebar.includes("Net if closed"));
-  assert.ok(sidebar.includes(">+$22.89<"));
+  assert.ok(sidebar.includes(">+$22.79<"));
   assert.ok(table.includes("Net if closed"));
-  assert.ok(table.includes(">+22.89<"));
+  assert.ok(table.includes(">+22.79<"));
   assert.ok(table.includes("→ +20.00 before depth and fees"), "the gross value stays in the tooltip");
   assert.ok(table.includes("Kraken last: 110"));
   assert.ok(table.includes(">Exit</th>"), "quote column is labelled by the basis it shows");
@@ -76,12 +77,12 @@ test("display PnL is net if closed: exit side of the book less the taker fee plu
   store.getState().onTicker({ symbol: otherSymbol, last: 90, markPrice: 80 });
   assert.equal(notifications, 2, "both unselected position tickers notify React subscribers");
   near(total(), net(24, 112) + net(20, 90), "both positions, net");
-  assert.ok(render(Sidebar).includes(">+$49.80<"));
+  assert.ok(render(Sidebar).includes(">+$49.60<"));
   const updatedTable = render(BottomTabs);
   assert.ok(updatedTable.includes('title="Mark for risk: 151">112</td>'));
   assert.ok(updatedTable.includes('title="Mark for risk: 80">90</td>'));
-  assert.ok(updatedTable.includes(">+26.89<"));
-  assert.ok(updatedTable.includes(">+22.91<"));
+  assert.ok(updatedTable.includes(">+26.79<"));
+  assert.ok(updatedTable.includes(">+22.81<"));
   unsubscribe();
   store.setState({ positions: [position], instruments: [instrument] });
 

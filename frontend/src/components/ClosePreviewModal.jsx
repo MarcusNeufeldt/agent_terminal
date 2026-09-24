@@ -34,7 +34,7 @@ export function ClosePreviewBody({ preview, venue, book, now = Date.now() }) {
   return (
     <>
       <div className="cp-hero">
-        <div className="cp-hero-label">You'd get closing now</div>
+        <div className="cp-hero-label">Trade result if closed now</div>
         <div className={"cp-hero-value " + (preview.net === null ? "" : preview.net >= 0 ? "up" : "down")}>
           {preview.net === null ? "–" : signed(preview.net)}
         </div>
@@ -50,7 +50,10 @@ export function ClosePreviewBody({ preview, venue, book, now = Date.now() }) {
           detail={`→ avg ${fmt(preview.avgPrice)} over ${preview.levelsUsed} level${preview.levelsUsed === 1 ? "" : "s"}`
             + (preview.worstPrice ? `, worst ${fmt(preview.worstPrice)}` : "")}
           value={cost(preview.bookWalkCost)} tone={preview.bookWalkCost > 0.005 ? "down" : ""} />
-        <Row label="Taker fee" detail={`${(fee * 100).toFixed(3)}%`} value={cost(preview.exitFee)} tone="down" />
+        <Row label="Exit taker fee" detail={`${(fee * 100).toFixed(3)}%`} value={cost(preview.exitFee)} tone="down" />
+        {preview.entryFee > 0 && (
+          <Row label="Entry fee" detail="estimated, already paid" value={cost(preview.entryFee)} tone="down" />
+        )}
         {venue === "kraken" && (
           <Row label="Funding" detail="settled on close" value={signed(preview.funding)}
             tone={preview.funding >= 0 ? "up" : "down"} />
@@ -69,7 +72,7 @@ export function ClosePreviewBody({ preview, venue, book, now = Date.now() }) {
       <div className="cp-foot">
         <span className={"cp-live" + (age !== null && age < 5 ? " on" : "")} />
         {age === null ? "Waiting for the book" : `Book ${age.toFixed(1)}s ago`} · updates every second.
-        {" "}Excludes the entry fee already paid{venue === "hyperliquid" ? "; funding settles hourly, none due on close" : ""}.
+        {" "}Entry fee estimated at the taker rate{venue === "hyperliquid" ? "; funding settles hourly, none due on close" : ""}.
       </div>
     </>
   );
@@ -114,7 +117,7 @@ export default function ClosePreviewModal({ symbol, onClose }) {
   const preview = position && book ? closePreview({
     position, book, contractSize: instrument?.contractSize ?? 1, inverse: instrument?.type === "futures_inverse",
     feeRate: TAKER_FEE[venue], slippageBound: venue === "hyperliquid" ? HL_CLOSE_SLIPPAGE : null,
-    funding: venue === "kraken" ? position.unrealizedFunding : 0,
+    funding: venue === "kraken" ? position.unrealizedFunding : 0, entryFeeRate: TAKER_FEE[venue],
   }) : null;
 
   const close = async () => {

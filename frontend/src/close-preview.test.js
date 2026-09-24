@@ -79,9 +79,9 @@ test("the modal shows screen value, book walk, fee and the real result, and neve
     now: Date.parse("2026-09-23T15:57:06.000Z") }));
   assert.match(html, /Screen value<span class="cp-detail">all at best bid 342.25<\/span>/);
   assert.match(html, /Walking the book<span class="cp-detail">→ avg 341\.982\d* over 3 levels, worst 341.71<\/span>/);
-  assert.match(html, /Taker fee<span class="cp-detail">0.050%<\/span>/);
+  assert.match(html, /Exit taker fee<span class="cp-detail">0.050%<\/span>/);
   assert.match(html, /Screen shows <b>\+\$\d+\.\d\d<\/b>.*in costs/, "the hero names the gap");
-  assert.match(html, /You&#x27;d get closing now/);
+  assert.match(html, /Trade result if closed now/);
   assert.match(html, /Book 1.0s ago/);
   assert.match(renderToStaticMarkup(React.createElement(ClosePreviewBody, { preview: null, venue: "hyperliquid" })),
     /Book unavailable — no estimate\. The close still works\./);
@@ -125,10 +125,23 @@ test("discipline rules ratchet on net PnL under a fresh storage key", async t =>
     dataStatus: { positions: { state: "current" } }, rulePeaks: {}, tickers: {},
     books: { PF_BCHUSD: { bids: [[342.25, 10], [342.0, 30], [341.71, 40]], asks: [[342.5, 50]], at: Date.now() } } });
   const netValue = store.getState().computeUpnl(position);
-  const expected = closePreview({ position, book: store.getState().books.PF_BCHUSD, feeRate: TAKER_FEE.kraken }).netFull;
+  const expected = closePreview({ position, book: store.getState().books.PF_BCHUSD, feeRate: TAKER_FEE.kraken,
+    entryFeeRate: TAKER_FEE.kraken }).netFull;
   close(netValue, expected);
   store.getState().updateRulePeaks();
   assert.equal(saved.has("kt.rulePeaks"), false, "gross-era peaks are not reused");
-  const peaks = JSON.parse(saved.get("kt.rulePeaks.net"));
+  const peaks = JSON.parse(saved.get("kt.rulePeaks.trade"));
   close(Object.values(peaks)[0], netValue);
+});
+
+test("the entry fee makes net the whole trade's result, and defaults to off", () => {
+  const book = { bids: [[110, 5]] };
+  const position = { side: "long", size: 2, price: 100 };
+  const exitOnly = closePreview({ position, book, feeRate: 0.0005 });
+  const trade = closePreview({ position, book, feeRate: 0.0005, entryFeeRate: 0.0005 });
+  close(exitOnly.entryFee, 0);
+  close(trade.entryFee, 0.0005 * 2 * 100);
+  close(trade.net, exitOnly.net - 0.1);
+  close(trade.netFull, exitOnly.netFull - 0.1);
+  close(trade.net, 2 * 10 - 0.0005 * 2 * 110 - 0.0005 * 2 * 100);
 });

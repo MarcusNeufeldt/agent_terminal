@@ -120,7 +120,7 @@ function PositionsTable() {
       {native && <caption className="muted">Stop snapshots only. Execution is not guaranteed; combined ladder coverage is not assessed.</caption>}
       <thead><tr>
         <th>Symbol</th><th>Side</th><th className="num">Size</th><th className="num">Entry</th>
-        <th className="num" title={`${exchangeName} price this position closes into: the bid for a long, the ask for a short. Falls back to the last trade only if the book is unavailable.`}>Exit</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`What a market close on ${exchangeName} would add right now: book walked for the full size, less the taker fee${readOnly ? "" : ", plus funding settled on close"}`}>Net if closed</th>
+        <th className="num" title={`${exchangeName} price this position closes into: the bid for a long, the ask for a short. Falls back to the last trade only if the book is unavailable.`}>Exit</th><th className="num">{readOnly ? "Liq (exchange)" : "Liq (est)"}</th><th className="num" title={`The whole trade's result if closed at market on ${exchangeName} now: book walked for the full size, less the exit taker fee${readOnly ? "" : ", plus funding settled on close"}, less the entry fee already paid (estimated at the taker rate)`}>Net if closed</th>
         <th className="num">{readOnly ? "Cum funding" : "Funding"}</th><th>Liq Δ</th>{native && <th>Stop observation</th>}<th></th>
       </tr></thead>
       <tbody>

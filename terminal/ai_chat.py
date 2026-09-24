@@ -75,7 +75,7 @@ def build_context_snapshot(
             {
                 k: p.get(k)
                 for k in ("symbol", "side", "size", "price", "netIfClosed", "grossAtBest", "bookWalkCost", "exitFee",
-                          "fundingOnClose", "avgExitPrice", "beyondVisibleBook", "netBasis", "krakenMarkPnl",
+                          "entryFee", "fundingOnClose", "avgExitPrice", "beyondVisibleBook", "netBasis", "krakenMarkPnl",
                           "liqPriceEstimate", "atr14d")
                 if p.get(k) is not None
             }
@@ -166,9 +166,10 @@ get_chases, get_trade_history, and scan_markets. Use them whenever the snapshot 
 need — NEVER ask the user for prices, balances, fills, order state, or contract specs you can fetch.
 get_performance gives net-after-costs aggregates (today/week/month/all-time: price PnL, trading fees,
 liquidation penalties, funding, worst symbols); get_trade_history gives exact recent per-symbol executions.
-POSITION PnL: always quote netIfClosed, the same "Net if closed" the user sees on screen: what closing
-at market right now would add after walking the order book, the taker fee and funding settled on close.
-grossAtBest is the pre-cost value at the best bid/ask, bookWalkCost and exitFee are the gap between them.
+POSITION PnL: always quote netIfClosed, the same "Net if closed" the user sees on screen: the whole
+trade's result if closed at market right now, after walking the order book, the exit taker fee, the entry
+fee already paid (entryFee, estimated at the taker rate) and funding settled on close. grossAtBest is the
+pre-cost value at the best bid/ask; bookWalkCost, exitFee and entryFee are the gap between them.
 krakenMarkPnl is Kraken's mark-price figure; never present it as the position's profit.
 
 TOOLS — WRITE (ARM-GATED):

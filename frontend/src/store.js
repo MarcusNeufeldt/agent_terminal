@@ -18,12 +18,16 @@ let audioCtx = null;
 let lastFillSig = null;
 const chartCancelPending = new Set();
 
-const PEAKS_KEY = "kt.rulePeaks.net";
+// Peaks follow the displayed PnL, so a change to what it includes starts them fresh:
+// older, higher peaks would read as an instant give-back on every open position.
+const PEAKS_KEY = "kt.rulePeaks.trade";
 const MAX_POSITION_BOOKS = 8;
 const BOOK_STALE_MS = 15000;
 
-// Net value of closing `p` at market now. Walks the stored book when it is fresh;
-// otherwise the best bid/ask less the taker fee, which ignores depth but not cost.
+// The whole trade's result if `p` were closed at market now: the book walked for the
+// full size, the exit taker fee, funding settled on close, and the entry fee already
+// paid (estimated at the taker rate, exact for market entries). Without a fresh book it
+// uses the best bid/ask, which ignores depth but not cost.
 function netIfClosed(s, p, inst) {
   const side = String(p.side).toLowerCase();
   const size = Number(p.size), entry = Number(p.price), mult = Number(inst.contractSize ?? 1);
@@ -34,14 +38,14 @@ function netIfClosed(s, p, inst) {
   const inverse = inst.type === "futures_inverse";
   const book = s.books?.[p.symbol];
   if (!inverse && book && Date.now() - book.at < BOOK_STALE_MS) {
-    const preview = closePreview({ position: p, book, contractSize: mult, feeRate, funding });
+    const preview = closePreview({ position: p, book, contractSize: mult, feeRate, funding, entryFeeRate: feeRate });
     if (preview && Number.isFinite(preview.netFull)) return preview.netFull;
   }
   const { price } = valuationPrice(s.tickers[p.symbol], { mode: "exit", side });
   if (!(Number.isFinite(price) && price > 0)) return null;
   const dir = side === "short" ? -1 : 1;
   if (inverse) return dir * size * mult * (1 / entry - 1 / price);
-  const net = dir * size * mult * (price - entry) - feeRate * size * mult * price + funding;
+  const net = dir * size * mult * (price - entry) - feeRate * size * mult * (price + entry) + funding;
   return Number.isFinite(net) ? net : null;
 }
 

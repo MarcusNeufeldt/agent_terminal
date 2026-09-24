@@ -35,6 +35,13 @@ class ClosePreviewTwinTests(unittest.TestCase):
         self.assertAlmostEqual(p["netIfClosed"], walked + 4 * (101 - 100) - 0.001 * 4 * 101)
         self.assertEqual(p["beyondVisibleBook"], 4)
 
+    def test_the_entry_fee_makes_net_the_whole_trade_and_matches_the_js_twin(self):
+        exit_only = close_preview(BCH_LONG, BCH_BOOK, fee_rate=TAKER_FEE["kraken"])
+        trade = close_preview(BCH_LONG, BCH_BOOK, fee_rate=TAKER_FEE["kraken"], entry_fee_rate=TAKER_FEE["kraken"])
+        self.assertEqual(exit_only["entryFee"], 0.0)
+        self.assertAlmostEqual(trade["entryFee"], 0.0005 * 51.8 * 341.18)
+        self.assertAlmostEqual(trade["netIfClosed"], exit_only["netIfClosed"] - 0.0005 * 51.8 * 341.18)
+
     def test_contract_multiplier_and_unusable_input(self):
         p = close_preview({"side": "long", "size": 2, "price": 100}, {"bids": [[110, 5]]}, fee_rate=0.001,
                           contract_size=10, funding=-1.5)
@@ -86,13 +93,14 @@ class AiNetPnlTests(unittest.TestCase):
             {"error": "positions unavailable"},
         ])
         bch, down, inverse, error = rows
-        expected = close_preview(BCH_LONG, BCH_BOOK, fee_rate=TAKER_FEE["kraken"])["netIfClosed"]
+        expected = close_preview(BCH_LONG, BCH_BOOK, fee_rate=TAKER_FEE["kraken"],
+                                 entry_fee_rate=TAKER_FEE["kraken"])["netIfClosed"]
         self.assertAlmostEqual(bch["netIfClosed"], round(expected, 4))
         self.assertEqual(bch["netBasis"], "book")
         self.assertNotIn("unrealizedPnl", bch, "the mark-based figure never goes out under the PnL name")
         self.assertEqual(bch["krakenMarkPnl"], 74.1)
         self.assertEqual(down["netBasis"], "best_price_no_depth", "a failed book read falls back to best bid less the fee")
-        self.assertAlmostEqual(down["netIfClosed"], 2 * (100 - 90) - 0.0005 * 2 * 100 + 1)
+        self.assertAlmostEqual(down["netIfClosed"], 2 * (100 - 90) - 0.0005 * 2 * 100 - 0.0005 * 2 * 90 + 1)
         self.assertEqual(inverse["netBasis"], "unavailable")
         self.assertNotIn("netIfClosed", inverse)
         self.assertEqual(error, {"error": "positions unavailable"})

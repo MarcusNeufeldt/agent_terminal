@@ -37,7 +37,10 @@ def sorted_levels(rows: Any, side: str) -> list[tuple[float, float]]:
 
 
 def close_preview(position: dict[str, Any], book: dict[str, Any], *, fee_rate: float,
-                  contract_size: float = 1.0, funding: float = 0.0) -> dict[str, Any] | None:
+                  contract_size: float = 1.0, funding: float = 0.0,
+                  entry_fee_rate: float = 0.0) -> dict[str, Any] | None:
+    """entry_fee_rate: the opening fee, estimated at that rate on the entry notional
+    (exact for market entries). With it, netIfClosed is the whole trade's result."""
     side = str(position.get("side") or "").lower()
     qty, entry, mult = _num(position.get("size")), _num(position.get("price")), _num(contract_size)
     if side not in {"long", "short"} or not qty or qty <= 0 or not entry or entry <= 0 or not mult or mult <= 0:
@@ -63,7 +66,8 @@ def close_preview(position: dict[str, Any], book: dict[str, Any], *, fee_rate: f
     fund = _num(funding) or 0.0
     walked = direction * filled * mult * (avg - entry)
     exit_fee = fee_rate * filled * mult * avg
-    net = walked - exit_fee + fund
+    entry_fee = (_num(entry_fee_rate) or 0.0) * qty * mult * entry
+    net = walked - exit_fee + fund - entry_fee
     # Size beyond the visible book is priced at the worst visible level.
     if rest > 1e-12:
         net += direction * rest * mult * (worst - entry) - fee_rate * rest * mult * worst
@@ -73,6 +77,7 @@ def close_preview(position: dict[str, Any], book: dict[str, Any], *, fee_rate: f
         "bookWalkCost": direction * filled * mult * (best - avg),
         "exitFee": exit_fee + (fee_rate * rest * mult * worst if rest > 1e-12 else 0.0),
         "fundingOnClose": fund,
+        "entryFee": entry_fee,
         "bestPrice": best,
         "avgExitPrice": avg,
         "levelsUsed": used,

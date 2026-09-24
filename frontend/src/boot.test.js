@@ -49,7 +49,7 @@ test("boot owns one live feed and releases pollers/listeners on remount or inter
     const source = [...sources][0];
     source.handlers.ticker({ data: JSON.stringify({ symbol, last: 110 + mount, markPrice: 150 }) });
     // Net of the Kraken taker fee at the streamed last price (no book in this fixture).
-    assert.ok(Math.abs(store.getState().totalUpnl() - (20 + 2 * mount - 0.0005 * 2 * (110 + mount))) < 1e-9,
+    assert.ok(Math.abs(store.getState().totalUpnl() - (20 + 2 * mount - 0.0005 * 2 * (110 + mount) - 0.0005 * 2 * 100)) < 1e-9,
       "non-selected position gets streamed last price");
     controller.abort();
     assert.equal(sources.size, 0, "unmount must close the stream instead of leaving a stale subscription");
