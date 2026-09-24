@@ -11,9 +11,12 @@ export default function BottomTabs() {
   const cancelAllForSymbol = useStore(s => s.cancelAllForSymbol);
   const cancelHyperliquidOrders = useStore(s => s.cancelHyperliquidOrders);
   const flattenAll = useStore(s => s.flattenAll);
+  const softCloseHyperliquid = useStore(s => s.softCloseHyperliquid);
   const bulkBusy = useStore(s => s.bulkBusy);
   const readOnly = useStore(s => s.readOnly);
   const canTrade = useStore(s => s.canTrade);
+  const ticketBusy = useStore(s => s.ticketBusy);
+  const positionState = useStore(s => s.dataStatus.positions?.state);
   const orderState = useStore(s => s.dataStatus.orders?.state);
   const cancelReceipt = useStore(s => s.hlCancelReceipt);
   const cancelHistory = useStore(s => s.hlCancelHistory);
@@ -43,10 +46,10 @@ export default function BottomTabs() {
           >⏹</button>
           <button
             className="bulk-icon soft"
-            disabled={bulkBusy || readOnly}
+            disabled={bulkBusy || (readOnly && (!canTrade || ticketBusy || positionState !== "current"))}
             title="Soft close: start reduce-only Chase exits for every position"
             aria-label="Soft close all positions with reduce-only Chase orders"
-            onClick={() => flattenAll("chase")}
+            onClick={() => readOnly ? softCloseHyperliquid() : flattenAll("chase")}
           >≫</button>
         </div>
       </div>
@@ -109,6 +112,7 @@ function PositionsTable() {
   const openGrid = useStore(s => s.openGrid);
   const ticketBusy = useStore(s => s.ticketBusy);
   const flattenAll = useStore(s => s.flattenAll);
+  const softCloseHyperliquid = useStore(s => s.softCloseHyperliquid);
   const bulkBusy = useStore(s => s.bulkBusy);
   const selectSymbol = useStore(s => s.selectSymbol);
   // Close opens a live preview of what a market close returns; the close itself runs from there.
@@ -153,10 +157,10 @@ function PositionsTable() {
               <td className="num">
                 <button className="row-btn sell" disabled={bulkBusy || (readOnly && (!canTrade || ticketBusy || status?.state !== "current"))}
                   onClick={() => setPreviewSymbol(p.symbol)}>Close</button>{" "}
-                <button className="row-btn" disabled={bulkBusy || readOnly}
+                <button className="row-btn" disabled={bulkBusy || (readOnly && (!canTrade || ticketBusy || status?.state !== "current"))}
                   title={`Soft close ${p.symbol} with a reduce-only Chase`}
                   aria-label={`Soft close ${p.symbol} with a reduce-only Chase`}
-                  onClick={() => flattenAll("chase", p.symbol)}>≫</button>{" "}
+                  onClick={() => readOnly ? softCloseHyperliquid(p.symbol) : flattenAll("chase", p.symbol)}>≫</button>{" "}
                 <button className="row-btn" disabled={bulkBusy || ticketBusy || (readOnly && status?.state !== "current")}
                   title={`Build a grid using ${p.symbol} position size`}
                   onClick={() => openGrid(p.symbol)}>Grid</button>

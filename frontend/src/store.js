@@ -1105,9 +1105,10 @@ const useStore = create((set, get) => ({
     }
   },
 
-  // Hyperliquid Chase: values come from the Hyperliquid ticket, never the Kraken DOM.
-  async submitHyperliquidChase(side, { size, reduceOnly }) {
-    const s = get(), symbol = s.symbol;
+  // Hyperliquid Chase: values come from the Hyperliquid ticket or a position row, never
+  // the Kraken DOM. `confirmed` means the caller already asked (soft close).
+  async submitHyperliquidChase(side, { size, reduceOnly, symbol: target, confirmed = false }) {
+    const s = get(), symbol = target || s.symbol;
     if (s.exchange !== "hyperliquid" || s.exchangeBusy || s.ticketBusy || s.hlReconciling || !isVenueSymbol(symbol)) return;
     if (!s.canTrade) { s.toast("Hyperliquid trading is disabled by the backend gate.", "err", 9000); return; }
     if (!s.hlRecoveryLoaded || s.hlRecoveryError || s.hlServerUnresolved.length || unresolvedReceipt(s.hlReceipt)) {
@@ -1118,7 +1119,7 @@ const useStore = create((set, get) => ({
     const quantity = normalizeContractSize(size, instrument.contractValueTradePrecision ?? 0);
     if (!Number.isFinite(quantity) || quantity <= 0) { s.toast("Enter a size that meets this market's lot size.", "err"); return; }
     const onTimeout = reduceOnly ? "the unfilled rest closes with a reduce-only market order" : "the unfilled rest is cancelled";
-    if (s.armed && !confirm(`LIVE CHASE ${side.toUpperCase()} ${quantity} ${symbol}${reduceOnly ? " (reduce-only)" : ""}\n\n`
+    if (s.armed && !confirmed && !confirm(`LIVE CHASE ${side.toUpperCase()} ${quantity} ${symbol}${reduceOnly ? " (reduce-only)" : ""}\n\n`
       + `Rests post-only at the best ${side === "buy" ? "bid" : "ask"} and re-pegs as it moves. After 5 minutes ${onTimeout}. Continue?`)) return;
     set({ ticketBusy: true });
     try {
@@ -1135,6 +1136,26 @@ const useStore = create((set, get) => ({
       get().toast(`Chase failed: ${e.message}`, "err", 12000);
     } finally {
       set({ ticketBusy: false });
+    }
+  },
+
+  // Soft close on Hyperliquid: a reduce-only Chase for the full size of one position, or
+  // of every position. One confirmation covers the batch; the server still enforces one
+  // Chase per market and at most five at once, and reports any it refuses.
+  async softCloseHyperliquid(symbol = null) {
+    const s = get();
+    if (s.exchange !== "hyperliquid" || s.ticketBusy || s.bulkBusy) return;
+    if (s.dataStatus.positions?.state !== "current") { s.toast("Current position data is required to soft close.", "err"); return; }
+    const positions = s.positions.filter(p => !p.error && Number(p.size) > 0 && ["long", "short"].includes(p.side) &&
+      (!symbol || p.symbol === symbol));
+    if (!positions.length) { s.toast("No open positions to soft close."); return; }
+    const list = positions.map(p => `${p.side === "long" ? "sell" : "buy"} ${p.sizeExact ?? p.size} ${p.symbol}`).join(", ");
+    if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} SOFT CLOSE ${positions.length} position${positions.length === 1 ? "" : "s"}: ${list}.\n\n`
+      + "Each rests post-only at the best price and re-pegs as the book moves (maker fee, no book walk). "
+      + "After 5 minutes any unfilled rest closes with a reduce-only market order. Stop on a Chase cancels only. Continue?")) return;
+    for (const p of positions) {
+      await get().submitHyperliquidChase(p.side === "long" ? "sell" : "buy",
+        { size: p.sizeExact ?? p.size, reduceOnly: true, symbol: p.symbol, confirmed: true });
     }
   },
 

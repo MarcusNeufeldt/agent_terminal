@@ -1207,3 +1207,38 @@ test("Stopping a Chase works even with the signed-trading gate off", async t => 
   assert.match(postPaths[0], /^\/api\/chase\/abort/);
   assert.equal(posts[0].chaseId, "c9");
 });
+
+test("Soft close on Hyperliquid starts one confirmed reduce-only Chase per position", async t => {
+  const replies = [];
+  const { store, posts, postPaths, prompts, renderOrders } = await harness(t, n => replies[n - 1] || {
+    exchange: "hyperliquid", type: "chase", outcome: "simulated", simulated: true,
+    action: { type: "order", orders: [{ s: "1", p: "1", t: { limit: { tif: "Alo" } } }] } });
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ canTrade: true, readOnly: true, exchange: "hyperliquid", tab: "positions",
+    instruments: [{ symbol: "HL_BTC", contractValueTradePrecision: 5 }, { symbol: SYMBOL, contractValueTradePrecision: 2 }],
+    positions: [{ symbol: "HL_BTC", side: "long", size: 0.01, sizeExact: "0.01", price: 60000 },
+                { symbol: SYMBOL, side: "short", size: 20, sizeExact: "20", price: 0.6 }],
+    dataStatus: { positions: { state: "current" }, orders: { state: "current" } } });
+  const markup = renderOrders();
+  assert.doesNotMatch(markup.match(/<button[^>]*aria-label="Soft close HL_BTC[^>]*>/)[0], /disabled/, "the row button is live on Hyperliquid");
+
+  await store.getState().softCloseHyperliquid("HL_BTC");
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /SIMULATED SOFT CLOSE 1 position: sell 0.01 HL_BTC/);
+  assert.deepEqual({ ...posts[0], requestId: undefined },
+    { symbol: "HL_BTC", side: "sell", size: 0.01, reduceOnly: true, expectedArmed: false, requestId: undefined });
+  assert.match(postPaths[0], /^\/api\/chase/);
+
+  await store.getState().softCloseHyperliquid();
+  assert.equal(prompts.length, 2, "one confirmation for the whole batch");
+  assert.match(prompts[1], /SOFT CLOSE 2 positions: sell 0.01 HL_BTC, buy 20 HL_APT/);
+  assert.deepEqual(posts.slice(1).map(p => [p.symbol, p.side, p.reduceOnly]), [["HL_BTC", "sell", true], [SYMBOL, "buy", true]]);
+
+  globalThis.confirm = () => false;
+  await store.getState().softCloseHyperliquid();
+  assert.equal(posts.length, 3, "declined: nothing sent");
+  store.setState({ dataStatus: { positions: { state: "unavailable" } } });
+  globalThis.confirm = () => true;
+  await store.getState().softCloseHyperliquid();
+  assert.equal(posts.length, 3, "stale positions: nothing sent");
+});
