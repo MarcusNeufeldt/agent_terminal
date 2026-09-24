@@ -17,13 +17,13 @@ function clock(seconds) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-export default function ChaseStatus({ exchange }) {
+export default function ChaseStatus({ exchange, showFinished = true }) {
   const chases = useStore(s => s.chases);
   const tickers = useStore(s => s.tickers);
   const abortChase = useStore(s => s.abortChase);
   const [now, setNow] = useState(() => Date.now());
   const [stopping, setStopping] = useState({});
-  const cards = chaseCards(chases, exchange, now);
+  const cards = chaseCards(chases, exchange, now, { showFinished });
   const running = cards.some(c => c.status === "running");
 
   // A one-second clock only while something is on screen, for the countdown and fade-out.
@@ -57,7 +57,7 @@ export default function ChaseStatus({ exchange }) {
               <span>Filled</span><b>{fmt(c.filled)} / {fmt(c.size)}</b>
               {live && <><span>Resting at</span><b>{c.activePrice ? fmt(c.activePrice) : "placing…"}{best ? <span className="muted"> · best {c.side === "buy" ? "bid" : "ask"} {fmt(best)}</span> : null}</b></>}
               <span>Pegs</span><b>{c.pegs ?? 0}</b>
-              {live && <><span>Time left</span><b>{clock(p.left)}{c.spec?.reduceOnly ? <span className="muted"> · then market</span> : <span className="muted"> · then cancel</span>}</b></>}
+              {live && <><span>Time left</span><b>{clock(p.left)}{c.spec?.finishMarket ? <span className="muted"> · then market</span> : <span className="muted"> · then cancel</span>}</b></>}
             </div>
             {lastEvent && <div className="chase-card-event" title={(c.events || []).join("\n")}>{lastEvent}</div>}
             {check && <div className="chase-card-event warn">{c.unknownReason || `Needs a manual check on ${venue}.`} New orders and exchange switching are blocked until it is checked.</div>}

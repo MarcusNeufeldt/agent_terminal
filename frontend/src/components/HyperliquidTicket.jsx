@@ -241,7 +241,7 @@ export default function HyperliquidTicket() {
           </>}
         </div>
         </>}
-        <ChaseStatus exchange="hyperliquid" />
+        <ChaseStatus exchange="hyperliquid" showFinished={otype === "chase"} />
         <div className="ticket-note" style={{ color: armed ? "var(--red)" : "var(--muted)" }}>
           {!canTrade
             ? "Hyperliquid signed trading is off. Set HYPERLIQUID_TRADING and HYPERLIQUID_SECRET_KEY, then restart the backend."

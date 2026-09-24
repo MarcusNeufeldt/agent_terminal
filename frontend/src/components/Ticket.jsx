@@ -110,14 +110,14 @@ export default function Ticket() {
           <button id="btn-buy" disabled={ticketBusy} onClick={() => submitOrder("buy")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "BUY / LONG" : "BUY"}</button>
           <button id="btn-sell" disabled={ticketBusy} onClick={() => submitOrder("sell")}>{ticketBusy ? "SUBMITTING…" : otype === "mkt" ? "SELL / SHORT" : "SELL"}</button>
         </div>
-        <ChaseStatus exchange="kraken" />
+        <ChaseStatus exchange="kraken" showFinished={otype === "chase"} />
         <div className="ticket-note" style={{ color: isChase ? (armed ? "var(--accent)" : "var(--muted)") : (armed ? "var(--red)" : "var(--muted)") }}>
           {isChase
             ? (armed ? "CHASE: reconciled post-only orders at best bid/ask, re-pegged only after confirmed cancellation." : "CHASE requires an armed terminal.")
             : (armed ? `LIVE: orders go straight to Kraken (${window.__env || "live"}).` : "SIMULATION: arm the terminal to send real orders.")}
         </div>
         </>}
-        {otype === "grid" && <ChaseStatus exchange="kraken" />}
+        {otype === "grid" && <ChaseStatus exchange="kraken" showFinished={otype === "chase"} />}
       </div>
     </div>
   );

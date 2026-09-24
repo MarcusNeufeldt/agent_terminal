@@ -6,8 +6,10 @@ const now = 1_000_000;
 const chases = {
   a: { id: "a", exchange: "hyperliquid", symbol: "HL_TAO", side: "buy", size: 1, filled: 0.25, status: "running",
     activePrice: 295.3, activeSize: 0.75, pegs: 3, started: 900, spec: { timeoutSec: 300 } },
-  b: { id: "b", exchange: "hyperliquid", symbol: "HL_TAO", side: "sell", size: 1, filled: 1, status: "filled", updated: now - 5000 },
-  c: { id: "c", exchange: "hyperliquid", symbol: "HL_NEAR", side: "sell", size: 1, filled: 1, status: "filled", updated: now - 120000 },
+  b: { id: "b", exchange: "hyperliquid", symbol: "HL_TAO", side: "sell", size: 1, filled: 1, status: "filled", updated: now - 5000, started: 980 },
+  c: { id: "c", exchange: "hyperliquid", symbol: "HL_NEAR", side: "sell", size: 1, filled: 1, status: "filled", updated: now - 120000, started: 850 },
+  // Reloaded: the browser just heard of it, but it started an hour ago.
+  old: { id: "old", exchange: "hyperliquid", symbol: "HL_NEAR", side: "buy", size: 1, filled: 1, status: "filled", updated: now - 1000, started: 1000 - 3600 },
   k: { id: "k", symbol: "PF_XBTUSD", side: "buy", size: 1, filled: 0, status: "unknown", started: 950 },
 };
 
@@ -15,6 +17,7 @@ test("status cards list this venue's live Chases, then the latest recently finis
   assert.deepEqual(chaseCards(chases, "hyperliquid", now).map(c => c.id), ["a", "b"]);
   assert.deepEqual(chaseCards(chases, "kraken", now).map(c => c.id), ["k"]);
   assert.deepEqual(chaseCards({}, "kraken", now), []);
+  assert.deepEqual(chaseCards(chases, "hyperliquid", now, { showFinished: false }).map(c => c.id), ["a"]);
 });
 
 test("progress shows filled share and the time left before the timeout", () => {

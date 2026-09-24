@@ -8,11 +8,20 @@ export function chaseVenue(chase) {
   return chase?.exchange === "hyperliquid" ? "hyperliquid" : "kraken";
 }
 
-// Live Chases on this venue first, then the most recent finished one for a short while.
-export function chaseCards(chases, exchange, now = Date.now(), keepFinishedMs = 60000) {
+// Live Chases on this venue first, then (when asked) the most recent finished one for
+// keepFinishedMs. `updated` is when the browser heard of it, which a reload resets, so
+// a finished Chase must also have started recently enough to have just ended: a Chase
+// never outlives its timeout by more than the market finish.
+export function chaseCards(chases, exchange, now = Date.now(), { showFinished = true, keepFinishedMs = 60000 } = {}) {
   const list = Object.values(chases || {}).filter(c => c && chaseVenue(c) === exchange);
   const live = list.filter(c => LIVE.includes(c.status)).sort((a, b) => (b.started || 0) - (a.started || 0));
-  const finished = list.filter(c => !LIVE.includes(c.status) && now - (c.updated || 0) < keepFinishedMs)
+  if (!showFinished) return live;
+  const recent = c => {
+    const started = Number(c.started) || 0;
+    const timeout = Number(c.spec?.timeoutSec) || 300;
+    return started > 0 && now / 1000 - started < timeout + 30 + keepFinishedMs / 1000;
+  };
+  const finished = list.filter(c => !LIVE.includes(c.status) && now - (c.updated || 0) < keepFinishedMs && recent(c))
     .sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, 1);
   return [...live, ...finished];
 }
