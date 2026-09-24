@@ -697,8 +697,10 @@ class WriteDecisionTests(unittest.TestCase):
         self.ns["hyperliquid"].trading_capacity = Mock(return_value={"leverage": {"value": 5, "type": "cross"},
             "maxTradeSizes": {"buy": "123.456", "sell": "200"}})
         body = self.order(size=1000, quickPercent=25, expectedLeverage=5, expectedMarginMode="cross")
-        self.assertEqual(self.write("/api/order", body)["action"]["orders"][0]["s"], "30.86")
-        self.assertEqual(self.write("/api/order", {**body, "side": "sell"})["action"]["orders"][0]["s"], "50")
+        # Opening sizes use 97% of the venue maximum so a 100% order still fits.
+        self.assertEqual(self.write("/api/order", body)["action"]["orders"][0]["s"], "29.93")
+        self.assertEqual(self.write("/api/order", {**body, "side": "sell"})["action"]["orders"][0]["s"], "48.5")
+        self.assertEqual(self.write("/api/order", {**body, "quickPercent": 100})["action"]["orders"][0]["s"], "119.75")
         self.assertEqual(self.write("/api/order", {**body, "size": 5})["action"]["orders"][0]["s"], "5")
         with self.assertRaisesRegex(HyperliquidError, "leverage changed"):
             self.write("/api/order", {**body, "expectedLeverage": 3})

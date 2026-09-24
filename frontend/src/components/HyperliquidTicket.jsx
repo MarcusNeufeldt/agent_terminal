@@ -15,6 +15,8 @@ const TYPES = [["mkt", "Market"], ["lmt", "Limit"], ["post", "Post-only"], ["cha
 // The venue rejects these with a minimum order value, so warn before submitting.
 const MIN_ORDER_VALUE = 10;
 let capacityRefreshPending = false;
+// Matches OPEN_CAPACITY_SHARE in terminal/hyperliquid_trading.py.
+export const OPEN_CAPACITY_PERCENT = 97;
 
 export function HyperliquidRiskPreview({ position, quantity, price, current }) {
   const preview = current ? linearExitPreview({ position, quantity, exitPrice: price }) : null;
@@ -100,8 +102,10 @@ export default function HyperliquidTicket() {
   const reducing = reduce || trigger || !!closeDraft;
   const percentQuantity = side => {
     const position = matchingPositions.length === 1 && positionState === "current" ? matchingPositions[0] : null;
+    // Opening sizes use 97% of the venue maximum (as the server does): at exactly 100%
+    // the order has no room for the fee or a tick and Hyperliquid rejects it for margin.
     const available = reducing ? position?.side === (side === "sell" ? "long" : "short") ? position.sizeExact : "0"
-      : capacityCurrent ? capacity.maxTradeSizes[side] : "0";
+      : capacityCurrent ? contractsForNotional(capacity.maxTradeSizes[side], 1, 8, OPEN_CAPACITY_PERCENT) || "0" : "0";
     const quantity = contractsForNotional(available, 1, lotDecimals, percent);
     return Number(quantity) > 0 ? quantity : "";
   };
@@ -216,7 +220,7 @@ export default function HyperliquidTicket() {
             ))}
           </div>
           {!capacityCurrent && <div className="ticket-note">{capacityError || "Loading exchange trading capacity…"} <button type="button" disabled={ticketBusy} onClick={refreshCapacity}>Refresh capacity</button></div>}
-          {capacityCurrent && <div className="ticket-note">Exchange maximum: Buy {capacity.maxTradeSizes.buy}, Sell {capacity.maxTradeSizes.sell} contracts. Already includes the current leverage; no extra multiplier is applied.</div>}
+          {capacityCurrent && <div className="ticket-note">Exchange maximum: Buy {capacity.maxTradeSizes.buy}, Sell {capacity.maxTradeSizes.sell} contracts. Already includes the current leverage. 100% uses {OPEN_CAPACITY_PERCENT}% of it so the order still fits the margin.</div>}
         </div>
         <div className="check-row">
           <input id="hl-reduce" type="checkbox" checked={trigger || closeDraft ? true : reduce} disabled={trigger || !!closeDraft}

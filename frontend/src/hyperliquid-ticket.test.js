@@ -540,6 +540,7 @@ test("Percentage buttons use current exchange capacity without guessing from bal
   markup = render();
   assert.doesNotMatch(markup, /disabled="" data-pct="25"/);
   assert.match(markup, /Exchange maximum: Buy 20, Sell 30/);
+  assert.match(markup, /100% uses 97% of it/);
   assert.match(markup, /Changes actual exchange leverage/);
   assert.match(markup, /data-lev="5"/);
   assert.doesNotMatch(markup, /data-lev="10"/);

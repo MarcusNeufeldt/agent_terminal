@@ -283,7 +283,7 @@ def hyperliquid_order_action(body: dict[str, Any]) -> dict[str, Any]:
                     body["expectedLeverage"] != capacity["leverage"]["value"] or
                     body.get("expectedMarginMode") != capacity["leverage"]["type"]):
                 raise hyperliquid_trading.HyperliquidError("Exchange leverage changed. Refresh quick sizing before submitting")
-            available = capacity["maxTradeSizes"][side]
+            available = hyperliquid_trading.usable_capacity(capacity["maxTradeSizes"][side])
         size = hyperliquid_trading.percent_size(available, body["quickPercent"], size, instrument["contractValueTradePrecision"])
     if order_type in HL_TRIGGER:
         stop = _as_float(body.get("stopPrice"))

@@ -163,6 +163,17 @@ def order_action_for(instrument, side, size, price, *, tif="gtc", reduce_only=Fa
                        tif, reduce_only, trigger=trigger, cloid=cloid, grouping=grouping)
 
 
+# Share of the venue's maxTradeSzs that an opening percent size may use. At exactly
+# 100% the order leaves no margin for the fee or a price tick and the venue rejects it.
+OPEN_CAPACITY_SHARE = Decimal("0.97")
+
+
+def usable_capacity(max_trade_size):
+    with localcontext() as context:
+        context.prec = 80
+        return str(_decimal(max_trade_size, "Trading capacity") * OPEN_CAPACITY_SHARE)
+
+
 def percent_size(available, percent, maximum, precision):
     if type(percent) is not int or not 1 <= percent <= 100:
         raise HyperliquidError("Size percentage must be an integer from 1 to 100")
