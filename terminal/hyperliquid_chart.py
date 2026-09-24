@@ -135,6 +135,15 @@ def validate(intent, backend):
         raise HyperliquidError('Reviewed quote expired. Refresh and drag again')
 
 
+def _misread_trigger(result):
+    """A saved 'rejected' that was really Hyperliquid accepting the trigger: older builds read
+    the bare 'waitingForTrigger' status as an error. Such a request may well be live, so it
+    must stay reconcilable instead of blocking chart edits for good."""
+    rows = result.get('rows') if isinstance(result, dict) else None
+    return (result.get('outcome') == 'rejected' and isinstance(rows, list) and bool(rows) and
+            all(isinstance(row, dict) and row.get('error') == 'waitingForTrigger' for row in rows))
+
+
 def reconcile(db, backend, request_id, body, intent):
     expiry = intent.get('expiresAfter')
     if type(expiry) is not int or not 0 < expiry < 2**64 or body.get('symbol') != intent.get('symbol'):
@@ -145,7 +154,7 @@ def reconcile(db, backend, request_id, body, intent):
             (intent.get('fullPosition') and order.get('s') != '0')):
         raise HyperliquidError('Chart client identity mismatch')
     saved = db.venue_recovery_state(request_id, backend.network, backend.account_address)
-    if saved['result'].get('outcome') in {'simulated', 'rejected'}:
+    if saved['result'].get('outcome') in {'simulated', 'rejected'} and not _misread_trigger(saved['result']):
         raise HyperliquidError('No uncertain live chart operation to reconcile')
     book = backend.orderbook(intent['symbol'], fresh=True)
     stamp = book.get('time')
