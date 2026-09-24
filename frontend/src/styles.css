@@ -808,3 +808,5 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.45; }
 .cp-confirm.sell { background: var(--red); box-shadow: 0 6px 18px rgba(239, 83, 80, 0.25); }
 .cp-confirm.buy { background: var(--green); box-shadow: 0 6px 18px rgba(38, 166, 154, 0.25); }
 .cp-confirm:hover:not(:disabled) { filter: brightness(1.08); }
+
+.vela-status-badge.warn { color: var(--warn) !important; border-color: rgba(240, 185, 11, 0.6) !important; }

@@ -295,11 +295,27 @@ const useStore = create((set, get) => ({
   },
 
   canHyperliquidChart() {
+    return get().hlChartBlockReason() === null;
+  },
+
+  // Why chart TP/SL dragging is off on Hyperliquid, or null when it is available. The
+  // chart shows this, since a line that silently stops dragging is otherwise a mystery.
+  hlChartBlockReason() {
     const s = get();
-    return s.exchange === "hyperliquid" && s.canTrade && !s.ticketBusy && !s.bulkBusy && !s.hlReconciling &&
-      !s.hlFillBusy && s.dataStatus.orders?.state === "current" && s.dataStatus.positions?.state === "current" &&
-      s.hlRecoveryLoaded && !s.hlRecoveryError && !!s.hlReceiptKey && !s.hlRecoveryHasMore &&
-      !s.hlServerUnresolved.length && !unresolvedReceipt(s.hlReceipt);
+    if (s.exchange !== "hyperliquid") return "not on Hyperliquid";
+    if (!s.canTrade) return "signed trading is off";
+    if (s.ticketBusy) return "an order is being submitted";
+    if (s.bulkBusy) return "a bulk action is running";
+    if (s.hlReconciling) return "an order status check is running";
+    if (s.hlFillBusy) return "fills are loading";
+    if (s.dataStatus.orders?.state !== "current") return `open orders are ${s.dataStatus.orders?.state || "not loaded"}`;
+    if (s.dataStatus.positions?.state !== "current") return `positions are ${s.dataStatus.positions?.state || "not loaded"}`;
+    if (!s.hlRecoveryLoaded) return "the recovery journal is not loaded";
+    if (s.hlRecoveryError) return `recovery error: ${s.hlRecoveryError}`;
+    if (!s.hlReceiptKey) return "no account identity yet";
+    if (s.hlRecoveryHasMore || s.hlServerUnresolved.length) return "an unresolved server submission (see the ticket)";
+    if (unresolvedReceipt(s.hlReceipt)) return `the last request is ${s.hlReceipt.outcome} (see the ticket)`;
+    return null;
   },
 
   async submitHyperliquidProtection(symbol, kind, price, order = null, positionSnapshot = null,

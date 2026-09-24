@@ -14,6 +14,9 @@ export default function ChartPanel() {
   const symbol = useStore(state => state.symbol);
   const [signal, setSignal] = useState(null);
   const [note, setNote] = useState("");
+  // On Hyperliquid, say why TP/SL lines cannot be dragged while a position is open.
+  const dragBlocked = useStore(state => state.exchange === "hyperliquid" &&
+    state.positions.some(p => !p.error && p.symbol === state.symbol) ? state.hlChartBlockReason() : null);
   const [riskEnabled, setRiskEnabled] = useState(() => localStorage.getItem(venueKey("kt.riskEnabled")) === "1");
 
   useEffect(() => {
@@ -135,7 +138,9 @@ export default function ChartPanel() {
           {signal && !signal.error ? `EMA${signal.fast}/${signal.slow}: ${side ? side.toUpperCase() : "flat"}` : "EMA –"}
         </span>
       </div>
-      <div className="vela-status-badge">{note || "VELA · ACTIVE CHART DRIVES TERMINAL"}</div>
+      <div className={"vela-status-badge" + (dragBlocked && !note ? " warn" : "")}>
+        {note || (dragBlocked ? `TP/SL DRAG OFF: ${dragBlocked}` : "VELA · ACTIVE CHART DRIVES TERMINAL")}
+      </div>
       <div id="vela-chart" ref={containerRef}></div>
     </div>
   );
