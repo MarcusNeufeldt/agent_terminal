@@ -1452,7 +1452,10 @@ class TerminalHandler(BaseHTTPRequestHandler):
                 try:
                     out = account_log.compact_rows(client)
                 except Exception as exc:
-                    self._send_json({"error": str(exc), "rows": []})
+                    # Serve what is already held, marked stale. "error" stays set so the
+                    # cooldown rule reads "unknown" rather than trusting a gap.
+                    held = account_log.compact_rows(client, account_log.cached_rows(client))
+                    self._send_json({"error": str(exc), "stale": bool(held), "rows": held})
                     return
                 self._send_json({"rows": out})
             elif path == "/api/fills":

@@ -19,7 +19,12 @@ export default function StatsModal({ onClose }) {
   const eqRef = useRef(null);
 
   useEffect(() => {
-    api("/api/stats").then(r => setRows(r.rows || [])).catch(e => setErr(e.message));
+    // A failed refresh arrives as {error, rows}: rows are the saved log (maybe empty).
+    // Never show an empty result as a real zero.
+    api("/api/stats").then(r => {
+      setRows(Array.isArray(r.rows) ? r.rows : []);
+      if (r.error) setErr(r.error);
+    }).catch(e => setErr(e.message));
     api("/api/equity").then(r => setEquity(r.rows || [])).catch(() => {});
     const onKey = e => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
@@ -88,9 +93,11 @@ export default function StatsModal({ onClose }) {
             {" "}— all-time = this window + that.
           </div>
         )}
-        {err && <div className="empty">Account log unavailable: {err}</div>}
+        {err && (rows && rows.length
+          ? <div className="cp-warn">Showing the saved account log; the refresh from Kraken failed ({err}). The latest trades may be missing.</div>
+          : <div className="empty">Account log unavailable: {err}</div>)}
         {!rows && !err && <div className="empty">Loading account log…</div>}
-        {rows && (
+        {rows && (rows.length > 0 || !err) && (
           <>
             <div className="stat-tiles">
               <Tile k="Net after all costs" v={signed(stats.net)} cls={stats.net >= 0 ? "up" : "down"}

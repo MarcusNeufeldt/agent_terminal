@@ -18,6 +18,7 @@ frontend/dist/
 
 # Runtime data and logs
 *.db
+account_log_cache.json
 *.db-shm
 *.db-wal
 *.sqlite
