@@ -136,3 +136,29 @@ test("display PnL is net if closed: exit side of the book less the taker fee plu
   assert.ok(render(Sidebar).includes(">+$0.00<"));
   assert.equal(networkCalls, 0);
 });
+
+test("Kraken % sizing uses the open position when Reduce-only is ticked, so 100% closes all of it", async t => {
+  const vite = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
+  t.after(() => vite.close());
+  const { default: store } = await vite.ssrLoadModule("/src/store.js");
+  const els = { "in-size": { value: "" }, "in-reduce": { checked: true } };
+  const oldDocument = globalThis.document;
+  globalThis.document = { getElementById: id => els[id] || null };
+  t.after(() => { globalThis.document = oldDocument; });
+  const toasts = [];
+  store.setState({ symbol: "PF_SOLUSD", toast: msg => toasts.push(msg),
+    instruments: [{ symbol: "PF_SOLUSD", contractSize: 1, contractValueTradePrecision: 2 }],
+    positions: [{ symbol: "PF_SOLUSD", side: "long", size: 12.3, price: 117 }],
+    tickers: { PF_SOLUSD: { last: 117 } }, account: { availableMargin: 100000 }, lev: 10 });
+  store.getState().sizeFromPct(100);
+  assert.equal(els["in-size"].value, "12.30");
+  store.getState().sizeFromPct(50);
+  assert.equal(els["in-size"].value, "6.15");
+  els["in-reduce"].checked = false;
+  store.getState().sizeFromPct(100);
+  assert.equal(els["in-size"].value, "8547.00", "without Reduce-only it is still margin x leverage");
+  els["in-reduce"].checked = true;
+  store.setState({ positions: [] });
+  store.getState().sizeFromPct(100);
+  assert.match(toasts.at(-1), /No open position/);
+});

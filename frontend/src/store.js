@@ -1778,6 +1778,15 @@ const useStore = create((set, get) => ({
 
   sizeFromPct(pct) {
     const s = get();
+    const inst0 = s.instruments.find(i => i.symbol === s.symbol) || {};
+    // Reduce-only sizes from the open position, so 100% closes all of it (as on Hyperliquid).
+    if (document.getElementById("in-reduce")?.checked) {
+      const position = s.positions.find(p => !p.error && p.symbol === s.symbol && Number(p.size));
+      if (!position) { s.toast("No open position on this symbol to reduce.", "err"); return; }
+      const el = document.getElementById("in-size");
+      if (el) el.value = formatContractSize(Math.abs(Number(position.size)) * pct / 100, inst0.contractValueTradePrecision ?? 2);
+      return;
+    }
     const t = s.tickers[s.symbol];
     const avail = Number((s.account.availableMargin ?? s.account.collateralValue) || 0);
     if (!t || !t.last || !avail) { s.toast("No price or margin data for sizing.", "err"); return; }

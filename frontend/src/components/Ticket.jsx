@@ -94,7 +94,7 @@ export default function Ticket() {
             <span id="usd-equiv" className="usd-equiv"></span>
           </div>
           <SizeSlider value={pct} onChange={p => { setPct(p); if (p > 0) sizeFromPct(p); }}
-            title={`Percent of available margin at ${lev}x`} />
+            title={`Percent of available margin at ${lev}x, or of the open position when Reduce-only is ticked`} />
           <div className="ticket-sub-label">Sizing leverage <span>{maxLev ? `pair max ${maxLev}x · ` : ""}for the % sizing only</span></div>
           <div className="lev-chips" id="lev-quick" title="Leverage applied to the % sizing. It does not change anything on Kraken.">
             {levChoices.map(l => (
@@ -103,7 +103,7 @@ export default function Ticket() {
           </div>
         </div>
         <div className="check-row">
-          <input id="in-reduce" type="checkbox" />
+          <input id="in-reduce" type="checkbox" onChange={() => { if (pct > 0) sizeFromPct(pct); }} />
           <label htmlFor="in-reduce">Reduce-only</label>
         </div>
         <div className="side-btns">
