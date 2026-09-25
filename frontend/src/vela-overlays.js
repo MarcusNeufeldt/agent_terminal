@@ -53,10 +53,14 @@ export function previewProtection(line, rawPrice) {
   const source = line.protection || line.tp || line.position;
   if (!source) return null;
   const price = snapOverlayPrice(rawPrice, source.tick);
-  // After the taker fee a TP/SL is certain to pay; slippage past the trigger is unknowable.
+  const grossOnly = exitAfterFee({ dir: source.dir, entry: source.entry, price, size: source.size, mult: source.mult || 1 });
+  const kind = line.protection?.kind || (line.tp ? "tp" : price === source.entry ? "be" : grossOnly?.gross > 0 ? "tp" : "sl");
+  // A stop pays the taker fee (market trigger); a TP rests as a post-only limit and pays
+  // the maker fee. Slippage past a stop's trigger is unknowable.
+  const maker = kind === "tp" && (source.maker || source.makerFeeRate !== undefined);
+  const feeRate = kind === "tp" && source.makerFeeRate !== undefined ? source.makerFeeRate : source.feeRate || 0;
   const { gross, fee, net: pnl } = exitAfterFee({ dir: source.dir, entry: source.entry, price, size: source.size,
-    mult: source.mult || 1, feeRate: source.feeRate || 0 }) || { gross: NaN, fee: 0, net: NaN };
-  const kind = line.protection?.kind || (line.tp ? "tp" : price === source.entry ? "be" : gross > 0 ? "tp" : "sl");
+    mult: source.mult || 1, feeRate }) || { gross: NaN, fee: 0, net: NaN };
   const type = kind === "sl" ? "SL" : kind === "tp" ? "TP" : "BE";
   const color = kind === "sl" ? "#ef5350" : kind === "tp" ? "#26a69a" : "#f0b90b";
   return {
@@ -64,7 +68,7 @@ export function previewProtection(line, rawPrice) {
     price,
     color,
     dashed: true,
-    title: `${type} ${price.toFixed(decimals(source.tick))} (${pnl >= 0 ? "+" : "-"}$${money(pnl)}${fee > 0 ? " after fee" : ""})`,
+    title: `${type} ${price.toFixed(decimals(source.tick))} (${pnl >= 0 ? "+" : "-"}$${money(pnl)}${fee > 0 ? ` after ${maker ? "maker " : ""}fee` : ""})`,
     drop: { symbol: source.symbol, kind, price, pnl, gross, fee, order: source.order || line.order || null, positionSnapshot: source.snapshot },
   };
 }
@@ -75,6 +79,8 @@ export function riskOverlays(lines) {
   if (!line) return [];
   const pnl = line.tp.dir * (line.price - line.tp.entry) * line.tp.size * (line.tp.mult || 1);
   if (!(pnl > 0)) return [];
+  // The mirrored stop is a market trigger, so it pays the taker fee even when the TP is a maker order.
+  const stopFee = line.tp.stopFeeRate ?? line.tp.feeRate ?? 0;
   return [1, 2, 3].map(ratio => {
     const risk = mirroredRisk({
       entry: line.tp.entry,
@@ -92,7 +98,7 @@ export function riskOverlays(lines) {
       dashed: true,
       risk: true,
       // The stop would also pay the taker fee, so the loss shown includes it.
-      title: `RISK ${risk.price.toFixed(decimals(line.tp.tick))} (-$${money(Math.abs(risk.pnl) + (line.tp.feeRate || 0) * line.tp.size * (line.tp.mult || 1) * risk.price)}${line.tp.feeRate ? " after fee" : ""}) · 1:${ratio}`,
+      title: `RISK ${risk.price.toFixed(decimals(line.tp.tick))} (-$${money(Math.abs(risk.pnl) + stopFee * line.tp.size * (line.tp.mult || 1) * risk.price)}${stopFee ? " after fee" : ""}) · 1:${ratio}`,
     };
   });
 }

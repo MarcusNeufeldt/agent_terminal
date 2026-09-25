@@ -60,6 +60,14 @@ class TakeProfitCleanupTests(unittest.TestCase):
         self.cleanup.step(True)
         self.assertEqual(len(self.cancelled), 2)
 
+    def test_a_filled_maker_limit_tp_also_cleans_up_the_pair(self):
+        self.orders[0] = {**self.orders[0], "orderType": "lmt", "limitPrice": 0.2}
+        self.cleanup = TakeProfitCleanup(self.db, self.ctx, self.chase, lambda: None, self.publish)
+        self.cleanup.step(True)
+        self.hit_tp()
+        self.cleanup.step(True)
+        self.assertEqual(self.cancelled, ["entry", "sl"])
+
     def test_disarmed_defers_cleanup_and_recovers_from_database(self):
         self.hit_tp()
         self.cleanup.step(False)

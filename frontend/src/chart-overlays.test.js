@@ -125,3 +125,35 @@ test("native whole-position TP profit follows size and entry changes while fixed
 test("keeps symbol overlays isolated", () => {
   assert.deepEqual(buildChartOverlays("PF_ETHUSD", positions, [], instruments), []);
 });
+
+test("a resting reduce-only exit limit is a draggable maker TP; entries and Chase exits are not", async () => {
+  const { previewProtection } = await import("./vela-overlays.js");
+  const lines = buildChartOverlays("PF_XBTUSD", positions, [
+    { symbol: "PF_XBTUSD", order_id: "mk-1", cliOrdId: "kt-full-tp-PF_XBTUSD-1", orderType: "lmt", side: "sell",
+      limitPrice: 120, reduceOnly: true, size: 2, unfilledSize: 2 },
+    { symbol: "PF_XBTUSD", order_id: "entry-1", orderType: "lmt", side: "buy", limitPrice: 90, reduceOnly: false, size: 1 },
+    { symbol: "PF_XBTUSD", order_id: "ch-1", cliOrdId: "ch-726da97f-4-de2425", orderType: "lmt", side: "sell",
+      limitPrice: 121, reduceOnly: true, size: 2 },
+  ], instruments);
+  const tp = lines.find(line => line.key === "order-stop:kt-full-tp-PF_XBTUSD-1");
+  assert.ok(tp && tp.tp, "the maker TP drags through the tp path");
+  assert.equal(tp.price, 120);
+  assert.equal(tp.tp.maker, true);
+  assert.equal(tp.tp.feeRate, 0.000175, "Kraken maker fee");
+  assert.equal(tp.tp.stopFeeRate, 0.0005, "a mirrored stop still pays the taker fee");
+  // (120 - 100) * 2 = 40 gross, less 0.0175% of 240 = 0.042.
+  assert.match(tp.title, /\+\$39\.96 after maker fee/);
+  assert.ok(!lines.some(line => line.key === "order-limit:kt-full-tp-PF_XBTUSD-1"), "no duplicate plain limit line");
+  assert.ok(lines.find(line => line.key === "order-limit:entry-1"), "an entry limit stays a plain order line");
+  const chase = lines.find(line => line.key === "order-limit:ch-726da97f-4-de2425");
+  assert.ok(chase && !chase.tp, "a Chase exit is not a TP");
+
+  // Dragging the position handle into profit previews a maker TP.
+  const handle = lines.find(line => line.key === "position:PF_XBTUSD");
+  const preview = previewProtection(handle, 110);
+  assert.equal(preview.drop.kind, "tp");
+  assert.match(preview.title, /\+\$19\.96 after maker fee/);
+  const stop = previewProtection(handle, 95);
+  assert.equal(stop.drop.kind, "sl");
+  assert.match(stop.title, /-\$10\.10 after fee/, "a stop pays the taker fee");
+});

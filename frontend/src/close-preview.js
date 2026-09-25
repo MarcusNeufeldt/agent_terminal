@@ -5,6 +5,9 @@
 // Taker rates. Kraken: measured 5.0bp on 97% of this account's fills (2026-09).
 // Hyperliquid: base tier 0 (4.5bp); staking or referral discounts are not applied.
 export const TAKER_FEE = { kraken: 0.0005, hyperliquid: 0.00045 };
+// A TP is a resting post-only limit, so it pays the maker fee. Measured from this
+// account's own maker fills: Kraken 1.75 bp, Hyperliquid 1.5 bp.
+export const MAKER_FEE = { kraken: 0.000175, hyperliquid: 0.00015 };
 // The Hyperliquid market close is an IOC bounded 0.5% from the best price (store.closePosition).
 export const HL_CLOSE_SLIPPAGE = 0.005;
 
@@ -91,4 +94,8 @@ export function exitAfterFee({ dir, entry, price, size, mult = 1, feeRate = 0 })
 
 export function feeRateFor(readOnly) {
   return readOnly ? TAKER_FEE.hyperliquid : TAKER_FEE.kraken;
+}
+
+export function makerFeeRateFor(readOnly) {
+  return readOnly ? MAKER_FEE.hyperliquid : MAKER_FEE.kraken;
 }

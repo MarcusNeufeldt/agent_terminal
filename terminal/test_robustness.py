@@ -60,6 +60,9 @@ class ProtectionContext:
     def mark_price(self, _symbol):
         return 4.65
 
+    def fresh_ticker(self, _symbol):
+        return {"bid": 4.649, "ask": 4.651, "markPrice": 4.65}
+
 
 class LongProtectionContext(ProtectionContext):
     def get_positions(self):
@@ -73,6 +76,9 @@ class LongProtectionContext(ProtectionContext):
 
     def current_price(self, _symbol):
         return 2.4
+
+    def fresh_ticker(self, _symbol):
+        return {"bid": 2.412, "ask": 2.414, "markPrice": 2.413}
 
     def instrument(self, _symbol):
         return {"tickSize": 0.001, "contractValueTradePrecision": 1}
@@ -134,6 +140,9 @@ class ProtectionExecutionContext:
 
     def mark_price(self, _symbol):
         return Decimal("100")
+
+    def fresh_ticker(self, _symbol):
+        return {"bid": 99.9, "ask": 100.1, "markPrice": 100}
 
 
 class ScannerClient:
@@ -902,9 +911,9 @@ class RobustnessTests(unittest.TestCase):
     @staticmethod
     def _open_tp(**changes):
         order = {
-            "symbol": "PF_TESTUSD", "side": "sell", "orderType": "take_profit",
+            "symbol": "PF_TESTUSD", "side": "sell", "orderType": "lmt",
             "reduceOnly": True, "order_id": "tp-1", "cliOrdId": f"{MANAGED_TP_PREFIX}PF_TESTUSD-old",
-            "size": 10, "unfilledSize": 10, "stopPrice": 120, "triggerSignal": "mark",
+            "size": 10, "unfilledSize": 10, "limitPrice": 120,
         }
         order.update(changes)
         return order
@@ -920,7 +929,7 @@ class RobustnessTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["edited"])
         self.assertEqual(result["orderId"], "tp-1")
-        self.assertEqual(client.calls, [("/editorder", {"orderId": "tp-1", "size": 10.0, "stopPrice": 125.0})])
+        self.assertEqual(client.calls, [("/editorder", {"orderId": "tp-1", "size": 10.0, "limitPrice": 125.0})])
 
     def test_protection_edit_rejection_leaves_original_order_working(self):
         client = ProtectionScriptClient({
@@ -950,19 +959,34 @@ class RobustnessTests(unittest.TestCase):
 
     def test_exact_partial_tp_drag_preserves_size_and_other_ladder_orders(self):
         partial = self._open_tp(unfilledSize=4, size=4)
-        other = self._open_tp(order_id="tp-2", cliOrdId="manual-tp-2", unfilledSize=6, size=6, stopPrice=130)
+        other = self._open_tp(order_id="tp-2", cliOrdId="manual-tp-2", unfilledSize=6, size=6, limitPrice=130)
         ctx = ProtectionExecutionContext(Mock(), [partial, other])
         result = execute_actions([{
             "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 126,
             "orderId": "tp-1", "preserveSize": True,
         }], ctx, False)[0]
         self.assertTrue(result["simulated"])
-        self.assertEqual(result["editParams"], {"orderId": "tp-1", "size": 4.0, "stopPrice": 126.0})
+        self.assertEqual(result["editParams"], {"orderId": "tp-1", "size": 4.0, "limitPrice": 126.0})
         ambiguous = execute_actions([{
             "type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 126,
         }], ctx, False)[0]
         self.assertFalse(ambiguous["ok"])
         self.assertIn("ladder", ambiguous["error"])
+
+    def test_dragging_a_legacy_trigger_tp_replaces_it_with_a_maker_tp(self):
+        trigger = {"symbol": "PF_TESTUSD", "side": "sell", "orderType": "take_profit", "reduceOnly": True,
+                   "order_id": "tp-9", "cliOrdId": f"{MANAGED_TP_PREFIX}PF_TESTUSD-t", "size": 10,
+                   "unfilledSize": 10, "stopPrice": 120, "triggerSignal": "mark"}
+        client = ProtectionScriptClient({
+            "/cancelorder": [{"result": "success", "cancelStatus": {"status": "cancelled"}}],
+            "/sendorder": [{"result": "success", "sendStatus": {"status": "placed", "order_id": "maker-1"}}],
+        })
+        result = execute_actions([{"type": "replace_tp", "symbol": "PF_TESTUSD", "stopPrice": 125, "orderId": "tp-9"}],
+                                 ProtectionExecutionContext(client, [trigger]), True)[0]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([path for path, _params in client.calls], ["/cancelorder", "/sendorder"])
+        sent = client.calls[1][1]
+        self.assertEqual((sent["orderType"], sent["limitPrice"], sent["reduceOnly"]), ("post", 125.0, True))
 
     def test_cancel_recreate_rolls_back_previous_protection_on_known_rejection(self):
         target = self._open_tp(order_id=None)
@@ -1041,9 +1065,12 @@ class RobustnessTests(unittest.TestCase):
         sl = _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.715}, ctx, "stp")
         self.assertEqual(tp["orderId"], "tp-1")
         self.assertEqual(sl["orderId"], "sl-1")
-        self.assertEqual(tp["editParams"], {"orderId": "tp-1", "size": 644.41, "stopPrice": 4.622})
+        # A legacy trigger TP is not edited: it is cancelled and replaced by a maker TP.
+        self.assertIsNone(tp["editParams"])
+        self.assertEqual(tp["cancelTarget"], {"order_id": "tp-1"})
         self.assertEqual(sl["editParams"], {"orderId": "sl-1", "size": 644.41, "stopPrice": 4.715})
-        self.assertEqual(tp["order"]["orderType"], "take_profit")
+        self.assertEqual((tp["order"]["orderType"], tp["order"]["limitPrice"], tp["order"]["reduceOnly"]), ("post", 4.622, True))
+        self.assertNotIn("stopPrice", tp["order"])
         self.assertEqual(sl["order"]["orderType"], "stp")
 
     def test_managed_full_tp_resizes_after_position_growth(self):
@@ -1063,6 +1090,11 @@ class RobustnessTests(unittest.TestCase):
         legacy = {**managed, "cliOrdId": "", "order_id": "legacy-tp"}
         self.assertEqual(len(managed_protection_sync_actions(positions, [legacy], {"legacy-tp"})), 1)
         self.assertEqual(managed_protection_sync_actions(positions, [{**managed, "cliOrdId": "manual-tp"}]), [])
+        # A maker (limit) TP keeps auto-resizing, at its limit price.
+        maker = {"symbol": "PF_ENAUSD", "orderType": "lmt", "reduceOnly": True, "limitPrice": 0.17296,
+                 "cliOrdId": f"{MANAGED_TP_PREFIX}PF_ENAUSD-2", "order_id": "maker-tp", "unfilledSize": 10313}
+        [resize] = managed_protection_sync_actions(positions, [maker])
+        self.assertEqual((resize["type"], resize["stopPrice"], resize["syncToSize"]), ("replace_tp", 0.17296, 20626.0))
 
     def test_managed_tp_does_not_rewrite_partial_ladders(self):
         positions = [{"symbol": "PF_ENAUSD", "side": "long", "size": 20626}]
@@ -1078,8 +1110,24 @@ class RobustnessTests(unittest.TestCase):
         ctx = ProtectionContext()
         with self.assertRaisesRegex(ActionError, "above current mark"):
             _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.64}, ctx, "stp")
-        with self.assertRaisesRegex(ActionError, "below current mark"):
-            _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.66}, ctx, "take_profit")
+        # A maker TP must rest on the exit side of the book, not merely beyond mark.
+        with self.assertRaisesRegex(ActionError, "below the best ask 4.651"):
+            _replace_protection_plan({"symbol": "PF_EGLDUSD", "stopPrice": 4.651}, ctx, "take_profit")
+        with self.assertRaisesRegex(ActionError, "above the best bid 2.412"):
+            _replace_protection_plan({"symbol": "PF_TRUMPUSD", "stopPrice": 2.412}, LongProtectionContext(), "take_profit")
+        plan = _replace_protection_plan({"symbol": "PF_TRUMPUSD", "stopPrice": 2.413}, LongProtectionContext(), "take_profit")
+        self.assertEqual((plan["order"]["orderType"], plan["order"]["side"], plan["order"]["limitPrice"]), ("post", "sell", 2.413))
+        self.assertTrue(plan["order"]["cliOrdId"].startswith(f"{MANAGED_TP_PREFIX}PF_TRUMPUSD"))
+
+    def test_a_chase_exit_is_never_mistaken_for_a_take_profit(self):
+        from actions import is_protection_order, protection_covers
+        chase = {"symbol": "PF_TESTUSD", "side": "sell", "orderType": "lmt", "reduceOnly": True,
+                 "cliOrdId": "ch-726da97f-4-de2425", "limitPrice": 120, "unfilledSize": 10}
+        self.assertFalse(is_protection_order(chase, "TP"))
+        self.assertFalse(protection_covers([chase], "PF_TESTUSD", "TP", 10))
+        maker = {**chase, "cliOrdId": f"{MANAGED_TP_PREFIX}PF_TESTUSD-1"}
+        self.assertTrue(protection_covers([maker], "PF_TESTUSD", "TP", 10))
+        self.assertFalse(is_protection_order({**maker, "reduceOnly": False}, "TP"))
 
     def test_profitable_trailing_stop_is_valid(self):
         plan = _replace_protection_plan(

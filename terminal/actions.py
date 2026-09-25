@@ -34,7 +34,30 @@ LIMIT_TYPES = {"lmt", "post", "ioc"}
 TRIGGER_TYPES = {"stp", "take_profit"}
 MANAGED_TP_PREFIX = "kt-full-tp-"
 MANAGED_SL_PREFIX = "kt-full-sl-"
-PROTECTION_ORDER_TYPES = {"TP": {"take_profit"}, "SL": {"stp", "stop"}}
+# A TP is a resting reduce-only LIMIT on the exit side (a maker TP), or the older mark
+# trigger. Kraken reports a post-only limit as lmt or post. Chase orders (ch-) are
+# reduce-only limits too, but they are exits in flight, not protection.
+TP_LIMIT_TYPES = {"lmt", "post"}
+PROTECTION_ORDER_TYPES = {"TP": {"take_profit"} | TP_LIMIT_TYPES, "SL": {"stp", "stop"}}
+CHASE_CLIENT_PREFIX = "ch-"
+
+
+def is_protection_order(order: dict[str, Any], kind: str) -> bool:
+    """One definition of a TP/SL order for every check: reduce-only, of the kind's types,
+    and for a limit TP not a Chase order."""
+    if not isinstance(order, dict) or str(order.get("reduceOnly")).lower() != "true":
+        return False
+    order_type = str(order.get("orderType") or "").lower()
+    if order_type not in PROTECTION_ORDER_TYPES.get(kind, set()):
+        return False
+    return not (order_type in TP_LIMIT_TYPES and str(order.get("cliOrdId") or "").startswith(CHASE_CLIENT_PREFIX))
+
+
+def protection_price(order: dict[str, Any]) -> Any:
+    """The price a TP/SL exits at: the limit for a maker TP, the trigger otherwise."""
+    if str(order.get("orderType") or "").lower() in TP_LIMIT_TYPES:
+        return order.get("limitPrice")
+    return order.get("stopPrice")
 PRICE_MAX_AGE_SECONDS = 5.0
 
 
@@ -81,14 +104,11 @@ def protection_covers(orders: list[dict[str, Any]], symbol: str, kind: str, posi
     size = _as_number(position_size)
     if size is None or size <= 0:
         return False
-    accepted = PROTECTION_ORDER_TYPES.get(kind)
-    if not accepted:
+    if kind not in PROTECTION_ORDER_TYPES:
         return False
     coverage = 0.0
     for order in orders:
-        if (str(order.get("symbol") or "") != symbol or
-                str(order.get("orderType") or "").lower() not in accepted or
-                str(order.get("reduceOnly")).lower() != "true"):
+        if str(order.get("symbol") or "") != symbol or not is_protection_order(order, kind):
             continue
         if order.get("positionTpsl") is True:
             return True
@@ -372,6 +392,11 @@ def _normalized_trigger_signal(value: Any) -> str:
 
 
 def _restore_protection_order(order: dict[str, Any], ctx: ActionContext, order_type: str) -> dict[str, Any]:
+    size = order.get("unfilledSize") if order.get("unfilledSize") is not None else order.get("size")
+    if str(order.get("orderType") or "").lower() in TP_LIMIT_TYPES:
+        # A maker TP comes back as the post-only limit it was.
+        return _validate_order({"orderType": "post", "symbol": order.get("symbol"), "side": order.get("side"),
+                                "size": size, "limitPrice": order.get("limitPrice"), "reduceOnly": True}, ctx)
     trigger_signal = _normalized_trigger_signal(order.get("triggerSignal"))
     restored = {
         "orderType": order_type,
@@ -400,21 +425,32 @@ def _replace_protection_plan(a: dict[str, Any], ctx: ActionContext, order_type: 
     stop = _dec(a.get("stopPrice"))
     if stop <= 0:
         raise ActionError("stopPrice must be positive")
-    mark = ctx.mark_price(symbol)
-    must_be_above = (side_pos == "long") == (order_type == "take_profit")
-    if stop == mark or (stop > mark) != must_be_above:
-        label = "take profit" if order_type == "take_profit" else "stop loss"
-        direction = "above" if must_be_above else "below"
-        raise ActionError(f"{label} price must be {direction} current mark {mark}")
+    maker_tp = order_type == "take_profit"
+    if maker_tp:
+        # The TP is a post-only limit: it must rest on the exit side of the book, or
+        # Kraken rejects it for crossing (a sell at or below the bid, a buy at or above the ask).
+        ticker = ctx.fresh_ticker(symbol)
+        bid, ask = ticker.get("bid"), ticker.get("ask")
+        if not bid or not ask:
+            raise ActionError(f"no current bid/ask for {symbol}; a maker take profit needs the book")
+        if side_pos == "long" and stop <= _dec(bid):
+            raise ActionError(f"take profit must be above the best bid {bid} to rest as a maker order")
+        if side_pos == "short" and stop >= _dec(ask):
+            raise ActionError(f"take profit must be below the best ask {ask} to rest as a maker order")
+    else:
+        mark = ctx.mark_price(symbol)
+        must_be_above = side_pos == "short"
+        if stop == mark or (stop > mark) != must_be_above:
+            direction = "above" if must_be_above else "below"
+            raise ActionError(f"stop loss price must be {direction} current mark {mark}")
 
     orders = _checked_rows(ctx.get_orders(), "open orders")
-    order_types = {"take_profit"} if order_type == "take_profit" else {"stp", "stop"}
+    kind = "TP" if maker_tp else "SL"
     existing = [
         order for order in orders
         if isinstance(order, dict)
         and str(order.get("symbol")) == symbol
-        and str(order.get("orderType") or "").lower() in order_types
-        and str(order.get("reduceOnly")).lower() == "true"
+        and is_protection_order(order, kind)
     ]
     requested_order_id = str(a.get("orderId") or a.get("order_id") or a.get("sourceOrderId") or "")
     requested_cli_id = str(a.get("cliOrdId") or a.get("sourceCliOrdId") or "")
@@ -445,6 +481,10 @@ def _replace_protection_plan(a: dict[str, Any], ctx: ActionContext, order_type: 
         "triggerSignal": "mark",
         "reduceOnly": True,
     }
+    if maker_tp:
+        # Maker TP: a resting post-only reduce-only limit at the TP price.
+        order_input = {"orderType": "post", "symbol": symbol, "side": order_input["side"],
+                       "size": order_input["size"], "limitPrice": _fmt(stop), "reduceOnly": True}
     if target and target.get("cliOrdId"):
         order_input["cliOrdId"] = str(target["cliOrdId"])
     elif target is None:
@@ -456,8 +496,14 @@ def _replace_protection_plan(a: dict[str, Any], ctx: ActionContext, order_type: 
     if target and not order_id and not target_cli_id:
         raise ActionError("existing protection has no exact exchange or client order ID")
     cancel_target = ({"order_id": order_id} if order_id else {"cliOrdId": target_cli_id}) if target else None
-    can_edit = bool(order_id) and _normalized_trigger_signal(target.get("triggerSignal")) == "mark"
-    edit_params = {"orderId": order_id, "size": new_order["size"], "stopPrice": new_order["stopPrice"]} if can_edit else None
+    target_is_limit = bool(target) and str(target.get("orderType") or "").lower() in TP_LIMIT_TYPES
+    if maker_tp:
+        # A limit TP is edited in place; a legacy trigger TP is cancelled and replaced by one.
+        can_edit = bool(order_id) and target_is_limit
+        edit_params = {"orderId": order_id, "size": new_order["size"], "limitPrice": new_order["limitPrice"]} if can_edit else None
+    else:
+        can_edit = bool(order_id) and _normalized_trigger_signal(target.get("triggerSignal")) == "mark"
+        edit_params = {"orderId": order_id, "size": new_order["size"], "stopPrice": new_order["stopPrice"]} if can_edit else None
     return {
         "target": target,
         "orderId": order_id or None,
@@ -496,8 +542,9 @@ def _find_open_protection(ctx: ActionContext, target: dict[str, Any]) -> dict[st
 
 def _protection_matches(order: dict[str, Any], desired: dict[str, Any]) -> bool:
     size = order.get("unfilledSize") if order.get("unfilledSize") is not None else order.get("size")
+    desired_size = desired.get("unfilledSize") if desired.get("unfilledSize") is not None else desired.get("size")
     try:
-        return _dec(order.get("stopPrice")) == _dec(desired.get("stopPrice")) and _dec(size) == _dec(desired.get("size"))
+        return _dec(protection_price(order)) == _dec(protection_price(desired)) and _dec(size) == _dec(desired_size)
     except ActionError:
         return False
 
@@ -750,10 +797,10 @@ def managed_protection_sync_actions(
         cli_id = str(order.get("cliOrdId") or "")
         order_id = str(order.get("order_id") or order.get("orderId") or "")
         order_type = str(order.get("orderType") or "").lower()
-        if cli_id.startswith(MANAGED_TP_PREFIX) or (order_id in managed_order_ids and order_type == "take_profit"):
-            action_type, order_types = "replace_tp", {"take_profit"}
+        if cli_id.startswith(MANAGED_TP_PREFIX) or (order_id in managed_order_ids and order_type in PROTECTION_ORDER_TYPES["TP"]):
+            action_type, kind = "replace_tp", "TP"
         elif cli_id.startswith(MANAGED_SL_PREFIX) or (order_id in managed_order_ids and order_type in {"stp", "stop"}):
-            action_type, order_types = "replace_sl", {"stp", "stop"}
+            action_type, kind = "replace_sl", "SL"
         else:
             continue
         symbol = str(order.get("symbol") or "")
@@ -762,15 +809,13 @@ def managed_protection_sync_actions(
             continue
         peers = [
             candidate for candidate in orders
-            if str(candidate.get("symbol") or "") == symbol
-            and str(candidate.get("orderType") or "").lower() in order_types
-            and str(candidate.get("reduceOnly")).lower() == "true"
+            if str(candidate.get("symbol") or "") == symbol and is_protection_order(candidate, kind)
         ]
         if len(peers) != 1:  # never rewrite intentional partial ladders or ambiguous protection
             continue
         current_size = _dec(position.get("size"))
         order_size = _dec(order.get("unfilledSize") if order.get("unfilledSize") is not None else order.get("size"))
-        stop_price = order.get("stopPrice")
+        stop_price = protection_price(order)
         if current_size == order_size or stop_price is None:
             continue
         actions.append({
@@ -1161,14 +1206,14 @@ Action schemas:
 - {"type": "order", "symbol", "side": "buy|sell", "orderType": "mkt|lmt|post|ioc|stp|take_profit", "size", "limitPrice?" (required for lmt/post/ioc), "stopPrice?" (required for stp/take_profit), "reduceOnly?"}
 - {"type": "ladder", "symbol", "side", "notional" (USD total), "orders" (1-20), "depthPercent", "orderType?": "post|lmt" (default post), "includeCurrent?" (first rung at current price), "reduceOnly?"}
 - {"type": "close", "symbol", "percent?" (1-100, default 100) or "size"} — reduce-only market close
-- {"type": "replace_tp", "symbol", "stopPrice", "orderId?"} — edits the exact TP when an ID is supplied; otherwise edits the only unambiguous TP or creates one managed full-position mark-trigger TP
+- {"type": "replace_tp", "symbol", "stopPrice", "orderId?"} — edits the exact TP when an ID is supplied; otherwise edits the only unambiguous TP or creates one managed full-position MAKER TP: a post-only reduce-only limit at stopPrice (it must rest beyond the best bid for a long, below the best ask for a short; it fills only if price trades through it, at the maker fee). An older mark-trigger TP is replaced by a maker TP.
 - {"type": "replace_sl", "symbol", "stopPrice", "orderId?"} — edits the exact SL when an ID is supplied; otherwise edits the only unambiguous SL or creates one managed full-position mark-trigger SL
 - {"type": "cancel_all", "symbol", "side?": "buy|sell", "reduceOnly?": true|false, "excludeReduceOnly?"} — filtered cancel. Examples: {"symbol","side":"sell","reduceOnly":true} clears exactly the TP/scale-out sells; {"symbol","excludeReduceOnly":true} clears entry grids while keeping protection live.
 - {"type": "cancel", "cliOrdId"} or {"orderId"}
 - {"type": "chase", "symbol", "side", "size", "timeoutSec?" (default 300), "repegSec?" (default 5), "maxRepegs?", "offsetTicks?"} — POST-ONLY maker chase: rests at best bid (buy) / best ask (sell), re-pegs as the market moves, until filled/timeout. Use when the user wants in WITHOUT taker fees. Requires the terminal ARMED; the action returns "chase started" immediately, fills arrive as notifications afterwards.
 
 THE OPEN ORDERS LIST IN THE SNAPSHOT IS YOUR BOOK STATE. Before any action that adds orders, reconcile against it:
-1. RESIZE/MOVE protection by exact order ID; the server uses `editorder` so the working order is never canceled first. Never reconstruct IDs from memory or collapse a partial ladder.
+1. RESIZE/MOVE protection by exact order ID; the server uses `editorder` so the working order is never canceled first (converting an older trigger TP to a maker TP is a cancel then replace). Never reconstruct IDs from memory or collapse a partial ladder.
 2. NEVER stack new orders on top of existing ones at the same or overlapping prices. One order per price level.
 3. NEVER end a proposal with "let me know if you also want X cleared/replaced" — include the cleanup in the block or state explicitly that nothing needs cleaning.
 4. Reduce-only sells must not exceed the current position size in total. If the position grew, recompute per-level sizes from the snapshot's CURRENT size; if it shrank, trim levels.

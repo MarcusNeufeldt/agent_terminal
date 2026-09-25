@@ -1,4 +1,5 @@
-import { exitAfterFee, feeRateFor } from "./close-preview.js";
+import { exitAfterFee, feeRateFor, makerFeeRateFor } from "./close-preview.js";
+import { isChaseOrder } from "./chase-view.js";
 
 export function buildChartOverlays(symbol, positions, orders, instruments, readOnly = false, canCancel = false, canProtect = false) {
   const overlays = [];
@@ -7,8 +8,10 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
   const instrument = (instruments || []).find(i => i.symbol === symbol) || {};
   const tick = Number(instrument.tickSize) || 0.01;
   const mult = Number(instrument.contractSize || 1);
-  // TP and SL both fill as market orders: every dollar figure is after the taker fee.
+  // A stop fills as a market order (taker fee); a TP is a resting post-only limit (maker fee).
   const feeRate = feeRateFor(readOnly);
+  const makerFeeRate = makerFeeRateFor(readOnly);
+  const exitSide = position ? (String(position.side).toLowerCase() === "long" ? "sell" : "buy") : null;
 
   for (const p of positions || []) {
     if (p.error || p.symbol !== symbol || !p.size) continue;
@@ -19,7 +22,7 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
       color: p.side === "long" ? "#26a69a" : "#ef5350",
       title: `${p.side} ${Number(p.size)}`,
       dashed: false,
-      position: { symbol, entry: Number(p.price), size: Number(p.size), mult, dir, tick, feeRate, side: p.side, snapshot: { ...p } },
+      position: { symbol, entry: Number(p.price), size: Number(p.size), mult, dir, tick, feeRate, makerFeeRate, side: p.side, snapshot: { ...p } },
     });
     if (p.liqPriceEstimate) {
       overlays.push({
@@ -47,7 +50,11 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
       positionSnapshot: position ? { ...position } : null,
     } : null;
 
-    if (o.limitPrice) {
+    // A maker TP: a resting reduce-only limit on the exit side of the open position.
+    // A Chase exit is also a reduce-only limit, but it is an exit in flight, not a TP.
+    const limitTp = !!position && !o.stopPrice && Number(o.limitPrice) > 0 && String(o.reduceOnly) === "true" &&
+      o.side === exitSide && !isChaseOrder(o);
+    if (o.limitPrice && !limitTp) {
       const size = o.size !== null && o.size !== undefined ? ` ${Number(o.size)}` : "";
       overlays.push({
         key: `order-limit:${identity}`,
@@ -59,15 +66,17 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
       });
     }
 
-    if (!o.stopPrice) continue;
-    const isTp = String(o.orderType).toLowerCase() === "take_profit";
+    if (!o.stopPrice && !limitTp) continue;
+    const isTp = limitTp || String(o.orderType).toLowerCase() === "take_profit";
     const type = isTp ? "TP" : "SL";
+    const exitPrice = Number(limitTp ? o.limitPrice : o.stopPrice);
+    const lineFee = limitTp ? makerFeeRate : feeRate;
     if (!position) {
       overlays.push({
         key: `order-stop:${identity}`,
-        price: Number(o.stopPrice),
+        price: exitPrice,
         color: isTp ? "#26a69a" : "#ef5350",
-        title: `${type} ${Number(o.stopPrice)}`,
+        title: `${type} ${exitPrice}`,
         dashed: true,
         ...(order ? { order } : {}),
       });
@@ -81,12 +90,12 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
     const orderSize = nativeFullPosition ? positionSize : Number(o.unfilledSize ?? o.size ?? positionSize);
     const coveredSize = Math.min(positionSize, orderSize);
     const coverage = positionSize > 0 ? Math.round(orderSize / positionSize * 100) : 0;
-    const { net: pnl } = exitAfterFee({ dir, entry: Number(position.price), price: Number(o.stopPrice), size: coveredSize, mult, feeRate }) || { net: NaN };
+    const { net: pnl } = exitAfterFee({ dir, entry: Number(position.price), price: exitPrice, size: coveredSize, mult, feeRate: lineFee }) || { net: NaN };
     overlays.push({
       key: `order-stop:${identity}`,
-      price: Number(o.stopPrice),
+      price: exitPrice,
       color: isTp ? "#26a69a" : "#ef5350",
-      title: `${type} ${Number(o.stopPrice)} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} after fee) · ${coverage}%${nativeFullPosition ? " · auto size" : ""}`,
+      title: `${type} ${exitPrice} (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} after ${limitTp ? "maker " : ""}fee) · ${coverage}%${nativeFullPosition ? " · auto size" : limitTp ? " · maker" : ""}`,
       dashed: true,
       ...(isTp ? {
         tp: {
@@ -96,7 +105,9 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
           mult,
           dir,
           tick,
-          feeRate,
+          feeRate: lineFee,
+          stopFeeRate: feeRate,
+          maker: limitTp,
           fullPosition: orderSize === positionSize,
           order,
         },

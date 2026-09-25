@@ -2,7 +2,7 @@
 from decimal import Decimal
 import json
 
-from actions import ActionError, _checked_rows, cancel_one
+from actions import ActionError, _checked_rows, cancel_one, is_protection_order
 
 
 def order_id(order):
@@ -54,7 +54,7 @@ class TakeProfitCleanup:
             side = "sell" if position["side"] == "long" else "buy"
             tps = [{"orderId": order_id(o), "size": o.get("unfilledSize", o.get("size"))}
                    for o in orders if o.get("symbol") == symbol and o.get("side") == side
-                   and o.get("orderType") == "take_profit" and str(o.get("reduceOnly")).lower() == "true"
+                   and is_protection_order(o, "TP")
                    and order_id(o) and float(o.get("unfilledSize", o.get("size")) or 0) >= float(position["size"])]
             if existing.get("status") == "paused" and not any(tp["orderId"] not in {old["orderId"] for old in existing["tps"]} for tp in tps):
                 continue

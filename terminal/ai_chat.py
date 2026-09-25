@@ -483,12 +483,12 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_tp",
-            "description": "Edit an exact take-profit by orderId, or edit/create the only unambiguous managed full-position TP. IMMEDIATE.",
+            "description": "Edit an exact take-profit by orderId, or edit/create the only unambiguous managed full-position TP. The TP is a maker order: a post-only reduce-only limit that fills only if price trades through it. IMMEDIATE.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string"},
-                    "stopPrice": {"type": "number", "description": "New TP trigger price"},
+                    "stopPrice": {"type": "number", "description": "New TP limit price (post-only; beyond the best bid for a long, below the best ask for a short)"},
                     "orderId": {"type": "string", "description": "Exact exchange order ID from the live snapshot"},
                 },
                 "required": ["symbol", "stopPrice"],

@@ -9,7 +9,7 @@ import { buildProtectionAction } from "./protection-action";
 import { buildChartOverlays } from "./chart-overlays";
 import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { valuationPrice } from "./pricing.js";
-import { closePreview, exitAfterFee, TAKER_FEE } from "./close-preview.js";
+import { closePreview, exitAfterFee, TAKER_FEE, MAKER_FEE } from "./close-preview.js";
 import { pairMaxLeverage } from "./leverage.js";
 import { chaseOverlays } from "./chase-view.js";
 import { toVelaTimeframe } from "./vela-provider";
@@ -273,12 +273,16 @@ const useStore = create((set, get) => ({
       const inst = s.instruments.find(i => i.symbol === symbol) || {};
       if (pos) {
         pnl = exitAfterFee({ dir: String(pos.side).toLowerCase() === "short" ? -1 : 1, entry: pos.price, price: stopPrice,
-          size: pos.size, mult: inst.contractSize || 1, feeRate: TAKER_FEE.kraken })?.net;
+          size: pos.size, mult: inst.contractSize || 1, feeRate: kind === "tp" ? MAKER_FEE.kraken : TAKER_FEE.kraken })?.net;
       }
     }
-    // Chart drags pass the after-fee value; slippage past the trigger is not included.
-    const pnlText = Number.isFinite(pnl) ? ` (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} after fee, before slippage)` : "";
-    if (get().armed && !confirm(`${label} ${symbol} at ${fmt(stopPrice)}${pnlText}?\n\nThis will change a LIVE reduce-only protection order.`)) return false;
+    // Chart drags pass the after-fee value. A TP is a maker limit (no slippage, but it fills
+    // only if price trades through it); a stop is a market trigger (slippage not included).
+    const pnlText = Number.isFinite(pnl) ? ` (${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} after ${kind === "tp" ? "maker fee" : "fee, before slippage"})` : "";
+    const how = kind === "tp"
+      ? "a post-only reduce-only LIMIT (maker). It fills only if price trades through it; it is not a guaranteed exit."
+      : "a reduce-only market trigger on mark price.";
+    if (get().armed && !confirm(`${label} ${symbol} at ${fmt(stopPrice)}${pnlText}?\n\nThis will change a LIVE protection order: ${how}`)) return false;
     try {
       const action = buildProtectionAction(kind, symbol, stopPrice, order);
       const r = await api("/api/action", { method: "POST", body: { actions: [action], requestId: newRequestId() } });
