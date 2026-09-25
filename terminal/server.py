@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import sys
+import calendar
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -602,6 +603,45 @@ def get_fills() -> list[dict[str, Any]]:
         return result
     except KrakenFuturesError as exc:
         return [{"error": str(exc)}]
+
+
+_fee_refresh = {"at": 0.0}
+
+
+def fills_with_fees(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach the fee Kraken booked for each fill. The fills feed has no fee, but the
+    account log books it under the same execution id as the fill_id. A fill too new for
+    the held log gets fee None and one throttled background log refresh."""
+    fees: dict[str, float] = {}
+    for row in account_log.cached_rows(client):
+        execution = row.get("execution")
+        if execution and row.get("fee") is not None:
+            fees[execution] = fees.get(execution, 0.0) + float(row["fee"])
+    out, missing_recent = [], False
+    cutoff = time.time() - 900
+    for fill in fills:
+        if not isinstance(fill, dict) or fill.get("error"):
+            out.append(fill)
+            continue
+        fee = fees.get(str(fill.get("fill_id") or ""))
+        out.append({**fill, "fee": round(fee, 10) if fee is not None else None})
+        if fee is None:
+            try:
+                stamp = calendar.timegm(time.strptime(str(fill.get("fillTime"))[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                stamp = 0
+            missing_recent = missing_recent or stamp > cutoff
+    if missing_recent and time.time() - _fee_refresh["at"] > 30:
+        _fee_refresh["at"] = time.time()
+        threading.Thread(target=lambda: _quiet(account_log.full_log, client), daemon=True).start()
+    return out
+
+
+def _quiet(fn, *args):
+    try:
+        fn(*args)
+    except Exception:
+        pass
 
 
 def get_instruments() -> dict[str, Any]:
@@ -1462,7 +1502,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"rows": out})
             elif path == "/api/fills":
-                self._send_json({"fills": get_fills()})
+                self._send_json({"fills": fills_with_fees(get_fills())})
             elif path == "/api/marketlist":
                 self._send_json({"rows": _marketlist()})
             elif path == "/api/volatility":

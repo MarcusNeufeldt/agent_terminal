@@ -229,6 +229,12 @@ function OrdersTable() {
   );
 }
 
+// Fee as basis points of the fill's notional, for the tooltip.
+function feeRate(f) {
+  const notional = Math.abs(Number(f.size || f.qty) * Number(f.price));
+  return notional > 0 ? `${(Number(f.fee) / notional * 10000).toFixed(2)} bp of $${notional.toFixed(2)}` : "";
+}
+
 function FillsTable() {
   const fills = useStore(s => s.fills);
   const status = useStore(s => s.dataStatus.fills);
@@ -237,6 +243,7 @@ function FillsTable() {
     <table className="data">
       <thead><tr>
         <th>Time</th><th>Symbol</th><th>Side</th><th className="num">Price</th><th className="num">Size</th>
+        <th>Role</th><th className="num" title="Fee the exchange charged for this fill">Fee</th>
       </tr></thead>
       <tbody>
         {fills.slice(0, 80).map((f, i) => (
@@ -246,6 +253,11 @@ function FillsTable() {
             <td className={f.side === "buy" ? "up" : "down"}>{f.side}</td>
             <td className="num">{fmt(f.price)}</td>
             <td className="num">{fmt(f.size || f.qty)}</td>
+            <td className={f.fillType === "maker" ? "up" : f.fillType === "taker" ? "down" : "muted"}
+              title={f.fillType === "maker" ? "Rested on the book (maker fee)" : f.fillType === "taker" ? "Took liquidity (taker fee)" : ""}>
+              {f.fillType === "maker" || f.fillType === "taker" ? f.fillType : (f.fillType || "–")}</td>
+            <td className="num" title={f.fee == null ? "Not booked yet; appears within about a minute" : feeRate(f)}>
+              {f.fee == null ? "…" : `$${Number(f.fee).toFixed(2)}`}</td>
           </tr>
         ))}
       </tbody>

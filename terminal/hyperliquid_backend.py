@@ -484,6 +484,8 @@ class HyperliquidBackend:
                            "price": trade["price"], "size": trade["qty"], "fillTime": iso_time(fill["time"]),
                            "id": trade["id"], "order_id": str(oid),
                            "fee": optional_number(fill.get("fee")), "feeToken": fill.get("feeToken"),
+                           # crossed: the fill took liquidity (taker); otherwise it rested (maker).
+                           "fillType": ("taker" if fill["crossed"] else "maker") if type(fill.get("crossed")) is bool else None,
                            "realizedPnl": optional_number(fill.get("closedPnl"))})
         return {"fills": result, "scope": "native-perps", "history": "recent-only"}
 

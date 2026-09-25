@@ -31,7 +31,7 @@ class HyperliquidTests(unittest.TestCase):
                                     "limitPx": "0.4", "triggerPx": "0.5", "isTrigger": True, "orderType": "Take Profit Limit",
                                     "reduceOnly": True, "timestamp": 1700000000000}],
             "userFills": [{"coin": "APT", "side": "A", "px": "0.7", "sz": "2", "time": 1700000000000,
-                           "tid": 88, "oid": 12345678901234567890, "fee": "0.01", "feeToken": "USDC", "closedPnl": "0.2"}],
+                           "tid": 88, "oid": 12345678901234567890, "fee": "0.01", "feeToken": "USDC", "closedPnl": "0.2", "crossed": True}],
             "spotClearinghouseState": {"balances": []},
             "userAbstraction": "manual",
         }
@@ -145,6 +145,7 @@ class HyperliquidTests(unittest.TestCase):
         self.assertEqual(fill["order_id"], "12345678901234567890")
         self.assertEqual(fill["id"], "88")
         self.assertEqual((fill["fee"], fill["feeToken"], fill["realizedPnl"]), (0.01, "USDC", 0.2))
+        self.assertEqual(fill["fillType"], "taker", "crossed = took liquidity")
         self.assertEqual(result["history"], "recent-only", "recent fills are not complete history")
 
     def test_order_status_invalid_ids_never_reach_upstream(self):

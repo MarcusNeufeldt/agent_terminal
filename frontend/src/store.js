@@ -1712,6 +1712,9 @@ const useStore = create((set, get) => ({
     try {
       const f = await api("/api/fills");
       const fills = (f.fills || []).filter(x => x && x.fillTime && !x.error);
+      // This poll also feeds the Fills table, which otherwise only loaded at page open.
+      set(s => ({ fills: fills.slice().sort((a, b) => new Date(b.fillTime) - new Date(a.fillTime)),
+        dataStatus: { ...s.dataStatus, fills: { state: "current" } } }));
       if (!fills.length) return;
       const key = (x) => JSON.stringify([x.fillTime, x.symbol, x.side, x.price, x.size || x.qty]);
       const sig = JSON.stringify(fills.map(key));
