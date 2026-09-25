@@ -15,10 +15,34 @@ def position_identity(position):
             'price': decimal_text(position.get('price'), positive=True)}
 
 
+# Chase cloids start with hex "chas"; a Chase exit is a reduce-only limit too, but not a TP.
+CHASE_CLOID_PREFIX = '0x63686173'
+
+
+def is_limit_tp(order, exit_side=None):
+    """A maker TP: a resting reduce-only plain limit (no trigger) on the exit side."""
+    return (order.get('orderType') == 'lmt' and order.get('reduceOnly') is True and order.get('triggerKind') is None and
+            (exit_side is None or order.get('side') == exit_side) and
+            not str(order.get('cliOrdId') or '').lower().startswith(CHASE_CLOID_PREFIX))
+
+
+def is_take_profit(order, exit_side=None):
+    """A TP of either form: the maker limit TP or an older take-profit trigger."""
+    return is_limit_tp(order, exit_side) or (
+        order.get('reduceOnly') is True and order.get('orderType') == 'take_profit' and
+        (exit_side is None or order.get('side') == exit_side))
+
+
 def order_identity(order):
     oid = str(order.get('order_id', ''))
     if not 1 <= len(oid) <= 20 or not oid.isascii() or not oid.isdigit() or not 0 < int(oid) < 2**64:
         raise HyperliquidError('Exact exchange order ID is required')
+    if is_limit_tp(order):
+        return {'order_id': oid, 'symbol': order.get('symbol'), 'side': order.get('side'),
+                'orderType': 'lmt', 'cliOrdId': order.get('cliOrdId'), 'reduceOnly': True,
+                'triggerMarket': None, 'triggerKind': None, 'positionTpsl': False, 'limitTp': True,
+                'unfilledSizeExact': decimal_text(order.get('unfilledSizeExact'), positive=True),
+                'stopPrice': None, 'limitPrice': decimal_text(order.get('limitPrice'), positive=True)}
     if type(order.get('triggerMarket')) is not bool or order.get('triggerKind') not in {'tp', 'sl'}:
         raise HyperliquidError('Trigger type is unavailable')
     return {'order_id': oid, 'symbol': order.get('symbol'), 'side': order.get('side'),
@@ -43,20 +67,29 @@ def current(backend, symbol, kind, expected_position, expected_order, *, full_po
     if expected_order is None:
         # Position handles create only when no protection of this type exists.
         # Existing partial ladders must be moved by their individual exact IDs.
-        if any(o.get('reduceOnly') is True and o.get('orderType') == ('stp' if kind == 'sl' else 'take_profit') for o in orders):
+        exists = (any(is_take_profit(o, opposite) for o in orders) if kind == 'tp' else
+                  any(o.get('reduceOnly') is True and o.get('orderType') == 'stp' for o in orders))
+        if exists:
             raise HyperliquidError('Protection already exists. Drag its individual line instead')
         return None
     matches = [o for o in orders if str(o.get('order_id')) == expected_order['order_id']]
     if len(matches) != 1 or order_identity(matches[0]) != expected_order:
         raise HyperliquidError('Target order changed or disappeared. Refresh and drag again')
     order = matches[0]
+    same_kind = (is_limit_tp(order, opposite) if kind == 'tp' else
+                 order.get('triggerKind') == 'sl' and order.get('orderType') == 'stp')
+    if kind == 'tp' and not is_limit_tp(order) and order.get('orderType') == 'take_profit':
+        # Turning a trigger into a limit through modify is not a verified venue operation.
+        raise HyperliquidError('This is an older market-trigger TP. Cancel it (x on its line), then drag the '
+                               'position handle to set a maker TP')
     if (order.get('symbol') != symbol or order.get('side') != opposite or order.get('reduceOnly') is not True or
-            order.get('triggerKind') != kind or order.get('orderType') != ('stp' if kind == 'sl' else 'take_profit') or
+            not same_kind or
             (not full_position and not expected_order.get('positionTpsl') and
              Decimal(expected_order['unfilledSizeExact']) > Decimal(expected_position['sizeExact']))):
         raise HyperliquidError('Only matching reduce-only position protection can be dragged')
     if full_position and not expected_order.get('positionTpsl'):
-        peers = [o for o in orders if o.get('reduceOnly') is True and o.get('triggerKind') == kind]
+        peers = [o for o in orders if (is_take_profit(o, opposite) if kind == 'tp' else
+                                       o.get('reduceOnly') is True and o.get('triggerKind') == kind)]
         if len(peers) != 1:
             raise HyperliquidError('Multiple same-kind exits exist. Keep the partial ladder or review it manually')
     return order
@@ -97,11 +130,25 @@ def prepare(body, backend):
     bid, ask = (Decimal(str(book['orderBook'][side][0][0])) for side in ('bids', 'asks'))
     if not 0 < bid < ask:
         raise HyperliquidError('Invalid quote')
-    above = (expected['side'] == 'long') == (kind == 'tp')
-    if not (Decimal(price) > ask if above else Decimal(price) < bid):
-        raise HyperliquidError('Protection price is already executable. Drag beyond the current market')
     side = 'sell' if expected['side'] == 'long' else 'buy'
     size = target['unfilledSizeExact'] if target and not full_position else expected['sizeExact']
+    if kind == 'tp':
+        # Maker TP: a post-only (Alo) reduce-only limit at the TP price, sized to the position
+        # now. It must rest on the exit side of the book: a sell above the bid, a buy below the ask.
+        if not (Decimal(price) > bid if side == 'sell' else Decimal(price) < ask):
+            raise HyperliquidError(f"Take profit must be {'above the best bid' if side == 'sell' else 'below the best ask'} "
+                                   f"({bid if side == 'sell' else ask}) to rest as a maker order")
+        action = order_action_for(instrument, side, size, price, tif='alo', reduce_only=True, cloid=body['cloid'])
+        if Decimal(action['orders'][0]['s']) != Decimal(size):
+            raise HyperliquidError('Reviewed quantity is not an exact contract lot')
+        if target:
+            action = {'type': 'batchModify', 'modifies': [{'oid': int(target['order_id']), 'order': action['orders'][0]}]}
+        return {'type': 'chartIntent', 'action': action, 'expiresAfter': int(time.time() * 1000) + 30000,
+                'symbol': symbol, 'kind': kind, 'position': expected, 'target': target, 'quoteTime': stamp,
+                'fullPosition': full_position, 'maker': True}
+    above = expected['side'] == 'short'
+    if not (Decimal(price) > ask if above else Decimal(price) < bid):
+        raise HyperliquidError('Protection price is already executable. Drag beyond the current market')
     market = target['triggerMarket'] if target else True
     limit = target['limitPrice'] if target and not market else price
     action = order_action_for(instrument, side, size, limit, reduce_only=True,
@@ -150,8 +197,9 @@ def reconcile(db, backend, request_id, body, intent):
         raise HyperliquidError('Invalid chart preparation')
     action = intent['action']
     order = action['modifies'][0]['order'] if action.get('type') == 'batchModify' else action['orders'][0]
+    maker = 'limit' in order.get('t', {})
     if (order.get('c') != body.get('cloid') or order.get('r') is not True or
-            (intent.get('fullPosition') and order.get('s') != '0')):
+            (intent.get('fullPosition') and not maker and order.get('s') != '0')):
         raise HyperliquidError('Chart client identity mismatch')
     saved = db.venue_recovery_state(request_id, backend.network, backend.account_address)
     if saved['result'].get('outcome') in {'simulated', 'rejected'} and not _misread_trigger(saved['result']):
@@ -166,11 +214,13 @@ def reconcile(db, backend, request_id, body, intent):
             str(status.get('cliOrdId') or '').lower() != body['cloid'].lower() or
             status.get('symbol') != intent['symbol'] or status.get('reduceOnly') is not True or
             status.get('side') != ('buy' if order['b'] else 'sell') or
-            (not (status.get('positionTpsl') is True and status.get('isTrigger') is True and
+            (Decimal(status.get('originalSizeExact', '-1')) != Decimal(order['s']) or status.get('isTrigger') is True
+             if maker else
+             not (status.get('positionTpsl') is True and status.get('isTrigger') is True and
                   Decimal(str(status.get('triggerPrice', '0'))) == Decimal(order['t']['trigger']['triggerPx']))
              if intent.get('fullPosition') else Decimal(status.get('originalSizeExact', '-1')) != Decimal(order['s']))):
         raise HyperliquidError('Replacement identity is not confirmed. Do not retry')
-    if intent['target']:
+    if intent['target'] and str(status.get('order_id')) != intent['target']['order_id']:
         old = backend.order_status(intent['target']['order_id'])
         if (not old.get('found') or old.get('symbol') != intent['symbol'] or
                 str(old.get('order_id')) != intent['target']['order_id'] or

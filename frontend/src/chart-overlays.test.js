@@ -157,3 +157,18 @@ test("a resting reduce-only exit limit is a draggable maker TP; entries and Chas
   assert.equal(stop.drop.kind, "sl");
   assert.match(stop.title, /-\$10\.10 after fee/, "a stop pays the taker fee");
 });
+
+test("Hyperliquid draws a resting reduce-only Alo limit as a draggable maker TP at 1.5 bp", () => {
+  const symbol = "HL_APT";
+  const hlPositions = [{ symbol, side: "long", size: 10, sizeExact: "10", price: 1 }];
+  const lines = buildChartOverlays(symbol, hlPositions, [
+    { symbol, order_id: "42", cliOrdId: "0x" + "c".repeat(32), orderType: "lmt", side: "sell", limitPrice: 1.2,
+      reduceOnly: true, triggerKind: null, triggerMarket: null, unfilledSizeExact: "10", unfilledSize: 10, size: 10 },
+  ], [{ symbol, tickSize: 0.01, contractSize: 1 }], true, true, true);
+  const tp = lines.find(line => line.key.startsWith("order-stop:"));
+  assert.ok(tp && tp.protection && tp.tp, "draggable through the protection path");
+  assert.equal(tp.protection.kind, "tp");
+  assert.equal(tp.protection.feeRate, 0.00015);
+  assert.equal(tp.protection.stopFeeRate, 0.00045);
+  assert.match(tp.title, /after maker fee/);
+});

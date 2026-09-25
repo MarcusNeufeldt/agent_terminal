@@ -139,14 +139,18 @@ export function buildChartOverlays(symbol, positions, orders, instruments, readO
     if (readOnly) {
       if (!protectionReady) delete line.position;
       const order = line.order?.snapshot;
+      // The maker TP (a resting reduce-only Alo limit) was recognised above; triggers are
+      // the stop loss and any older market TP.
+      const makerTp = line.tp?.maker === true;
       const protectionSize = order?.positionTpsl === true ? Number(position?.sizeExact) : Number(order?.unfilledSizeExact);
       if (protectionReady && position && protectionSize > 0 &&
           protectionSize <= Number(position.sizeExact) && line.key.startsWith("order-stop:") && order?.reduceOnly === true &&
           order.side === (position.side === "long" ? "sell" : "buy") &&
-          ["tp", "sl"].includes(order.triggerKind) && typeof order.triggerMarket === "boolean") {
-        line.protection = { symbol, kind: order.triggerKind, entry: Number(position.price),
+          (makerTp || (["tp", "sl"].includes(order.triggerKind) && typeof order.triggerMarket === "boolean"))) {
+        line.protection = { symbol, kind: makerTp ? "tp" : order.triggerKind, entry: Number(position.price),
           size: protectionSize, mult, dir: position.side === "long" ? 1 : -1,
-          tick, feeRate, order: line.order, snapshot: { ...position } };
+          tick, feeRate: makerTp ? makerFeeRate : feeRate, stopFeeRate: feeRate, maker: makerTp,
+          order: line.order, snapshot: { ...position } };
       }
       if (!canCancel) delete line.order;
       if (line.protection?.kind === "tp") {

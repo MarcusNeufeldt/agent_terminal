@@ -45,12 +45,14 @@ class Backend:
 class ChartTests(unittest.TestCase):
     def setUp(self):
         self.backend = Backend()
-        self.body = {'symbol': 'HL_APT', 'kind': 'tp', 'price': 1.2, 'position': deepcopy(self.backend.position),
+        # Trigger mechanics are exercised through the stop loss; the TP is a maker limit
+        # (see MakerTakeProfitTests).
+        self.body = {'symbol': 'HL_APT', 'kind': 'sl', 'price': 0.8, 'position': deepcopy(self.backend.position),
                      'cloid': '0x' + 'a'*32, 'expectedArmed': False}
     def target(self, market=True):
-        row = {'order_id': str(2**63+5), 'symbol': 'HL_APT', 'side': 'sell', 'orderType': 'take_profit',
-               'cliOrdId': '0x'+'b'*32, 'reduceOnly': True, 'triggerKind': 'tp', 'triggerMarket': market,
-               'unfilledSizeExact': '3', 'stopPrice': 1.1, 'limitPrice': 1.11}
+        row = {'order_id': str(2**63+5), 'symbol': 'HL_APT', 'side': 'sell', 'orderType': 'stp',
+               'cliOrdId': '0x'+'b'*32, 'reduceOnly': True, 'triggerKind': 'sl', 'triggerMarket': market,
+               'unfilledSizeExact': '3', 'stopPrice': 0.9, 'limitPrice': 0.89}
         self.backend.open = [row]
         self.body.update(target=deepcopy(row), acknowledgeReplacement=True)
         return row
@@ -70,11 +72,14 @@ class ChartTests(unittest.TestCase):
             self.assertTrue(order['r'])
             self.assertEqual(order['s'], '10')
             self.assertEqual(order['b'], side == 'short')
-            self.assertEqual(order['t']['trigger']['tpsl'], kind)
-            self.assertTrue(order['t']['trigger']['isMarket'])
+            if kind == 'tp':
+                self.assertEqual(order['t'], {'limit': {'tif': 'Alo'}}, 'a TP is a post-only maker limit')
+            else:
+                self.assertEqual(order['t']['trigger']['tpsl'], kind)
+                self.assertTrue(order['t']['trigger']['isMarket'])
     def test_native_full_position_uses_zero_size_for_long_short_tp_sl(self):
         self.body.update(fullPosition=True, acknowledgeFullPosition=True)
-        for side, kind, price in [('long','tp',1.2), ('long','sl',0.8), ('short','tp',0.8), ('short','sl',1.2)]:
+        for side, kind, price in [('long','sl',0.8), ('short','sl',1.2)]:
             for size in ('10', '30', '5'):
                 self.backend.position.update(side=side, sizeExact=size)
                 self.body.update(kind=kind, price=price, position=deepcopy(self.backend.position))
@@ -96,7 +101,7 @@ class ChartTests(unittest.TestCase):
         intent = chart.prepare(self.body, self.backend)
         wire = intent['action']['modifies'][0]['order']
         self.assertEqual(wire['s'], '0')
-        self.assertEqual(wire['p'], '1.11')
+        self.assertEqual(wire['p'], '0.89')
         self.assertEqual(intent['action']['modifies'][0]['oid'], 2**63+5)
         self.backend.open.append({**self.backend.open[0], 'order_id': '123'})
         with self.assertRaisesRegex(HyperliquidError, 'ladder'): chart.prepare(self.body, self.backend)
@@ -124,7 +129,7 @@ class ChartTests(unittest.TestCase):
         self.assertEqual(action['modifies'][0]['oid'], 2**63+5)
         order = action['modifies'][0]['order']
         self.assertEqual(order['s'], '3')
-        self.assertEqual(order['p'], '1.11')
+        self.assertEqual(order['p'], '0.89')
         self.assertFalse(order['t']['trigger']['isMarket'])
         self.assertEqual(self.backend.open[1], sibling)
         self.body['acknowledgeReplacement'] = False
@@ -208,7 +213,7 @@ class ChartTests(unittest.TestCase):
         db.venue_recovery_state.return_value = {'result': {'outcome': 'unknown'}}
         status = {'found': True, 'cliOrdId': self.body['cloid'], 'symbol': 'HL_APT', 'reduceOnly': True,
                   'side': 'sell', 'originalSizeExact': '0', 'order_id': '42', 'orderStatus': 'open',
-                  'positionTpsl': True, 'isTrigger': True, 'triggerPrice': 1.2}
+                  'positionTpsl': True, 'isTrigger': True, 'triggerPrice': 0.8}
         old = {'found': True, 'orderStatus': 'canceled', 'symbol': 'HL_APT', 'order_id': self.body['target']['order_id']}
         with patch('hyperliquid_chart.time.time', return_value=(intent['expiresAfter']+5000)/1000):
             for bad in ({'positionTpsl': False}, {'triggerPrice': 1.3}, {'isTrigger': False}, {'uncertain': True}):
@@ -246,6 +251,83 @@ class ChartTests(unittest.TestCase):
                 self.assertEqual(db.venue_recovery_state('chart-fixture','testnet',ACCOUNT)['result'],original)
                 self.assertEqual(db.claim_write_request('next-order','/api/order',payload)['state'],'new')
             finally: db._conn.close()
+
+
+
+class MakerTakeProfitTests(unittest.TestCase):
+    """The chart TP on Hyperliquid is a post-only reduce-only limit, sized to the position."""
+
+    def setUp(self):
+        self.backend = Backend()
+        self.body = {'symbol': 'HL_APT', 'kind': 'tp', 'price': 1.2, 'position': deepcopy(self.backend.position),
+                     'cloid': '0x' + 'a'*32, 'expectedArmed': False, 'fullPosition': True, 'acknowledgeFullPosition': True}
+
+    def maker_tp(self, **changes):
+        row = {'order_id': str(2**63+7), 'symbol': 'HL_APT', 'side': 'sell', 'orderType': 'lmt', 'cliOrdId': '0x'+'c'*32,
+               'reduceOnly': True, 'triggerKind': None, 'triggerMarket': None, 'positionTpsl': False,
+               'unfilledSizeExact': '10', 'stopPrice': None, 'limitPrice': 1.15}
+        row.update(changes)
+        return row
+
+    def test_a_new_tp_is_an_alo_limit_for_the_whole_position_with_no_trigger(self):
+        intent = chart.prepare(self.body, self.backend)
+        order = intent['action']['orders'][0]
+        self.assertEqual((order['t'], order['s'], order['p'], order['r'], order['b']), ({'limit': {'tif': 'Alo'}}, '10', '1.2', True, False))
+        self.assertEqual(intent['action']['grouping'], 'na')
+        self.assertTrue(intent['maker'])
+        chart.validate(intent, self.backend)
+
+    def test_the_tp_price_must_rest_on_the_exit_side_of_the_book(self):
+        # Long: a sell must sit above the best bid (0.99). Between bid and ask it still rests.
+        self.assertEqual(chart.prepare({**self.body, 'price': 1.0}, self.backend)['action']['orders'][0]['p'], '1')
+        with self.assertRaisesRegex(HyperliquidError, 'above the best bid'):
+            chart.prepare({**self.body, 'price': 0.99}, self.backend)
+        self.backend.position['side'] = 'short'
+        short = {**self.body, 'position': deepcopy(self.backend.position), 'price': 1.01}
+        with self.assertRaisesRegex(HyperliquidError, 'below the best ask'):
+            chart.prepare(short, self.backend)
+
+    def test_an_existing_maker_tp_blocks_a_second_one_and_moves_by_modify(self):
+        row = self.maker_tp()
+        self.backend.open = [row]
+        with self.assertRaisesRegex(HyperliquidError, 'already exists'):
+            chart.prepare(self.body, self.backend)
+        body = {**self.body, 'target': deepcopy(row), 'acknowledgeReplacement': True, 'price': 1.3}
+        intent = chart.prepare(body, self.backend)
+        modify = intent['action']
+        self.assertEqual((modify['type'], modify['modifies'][0]['oid']), ('batchModify', 2**63+7))
+        self.assertNotIn('a', modify, 'the trigger-only a=true flag is not sent for a plain limit')
+        self.assertEqual(modify['modifies'][0]['order']['t'], {'limit': {'tif': 'Alo'}})
+        self.assertEqual(modify['modifies'][0]['order']['p'], '1.3')
+
+    def test_a_legacy_trigger_tp_is_not_converted_by_modify(self):
+        trigger = {'order_id': str(2**63+5), 'symbol': 'HL_APT', 'side': 'sell', 'orderType': 'take_profit',
+                   'cliOrdId': '0x'+'b'*32, 'reduceOnly': True, 'triggerKind': 'tp', 'triggerMarket': True,
+                   'positionTpsl': True, 'unfilledSizeExact': '0', 'stopPrice': 1.1, 'limitPrice': 1.1}
+        self.backend.open = [trigger]
+        body = {**self.body, 'target': deepcopy(trigger), 'acknowledgeReplacement': True}
+        with self.assertRaisesRegex(HyperliquidError, 'older market-trigger TP'):
+            chart.prepare(body, self.backend)
+        with self.assertRaisesRegex(HyperliquidError, 'already exists'):
+            chart.prepare(self.body, self.backend)
+
+    def test_a_chase_exit_is_not_a_take_profit(self):
+        self.backend.open = [self.maker_tp(cliOrdId='0x63686173' + 'd'*24)]
+        self.assertEqual(chart.prepare(self.body, self.backend)['action']['type'], 'order')
+
+    def test_recovery_of_a_maker_tp_compares_size_and_never_reads_a_trigger(self):
+        intent = chart.prepare(self.body, self.backend)
+        db = Mock()
+        db.venue_recovery_state.return_value = {'result': {'outcome': 'unknown'}}
+        status = {'found': True, 'cliOrdId': self.body['cloid'], 'symbol': 'HL_APT', 'reduceOnly': True, 'side': 'sell',
+                  'originalSizeExact': '10', 'order_id': '42', 'orderStatus': 'open', 'isTrigger': False}
+        with patch('hyperliquid_chart.time.time', return_value=(intent['expiresAfter'] + 5000) / 1000):
+            for bad in ({'originalSizeExact': '9'}, {'isTrigger': True}, {'side': 'buy'}):
+                self.backend.order_status.side_effect = [{**status, **bad}]
+                with self.assertRaisesRegex(HyperliquidError, 'identity'):
+                    chart.reconcile(db, self.backend, 'maker-recovery', self.body, intent)
+            self.backend.order_status.side_effect = [status]
+            self.assertEqual(chart.reconcile(db, self.backend, 'maker-recovery', self.body, intent)['outcome'], 'reconciled')
 
 
 if __name__ == '__main__': unittest.main()

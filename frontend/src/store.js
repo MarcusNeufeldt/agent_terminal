@@ -11,7 +11,7 @@ import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { valuationPrice } from "./pricing.js";
 import { closePreview, exitAfterFee, TAKER_FEE, MAKER_FEE } from "./close-preview.js";
 import { pairMaxLeverage } from "./leverage.js";
-import { chaseOverlays } from "./chase-view.js";
+import { chaseOverlays, isChaseOrder } from "./chase-view.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
 
@@ -333,11 +333,21 @@ const useStore = create((set, get) => ({
     const position = positionSnapshot || order?.positionSnapshot || matches[0];
     if (position.symbol !== symbol) return false;
     const target = order ? order.snapshot : null;
-    if (order && (!target || String(target.order_id) !== String(order.orderId) || target.symbol !== symbol ||
-        target.reduceOnly !== true || target.triggerKind !== kind || typeof target.triggerMarket !== "boolean")) {
-      s.toast("Refresh the chart before moving this exact trigger.", "warn"); return false;
+    // The TP is a maker order: a resting post-only reduce-only limit on the exit side.
+    const exitSide = position.side === "long" ? "sell" : "buy";
+    const isMakerTp = o => o.orderType === "lmt" && o.reduceOnly === true && !o.triggerKind && o.side === exitSide && !isChaseOrder(o);
+    if (kind === "tp" && target && target.orderType === "take_profit") {
+      s.toast("This is an older market-trigger TP. Cancel it (x on its line), then drag the position handle to set a maker TP.", "warn", 12000);
+      return false;
     }
-    const existing = s.orders.filter(o => o.symbol === symbol && o.reduceOnly === true && o.orderType === (kind === "sl" ? "stp" : "take_profit"));
+    if (order && (!target || String(target.order_id) !== String(order.orderId) || target.symbol !== symbol ||
+        target.reduceOnly !== true ||
+        !(kind === "tp" ? isMakerTp(target) : target.triggerKind === kind && typeof target.triggerMarket === "boolean"))) {
+      s.toast("Refresh the chart before moving this exact order.", "warn"); return false;
+    }
+    const existing = s.orders.filter(o => o.symbol === symbol && (kind === "tp"
+      ? isMakerTp(o) || (o.reduceOnly === true && o.orderType === "take_profit")
+      : o.reduceOnly === true && o.orderType === "stp"));
     if (!target && existing.length) {
       s.toast("Protection already exists. Drag its individual TP/SL line; partial ladders are not replaced together.", "warn"); return false;
     }
@@ -346,14 +356,18 @@ const useStore = create((set, get) => ({
     }
     const quantity = fullPosition ? position.sizeExact : target?.unfilledSizeExact || position.sizeExact;
     if (!(Number(quantity) > 0)) return false;
-    const risk = target ? `Hyperliquid ALWAYS places the replacement even if the original fills or disappears during this request. Prior fills may therefore leave an additional reduce-only exit ${fullPosition ? "covering the position at trigger time" : "for this quantity"}. It cannot open/increase a position.`
+    const maker = kind === "tp";
+    const risk = maker
+      ? `${target ? "Moves the maker TP. " : ""}A post-only reduce-only LIMIT (maker): it rests on the book and fills only if price trades through it. It is not a guaranteed exit; close at market from the positions table if you need out.`
+      : target ? `Hyperliquid ALWAYS places the replacement even if the original fills or disappears during this request. Prior fills may therefore leave an additional reduce-only exit ${fullPosition ? "covering the position at trigger time" : "for this quantity"}. It cannot open/increase a position.`
       : "Creates a full-size reduce-only market trigger. Fills are not guaranteed.";
-    const sizing = fullPosition ? " Entire-position mode: Hyperliquid follows future position increases and decreases, even while this terminal is closed. The displayed quantity and profit are current estimates, not a fixed exit size." : " Fixed-size protection; future position increases are not covered.";
-    const limit = (target && !target.triggerMarket ? ` Stop-limit price stays ${target.limitPrice}.` : "") + sizing;
-    const result = exitAfterFee({ dir: position.side === "short" ? -1 : 1, entry: position.price, price, size: quantity,
-      feeRate: TAKER_FEE.hyperliquid });
+    const sizing = maker ? " Sized to the position now; it does not follow later position increases or decreases."
+      : fullPosition ? " Entire-position mode: Hyperliquid follows future position increases and decreases, even while this terminal is closed. The displayed quantity and profit are current estimates, not a fixed exit size." : " Fixed-size protection; future position increases are not covered.";
+    const limit = (!maker && target && !target.triggerMarket ? ` Stop-limit price stays ${target.limitPrice}.` : "") + sizing;
+    const feeRate = maker ? MAKER_FEE.hyperliquid : TAKER_FEE.hyperliquid;
+    const result = exitAfterFee({ dir: position.side === "short" ? -1 : 1, entry: position.price, price, size: quantity, feeRate });
     const outcome = result && Number.isFinite(result.net)
-      ? `\n\nIf filled at ${price}: ${result.net >= 0 ? "+" : "-"}$${Math.abs(result.net).toFixed(2)} after the ${(TAKER_FEE.hyperliquid * 100).toFixed(3)}% taker fee ($${result.fee.toFixed(2)}), before slippage.`
+      ? `\n\nIf filled at ${price}: ${result.net >= 0 ? "+" : "-"}$${Math.abs(result.net).toFixed(2)} after the ${(feeRate * 100).toFixed(3)}% ${maker ? "maker" : "taker"} fee ($${result.fee.toFixed(2)})${maker ? "" : ", before slippage"}.`
       : "";
     if (!confirm(`${s.armed ? "LIVE" : "SIMULATED"} ${kind.toUpperCase()} ${symbol}: ${quantity} contracts at ${price}. ${target ? `Move exact order ${target.order_id}.` : "Create protection."}${outcome}\n\n${risk}${limit}\n\nContinue?`)) return false;
     const requestId = newRequestId(), cloid = newCloid();

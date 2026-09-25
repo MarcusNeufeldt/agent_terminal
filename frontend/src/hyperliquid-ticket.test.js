@@ -93,26 +93,52 @@ test("Chart protection callback sends one confirmed exact-ID native intent and p
 });
 
 test("Position handles request native full-position protection with an explicit future-size confirmation", async t => {
-  const { store, posts, prompts } = await harness(t, resting);
+  const { store, posts, prompts, toasts } = await harness(t, resting);
   store.getState().setSignedTradingMode("mainnet");
   store.setState({ positions: [{ symbol: SYMBOL, side: "long", size: 10, sizeExact: "10", price: 0.6 }], orders: [],
     dataStatus: { orders: { state: "current" }, positions: { state: "current" } } });
+  // The TP is a maker limit sized to the position now; the stop keeps following it natively.
   await store.getState().adjustProtection(SYMBOL, "tp", 0.8);
   assert.equal(posts.length, 1);
   assert.equal(posts[0].fullPosition, true);
   assert.equal(posts[0].acknowledgeFullPosition, true);
-  assert.match(prompts[0], /follows future position increases and decreases/);
+  assert.match(prompts[0], /post-only reduce-only LIMIT \(maker\)/);
+  assert.match(prompts[0], /0\.015% maker fee/);
+  assert.match(prompts[0], /does not follow later position increases or decreases/);
+  store.setState({ hlReceipt: null, positions: [{ symbol: SYMBOL, side: "long", size: 10, sizeExact: "10", price: 0.6 }], orders: [],
+    dataStatus: { orders: { state: "current" }, positions: { state: "current" } } });
+  await store.getState().adjustProtection(SYMBOL, "sl", 0.5);
+  assert.ok(prompts[1], JSON.stringify(toasts.slice(-2)));
+  assert.match(prompts[1], /follows future position increases and decreases/);
+  assert.match(prompts[1], /taker fee/);
+});
+
+test("An older market-trigger TP is not moved on Hyperliquid; the user is told to cancel and re-set it", async t => {
+  const { store, posts, toasts } = await harness(t, resting);
+  const position = { symbol: SYMBOL, side: "long", size: 10, sizeExact: "10", price: 0.6 };
+  const trigger = { symbol: SYMBOL, order_id: "456", side: "sell", orderType: "take_profit", triggerKind: "tp",
+    triggerMarket: true, reduceOnly: true, positionTpsl: true, unfilledSizeExact: "0", stopPrice: 0.8, limitPrice: 0.8 };
+  store.getState().setSignedTradingMode("mainnet");
+  store.setState({ positions: [position], orders: [trigger],
+    dataStatus: { orders: { state: "current" }, positions: { state: "current" } } });
+  await store.getState().submitHyperliquidProtection(SYMBOL, "tp", 0.9, { snapshot: trigger, orderId: "456" }, position);
+  assert.equal(posts.length, 0);
+  assert.match(toasts.at(-1)[1], /older market-trigger TP/);
+  // Nor is a second TP created next to it from the position handle.
+  await store.getState().adjustProtection(SYMBOL, "tp", 0.9);
+  assert.equal(posts.length, 0);
 });
 
 test("Fixed trigger conversion is confirmed, refuses ladders, and native order size renders from current position", async t => {
   const { store, posts, renderOrders } = await harness(t, resting);
   const position = { symbol: SYMBOL, side: "long", size: 10, sizeExact: "10", price: 0.6 };
-  const target = { symbol: SYMBOL, order_id: "456", side: "sell", orderType: "take_profit", triggerKind: "tp",
-    triggerMarket: true, reduceOnly: true, unfilledSizeExact: "3", stopPrice: 0.8, limitPrice: 0.8 };
+  // Trigger conversion to native full-position sizing now applies to the stop loss only.
+  const target = { symbol: SYMBOL, order_id: "456", side: "sell", orderType: "stp", triggerKind: "sl",
+    triggerMarket: true, reduceOnly: true, unfilledSizeExact: "3", stopPrice: 0.5, limitPrice: 0.5 };
   store.getState().setSignedTradingMode("mainnet");
   store.setState({ tab: "orders", positions: [position], orders: [target, { ...target, order_id: "789" }],
     dataStatus: { orders: { state: "current" }, positions: { state: "current" } } });
-  const convert = () => store.getState().submitHyperliquidProtection(SYMBOL, "tp", 0.8,
+  const convert = () => store.getState().submitHyperliquidProtection(SYMBOL, "sl", 0.5,
     { snapshot: target, orderId: target.order_id }, null, true);
   await convert();
   assert.equal(posts.length, 0);
