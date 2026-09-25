@@ -1173,6 +1173,11 @@ test("Chase renders without a price field and sends explicit Hyperliquid values,
   store.getState().setSignedTradingMode("mainnet");
   store.setState({ canTrade: true });
 
+  // A reduce-only Chase needs an opposite position to shrink; without one it is refused locally.
+  await store.getState().submitHyperliquidChase("sell", { size: 20, reduceOnly: true });
+  assert.equal(posts.length, 0);
+  assert.match(toasts.at(-1)[1], /no open HL_APT position to reduce/);
+  store.setState({ positions: [{ symbol: SYMBOL, side: "long", size: 20, sizeExact: "20" }] });
   await store.getState().submitHyperliquidChase("sell", { size: 20, reduceOnly: true });
   assert.deepEqual({ ...posts[0], requestId: undefined },
     { symbol: SYMBOL, side: "sell", size: 20, reduceOnly: true, expectedArmed: false, requestId: undefined });

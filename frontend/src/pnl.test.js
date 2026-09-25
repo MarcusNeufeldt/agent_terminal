@@ -162,3 +162,22 @@ test("Kraken % sizing uses the open position when Reduce-only is ticked, so 100%
   store.getState().sizeFromPct(100);
   assert.match(toasts.at(-1), /No open position/);
 });
+
+test("reduce-only Chases are refused unless they shrink an opposite position; an ended Chase stays ended", async t => {
+  const vite = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
+  t.after(() => vite.close());
+  const { default: store } = await vite.ssrLoadModule("/src/store.js");
+  store.setState({ positions: [{ symbol: "PF_HYPEUSD", side: "long", size: 239.4 }] });
+  const problem = store.getState().reduceOnlyProblem;
+  assert.equal(problem("PF_HYPEUSD", "sell"), null);
+  assert.match(problem("PF_HYPEUSD", "buy"), /cannot reduce a long position/);
+  assert.match(problem("PF_SOLUSD", "sell"), /no open PF_SOLUSD position/);
+
+  // The worker ended before the start reply arrived: the late "running" must not revive it.
+  store.getState().onChaseEvent({ id: "c1", symbol: "PF_HYPEUSD", status: "cancelled", filled: 0, size: 88.1 });
+  store.getState().onChaseEvent({ id: "c1", symbol: "PF_HYPEUSD", status: "running", filled: 0, size: 88.1 });
+  assert.equal(store.getState().chases.c1.status, "cancelled");
+  store.getState().onChaseEvent({ id: "c2", status: "running" });
+  store.getState().onChaseEvent({ id: "c2", status: "filled" });
+  assert.equal(store.getState().chases.c2.status, "filled");
+});

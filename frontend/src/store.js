@@ -1115,10 +1115,22 @@ const useStore = create((set, get) => ({
     return body;
   },
 
+  // A reduce-only order can only shrink an opposite position: SELL reduces a long, BUY a
+  // short. Returns why it cannot, or null. The server refuses it too; this says so first.
+  reduceOnlyProblem(symbol, side) {
+    const matches = get().positions.filter(p => !p.error && p.symbol === symbol && Number(p.size));
+    if (matches.length !== 1) return `Reduce-only ${side.toUpperCase()}: there is no open ${symbol} position to reduce.`;
+    const needs = side === "sell" ? "long" : "short";
+    return matches[0].side === needs ? null
+      : `Reduce-only ${side.toUpperCase()} cannot reduce a ${matches[0].side} position. Untick Reduce-only to open, or use ${side === "sell" ? "BUY" : "SELL"} to close.`;
+  },
+
   async submitChase(side) {
     const body = get().ticketPayload(side);
     if (!body) return;
     if (!get().armed) { get().toast("CHASE requires an armed terminal — arm it first.", "warn"); return; }
+    const problem = body.reduceOnly ? get().reduceOnlyProblem(body.symbol, side) : null;
+    if (problem) { get().toast(problem, "err", 9000); return; }
     try {
       const r = await api("/api/chase", {
         method: "POST",
@@ -1145,6 +1157,8 @@ const useStore = create((set, get) => ({
     const instrument = s.instruments.find(i => i.symbol === symbol) || {};
     const quantity = normalizeContractSize(size, instrument.contractValueTradePrecision ?? 0);
     if (!Number.isFinite(quantity) || quantity <= 0) { s.toast("Enter a size that meets this market's lot size.", "err"); return; }
+    const problem = reduceOnly ? s.reduceOnlyProblem(symbol, side) : null;
+    if (problem) { s.toast(problem, "err", 9000); return; }
     const onTimeout = reduceOnly ? "the unfilled rest closes with a reduce-only market order" : "the unfilled rest is cancelled";
     if (s.armed && !confirmed && !confirm(`LIVE CHASE ${side.toUpperCase()} ${quantity} ${symbol}${reduceOnly ? " (reduce-only)" : ""}\n\n`
       + `Rests post-only at the best ${side === "buy" ? "bid" : "ask"} and re-pegs as it moves. After 5 minutes ${onTimeout}. Continue?`)) return;
@@ -1663,6 +1677,10 @@ const useStore = create((set, get) => ({
   // ---- chase events (SSE) ----
   onChaseEvent(c) {
     if (!c || !c.id) return;
+    // A Chase can end before its start reply arrives; that late "running" snapshot must not
+    // bring an ended Chase back. Ended states are final.
+    const known = get().chases[c.id];
+    if (known && !["running", "unknown", "orphaned"].includes(known.status) && c.status === "running") return;
     set(s => ({ chases: { ...s.chases, [c.id]: { ...c, updated: Date.now() } } }));
     if (!(chart && chart._drag)) get().applyOverlayLines(); // move the Chase line with each re-peg
   },
