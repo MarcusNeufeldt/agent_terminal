@@ -234,6 +234,7 @@ class RobustnessTests(unittest.TestCase):
             raise RuntimeError("cancel timed out")
 
         worker = self._chase_worker(SimpleNamespace(post=post))
+        worker.spec["unclearCancelSec"] = 0  # no time to settle it: it must stay unknown, order kept
         worker._active = {"cliOrdId": "ch-test", "orderId": "order-1", "price": Decimal("10"), "size": 10, "seenFilled": 0, "placedAt": 0}
         with self.assertRaises(ChaseUnknown):
             worker._cancel_active()

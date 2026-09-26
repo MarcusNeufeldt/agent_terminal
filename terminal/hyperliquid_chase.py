@@ -29,6 +29,8 @@ CLOID_PREFIX = "0x63686173"
 MAX_ALO_REJECTS = 20
 MARKET_FINISH_SLIPPAGE = 0.5
 VISIBILITY_GRACE_SEC = 5.0
+# While a cancelled order still reads open, the cancel is sent again this often.
+RESEND_CANCEL_SEC = 5.0
 
 
 def chase_cloid() -> str:
@@ -194,27 +196,66 @@ class HyperliquidChaseWorker(ChaseWorker):
         self._audit("cancellation_intent", cloid=active["cloid"], oid=active.get("orderId"))
         self._transition("CANCEL_REQUESTED", f"cancel requested for {active['cloid']}")
         action = {"type": "cancelByCloid", "cancels": [{"asset": self._instrument_row["assetId"], "cloid": active["cloid"]}]}
-        result = self._submit(action, placement=False)
-        # A refused cancel usually means it already filled or was cancelled; the status
-        # read below decides either way.
-        self._audit("cancellation_result", cloid=active["cloid"], outcome=result.get("outcome"), error=result.get("error"))
-        for attempt in range(4):
+        # A refused cancel usually means it already filled or was cancelled, and a lost reply
+        # (network failure) may or may not have landed. Either way the order status decides.
+        result = self._send_cancel(action, active)
+        deadline = time.monotonic() + float(self.spec.get("unclearCancelSec", 30.0))
+        resend_at = time.monotonic() + RESEND_CANCEL_SEC
+        last = result.get("error") or result.get("outcome") or "no status yet"
+        while True:
             try:
                 state, filled = self._order_state(active)
             except ChaseTransient as exc:
-                if attempt == 3:
-                    raise ChaseUnknown(f"cancel sent, but the order state could not be read: {exc}") from exc
-                time.sleep(1.0)
-                continue
+                state, filled, last = None, None, str(exc)
             if state == "filled" or state in CANCELED or state in REJECTED:
                 self._base += filled
                 self.filled = float(self._base)
                 self._active = None
                 self._transition("RECONCILED", f"{active['cloid']} {state}; {self.filled}/{self.spec['size']} filled")
                 return
-            if attempt == 3:
-                raise ChaseUnknown(f"{active['cloid']} still {state or 'unclassified'} after cancellation")
+            if state is not None:
+                last = f"still {state or 'unclassified'} after cancellation"
+            if time.monotonic() >= deadline:
+                raise ChaseUnknown(f"{active['cloid']} {last}; cancel outcome could not be settled")
+            if state == "open" and time.monotonic() >= resend_at:
+                # Still resting: the cancel never arrived. Cancel by cloid cannot touch another order.
+                self._log(f"{active['cloid']} still open; sending the cancel again")
+                self._send_cancel(action, active)
+                resend_at = time.monotonic() + RESEND_CANCEL_SEC
             time.sleep(1.0)
+
+    def _send_cancel(self, action: dict[str, Any], active: dict[str, Any]) -> dict[str, Any]:
+        try:
+            result = self.ctx.submit(action, placement=False)
+        except Exception as exc:
+            result = {"outcome": "unknown", "error": f"{type(exc).__name__}: {exc}"}
+        self._audit("cancellation_result", cloid=active["cloid"], outcome=result.get("outcome"), error=result.get("error"))
+        if result.get("outcome") == "unknown" or result.get("uncertain"):
+            self._log(f"cancel outcome unclear ({result.get('error') or 'no confirmation'}); checking the order")
+        return result
+
+    def try_resolve(self) -> bool:
+        """Settle an unknown Chase from outside its thread: an order that is filled or cancelled
+        is reconciled; one still open stays unknown. Nothing is placed or cancelled."""
+        active = self._active
+        if self.status != "unknown" or self.is_alive() or not active:
+            return False
+        try:
+            state, filled = self._order_state(active)
+        except ChaseError as exc:
+            self._audit("background_resolve_failed", error=str(exc))
+            return False
+        if not (state == "filled" or state in CANCELED or state in REJECTED):
+            self.unknown_reason = f"{active['cloid']} is still {state or 'unclassified'} on Hyperliquid; cancel or keep it there"
+            return False
+        self._base += filled
+        self.filled = float(self._base)
+        self._active = None
+        self.status = "running"  # _finish records the final status from here
+        self._finish(self._terminal_status(self.stop_reason or "cancelled"),
+                     f"resolved in the background: {active['cloid']} {state}")
+        self._publish()
+        return True
 
     def _market_finish(self, reason: str) -> None:
         if not self.ctx.armed():

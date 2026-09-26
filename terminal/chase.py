@@ -417,7 +417,9 @@ class ChaseWorker(threading.Thread):
                 "/cancelorder", params={"cliOrdId": active["cliOrdId"]}, private=True,
             )
         except Exception as exc:
-            raise ChaseUnknown(f"cancellation outcome unknown for {active['cliOrdId']}: {exc}") from exc
+            # A lost reply is not a lost order: look at the order before calling it unknown.
+            self._resolve_unclear_cancel(exc)
+            return
         try:
             status, detail = _operation_status(response, "cancelStatus")
         except ChaseRejected as exc:
@@ -428,6 +430,69 @@ class ChaseWorker(threading.Thread):
         active["cancelConfirmed"] = True
         self._transition("CANCEL_CONFIRMED", f"cancel confirmed for {active['cliOrdId']}")
         self._retry_cancel_reconciliation()
+
+    def _resolve_unclear_cancel(self, error: Exception) -> None:
+        """The cancel request failed in transit (e.g. a TLS handshake timeout), so it may or
+        may not have landed. Read the order for up to unclearCancelSec: gone means cancelled
+        or filled, which the normal reconciliation tells apart; still resting means the cancel
+        never arrived, so it is sent again (by client id, which cannot touch another order).
+        Only when neither is established in time does the Chase stop as unknown."""
+        active = self._active
+        cli_id = active["cliOrdId"]
+        self._log(f"cancel outcome unclear ({error}); checking the order before deciding")
+        deadline = time.monotonic() + float(self.spec.get("unclearCancelSec", 30.0))
+        poll = float(self.spec.get("unclearCancelPollSec", 3.0))
+        last = f"{type(error).__name__}: {error}"
+        while True:
+            gone = confirmed = False
+            try:
+                if not any(self._matches(order, active) for order in self._open_orders()):
+                    gone = True
+                else:
+                    response = self.ctx.client.post("/cancelorder", params={"cliOrdId": cli_id}, private=True)
+                    status, _detail = _operation_status(response, "cancelStatus")
+                    confirmed = status == "cancelled"
+                    last = f"order still resting; re-sent cancel returned {status or 'no status'}"
+            except ChaseError as exc:
+                # Only reads and the re-sent cancel run in here; an ambiguous cancel reply
+                # (e.g. notFound once the order has filled) is settled by the next read.
+                last = str(exc)
+            except Exception as exc:
+                last = f"{type(exc).__name__}: {exc}"
+            if gone or confirmed:
+                self._audit("cancellation_resolved", cliOrdId=cli_id, orderId=active.get("orderId"),
+                            via="order_absent" if gone else "cancel_resent")
+                active["cancelConfirmed"] = True
+                self._transition("CANCEL_CONFIRMED", f"{cli_id} {'is off the book' if gone else 'cancel confirmed on retry'}")
+                self._retry_cancel_reconciliation()
+                return
+            if time.monotonic() >= deadline:
+                raise ChaseUnknown(f"cancellation outcome unknown for {cli_id}: {last}") from error
+            self._log(f"{last}; checking again")
+            time.sleep(poll)
+
+    def try_resolve(self) -> bool:
+        """Settle a Chase that stopped as unknown, from outside its thread. Nothing is placed:
+        an order no longer on the book is reconciled as cancelled or filled; one still resting
+        stays unknown for the user. Returns True when the Chase reached a final state."""
+        active = self._active
+        if self.status != "unknown" or self.is_alive() or not active:
+            return False
+        try:
+            if any(self._matches(order, active) for order in self._open_orders()):
+                self.unknown_reason = f"{active['cliOrdId']} is still resting on the book; cancel or keep it on Kraken"
+                return False
+            active["cancelConfirmed"] = True
+            self._reconcile_cancelled()
+        except ChaseError as exc:
+            self._audit("background_resolve_failed", error=str(exc))
+            active.pop("cancelConfirmed", None)
+            return False
+        self.status = "running"  # _finish records the final status from here
+        self._finish(self._terminal_status(self.stop_reason or "cancelled"),
+                     "resolved in the background: the order is off the book and reconciled")
+        self._publish()
+        return True
 
     def _retry_cancel_reconciliation(self) -> None:
         for attempt in range(3):
@@ -614,6 +679,19 @@ class ChaseManager:
             return {"error": f"chase {chase_id} is {worker.status}; reconcile or cancel by exact order ID"}
         worker.abort()
         return {"ok": True, "chase": worker.snapshot()}
+
+    def resolve_unknown(self) -> list[str]:
+        """One background pass over Chases that stopped as unknown; see ChaseWorker.try_resolve."""
+        with self._lock:
+            workers = [w for w in self._chases.values() if w.status == "unknown" and not w.is_alive()]
+        resolved = []
+        for worker in workers:
+            try:
+                if worker.try_resolve():
+                    resolved.append(worker.id)
+            except Exception:
+                continue
+        return resolved
 
     def acknowledge(self, chase_id: str) -> dict[str, Any]:
         """The user checked an unknown or orphaned Chase on the exchange. Nothing is sent;

@@ -77,12 +77,50 @@ class CancellationRetryTests(unittest.TestCase):
                 self.assertEqual(len(sent), 1 if permanent else 2)
                 self.assertEqual(worker.status, "unknown" if permanent else "max_repegs")
 
-    def test_cancellation_write_timeout_is_not_retried(self):
-        self.client.post.side_effect = TimeoutError("write uncertain")
-        with self.assertRaises(ChaseUnknown):
+    def resting(self):
+        return {"result": "success", "openOrders": [{"order_id": "order", "cliOrdId": "ch-test-1", "unfilledSize": 10}], "fills": []}
+
+    def test_an_unclear_cancel_whose_order_filled_is_reconciled_as_filled(self):
+        # The FET case: the cancel reply was lost, the order stayed and filled in full.
+        filled = {"result": "success", "orders": [{"status": "FULLY_EXECUTED", "order": {
+            "orderId": "order", "cliOrdId": "ch-test-1", "filled": 10}}]}
+        self.client.post.side_effect = [TimeoutError("TLS handshake timed out"), filled]
+        self.worker._cancel_active()
+        self.assertIsNone(self.worker._active)
+        self.assertEqual(self.worker.filled, 10)
+        self.assertEqual([c.args[0] for c in self.client.post.call_args_list], ["/cancelorder", "/orders/status"])
+        self.assertTrue(any(a["event"] == "cancellation_resolved" and a["via"] == "order_absent" for a in self.worker.audit))
+
+    def test_an_unclear_cancel_while_still_resting_is_sent_again_only_after_reading_the_order(self):
+        reads = iter([self.resting(), {"result": "success", "openOrders": [], "fills": []}])
+        self.client.get.side_effect = lambda path, **kw: next(reads)
+        self.client.post.side_effect = [TimeoutError("TLS handshake timed out"), self.cancel, self.status]
+        self.worker._cancel_active()
+        self.assertIsNone(self.worker._active)
+        self.assertEqual([c.args[0] for c in self.client.post.call_args_list], ["/cancelorder", "/cancelorder", "/orders/status"])
+        self.assertTrue(any(a["event"] == "cancellation_resolved" and a["via"] == "cancel_resent" for a in self.worker.audit))
+
+    def test_an_unclear_cancel_that_cannot_be_settled_in_time_stays_unknown(self):
+        self.worker.spec["unclearCancelSec"] = 0
+        self.client.get.side_effect = lambda path, **kw: self.resting()
+        self.client.post.side_effect = [TimeoutError("write uncertain"), TimeoutError("still offline")]
+        with self.assertRaisesRegex(ChaseUnknown, "cancellation outcome unknown"):
             self.worker._cancel_active()
-        self.assertEqual(self.client.post.call_count, 1)
-        self.client.get.assert_not_called()
+        self.assertEqual(self.worker._active["orderId"], "order")
+        self.assertEqual(sum(c.args[0] == "/cancelorder" for c in self.client.post.call_args_list), 2)
+
+    def test_an_ended_unknown_chase_is_resolved_in_the_background_without_placing_anything(self):
+        self.worker.status, self.worker.state = "unknown", "UNKNOWN"
+        filled = {"result": "success", "orders": [{"status": "FULLY_EXECUTED", "order": {
+            "orderId": "order", "cliOrdId": "ch-test-1", "filled": 10}}]}
+        self.client.get.side_effect = lambda path, **kw: self.resting()
+        self.assertFalse(self.worker.try_resolve(), "still resting: stays unknown")
+        self.assertIn("still resting", self.worker.unknown_reason)
+        self.client.get.side_effect = lambda path, **kw: {"result": "success", "openOrders": [], "fills": []}
+        self.client.post.side_effect = [filled]
+        self.assertTrue(self.worker.try_resolve())
+        self.assertEqual((self.worker.status, self.worker.filled), ("filled", 10))
+        self.assertFalse(any(c.args[0] in {"/sendorder", "/cancelorder"} for c in self.client.post.call_args_list))
 
     def test_expired_status_uses_paginated_exact_cancelled_history(self):
         self.client.post.side_effect = [self.cancel, {"result": "success", "orders": []}]

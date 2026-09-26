@@ -853,6 +853,23 @@ def _detect_orphan_chases() -> None:
 
 threading.Thread(target=_equity_snapshot_loop, name="equity-snapshots", daemon=True).start()
 threading.Thread(target=_detect_orphan_chases, name="chase-orphan-scan", daemon=True).start()
+
+
+def _unknown_chase_loop() -> None:
+    """A Chase that stopped as unknown (e.g. a cancel reply lost to a network timeout) is
+    re-read every 15 s on both venues. Once its order is off the book it is reconciled as
+    filled or cancelled and stops blocking; nothing is ever placed or cancelled from here."""
+    while True:
+        time.sleep(15)
+        for manager in (chase_manager, hl_chase_manager):
+            try:
+                for chase_id in manager.resolve_unknown():
+                    db.log_event("chase_resolved", {"id": chase_id})
+            except Exception:
+                pass
+
+
+threading.Thread(target=_unknown_chase_loop, name="unknown-chase-resolver", daemon=True).start()
 action_ctx.chase = chase_manager
 
 

@@ -369,3 +369,62 @@ class ChaseStartRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnclearCancelTests(unittest.TestCase):
+    """A cancel whose reply is lost is settled from the order status, not declared unknown."""
+
+    def setUp(self):
+        import unittest.mock
+        from unittest.mock import Mock, patch
+        self.sleep = patch("hyperliquid_chase.time.sleep")
+        self.sleep.start()
+        self.addCleanup(self.sleep.stop)
+        self.worker = hc.HyperliquidChaseWorker(
+            {"exchange": "hyperliquid", "symbol": SYMBOL, "side": "buy", "size": 5.0, "reduceOnly": False,
+             "timeoutSec": 5, "maxRepegs": 5, "repegSec": 0.05, "finishMarket": False, "unclearCancelSec": 30},
+            Mock(), lambda *_: None)
+        self.worker._instrument_row = {"assetId": 1, "contractValueTradePrecision": 2}
+        self.worker._base = Decimal(0)
+        self.worker._active = {"cloid": "0x63686173" + "e" * 24, "cliOrdId": "0x63686173" + "e" * 24, "orderId": "7",
+                               "price": Decimal("1"), "size": Decimal("5"), "seen": Decimal(0), "placedAt": 0}
+        self.states = []
+
+        def order_status(cloid):
+            state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+            return {"found": True, "cliOrdId": cloid, "symbol": SYMBOL, "side": "buy", "order_id": "7",
+                    "orderStatus": state, "originalSizeExact": "5", "remainingSizeExact": "0" if state == "filled" else "5"}
+        self.worker.ctx.backend.order_status = order_status
+
+    def test_a_lost_cancel_reply_whose_order_filled_counts_as_filled(self):
+        self.worker.ctx.submit.return_value = {"outcome": "unknown", "uncertain": True, "error": "TLS handshake timed out"}
+        self.states = ["filled"]
+        self.worker._cancel_active()
+        self.assertIsNone(self.worker._active)
+        self.assertEqual(self.worker.filled, 5.0)
+
+    def test_a_cancel_that_never_arrived_is_sent_again_while_the_order_reads_open(self):
+        self.worker.ctx.submit.side_effect = [{"outcome": "unknown", "error": "timeout"}] + [{"outcome": "confirmed"}] * 5
+        self.states = ["open"] * 7 + ["canceled"]
+        with unittest.mock.patch("hyperliquid_chase.time.monotonic", side_effect=[float(i) for i in range(100)]):
+            self.worker._cancel_active()
+        self.assertIsNone(self.worker._active)
+        self.assertGreaterEqual(self.worker.ctx.submit.call_count, 2, "the cancel is re-sent while the order reads open")
+        self.assertLessEqual(self.worker.ctx.submit.call_count, 3, "at most once per RESEND_CANCEL_SEC")
+
+    def test_an_order_still_open_at_the_deadline_stays_unknown(self):
+        self.worker.spec["unclearCancelSec"] = 0
+        self.worker.ctx.submit.return_value = {"outcome": "unknown", "error": "timeout"}
+        self.states = ["open"]
+        with self.assertRaisesRegex(hc.ChaseUnknown, "could not be settled"):
+            self.worker._cancel_active()
+
+    def test_background_resolution_settles_an_ended_unknown_chase_without_orders(self):
+        self.worker.status, self.worker.state = "unknown", "UNKNOWN"
+        self.states = ["open"]
+        self.assertFalse(self.worker.try_resolve())
+        self.assertIn("still open", self.worker.unknown_reason)
+        self.states = ["filled"]
+        self.assertTrue(self.worker.try_resolve())
+        self.assertEqual((self.worker.status, self.worker.filled), ("filled", 5.0))
+        self.worker.ctx.submit.assert_not_called()
