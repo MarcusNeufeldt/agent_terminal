@@ -73,13 +73,26 @@ def move_grid(db, ctx, args, armed):
             for order in working:
                 validate_order(order, symbol, side)
             ticker = ctx.fresh_ticker(symbol)
-            anchor = args.get("anchor", "last")
-            if anchor not in {"last", "best_bid", "best_ask"}:
-                raise GridError("anchor must be last, best_bid, or best_ask.")
-            target = number(ticker.get({"last": "last", "best_bid": "bid", "best_ask": "ask"}[anchor]), "anchor price")
             tick = number(ctx.instrument(symbol).get("tickSize"), "tick size")
-            top = (max if side == "buy" else min)(number(o["limitPrice"], "working price") for o in working)
-            delta = target - top
+            prices = [number(o["limitPrice"], "working price") for o in working]
+            # near = the rung closest to the market, far = the one furthest from it.
+            near = (max if side == "buy" else min)(prices)
+            far = (min if side == "buy" else max)(prices)
+            if args.get("targetPrice") is not None:
+                # An explicit target ("last order at 0.238"): that rung lands exactly there
+                # and every other rung shifts by the same amount.
+                rung = args.get("targetRung", "far")
+                if rung not in {"near", "far"}:
+                    raise GridError("targetRung must be near or far.")
+                target = number(args["targetPrice"], "target price")
+                delta = target - (near if rung == "near" else far)
+                anchor = f"{rung}_rung"
+            else:
+                anchor = args.get("anchor", "last")
+                if anchor not in {"last", "best_bid", "best_ask"}:
+                    raise GridError("anchor must be last, best_bid, or best_ask.")
+                target = number(ticker.get({"last": "last", "best_bid": "bid", "best_ask": "ask"}[anchor]), "anchor price")
+                delta = target - near
             rounding = ROUND_FLOOR if side == "buy" else ROUND_CEILING
             rows = []
             for order in working:

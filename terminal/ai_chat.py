@@ -550,11 +550,14 @@ TOOLS.extend([
         "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["buy", "sell"]}}, "required": ["symbol", "side"]},
     }},
     {"type": "function", "function": {
-        "name": "move_grid", "description": "Move a recorded entry grid in ONE ARM-gated call using exact-ID price amendments. Preserves working quantities and absolute spacing. NEVER cancel/recreate a grid to move it, and NEVER replenish filled or cancelled rungs. Resolves one unambiguous grid automatically; otherwise use get_grids. Defaults to last price, rejects crossing prices before editing. Resume interrupted moves with the returned operationId, keeping the original target. Partial failures must be reported, not hidden.",
+        "name": "move_grid", "description": "The ONLY way to move or shift a grid: ONE ARM-gated call using exact-ID price amendments. place_order/place_ladder next to a working grid are refused. Preserves working quantities and absolute spacing. NEVER cancel/recreate a grid to move it, and NEVER replenish filled or cancelled rungs. Resolves one unambiguous grid automatically; otherwise use get_grids. Defaults to last price, rejects crossing prices before editing. Resume interrupted moves with the returned operationId, keeping the original target. Partial failures must be reported, not hidden.",
         "parameters": {"type": "object", "properties": {
             "symbol": {"type": "string"}, "side": {"type": "string", "enum": ["buy", "sell"]},
             "gridId": {"type": "string"}, "operationId": {"type": "string"},
-            "anchor": {"type": "string", "enum": ["last", "best_bid", "best_ask"]},
+            "anchor": {"type": "string", "enum": ["last", "best_bid", "best_ask"],
+                       "description": "Without targetPrice: put the rung nearest the market at this price"},
+            "targetPrice": {"type": "number", "description": "Put one rung exactly here and shift every other rung by the same amount, e.g. 'move it so the last order is at 0.238' = targetPrice 0.238, targetRung far"},
+            "targetRung": {"type": "string", "enum": ["near", "far"], "description": "Which rung lands on targetPrice: near = closest to the market, far = the last one. Default far"},
         }, "required": ["symbol", "side"]},
     }},
 ])
@@ -812,7 +815,9 @@ def respond(
         payload_messages.append({"role": "assistant", "content": final_text or None, "tool_calls": tool_calls})
         payload_messages.extend(tool_msgs)
     else:
-        final_text = "Stopped at the tool-round limit. No further actions were executed."
+        final_text = ("Stopped at the tool-round limit after placing or changing orders: the task may be HALF-DONE. "
+                      "Check open orders before anything else." if receipts else
+                      "Stopped at the tool-round limit. No further actions were executed.")
 
     # fallback path: fenced blocks for models that ignore tools
     fence_blocks = extract_action_blocks(final_text)

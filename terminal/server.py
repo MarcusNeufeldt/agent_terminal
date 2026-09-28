@@ -2120,6 +2120,28 @@ def _mentioned_symbols(message: str) -> list[str]:
     return sorted(found)
 
 
+def _grid_entry_block(name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    """Refuse an AI entry order beside a recorded grid that still has working orders. Moving
+    a grid is move_grid's job; the AI twice 'moved' one by adding orders, which only added
+    exposure. Reduce-only exits are unaffected; the user can still place anything by hand."""
+    if name not in {"place_order", "place_ladder"} or args.get("reduceOnly") is True:
+        return None
+    symbol = _normalize_symbol(str(args.get("symbol") or ""))
+    side = str(args.get("side") or "").lower()
+    if side not in {"buy", "sell"} or not db.recorded_grids(symbol, side):
+        return None
+    try:
+        working = sum(g["workingOrders"] for g in grid_move.list_grids(db, action_ctx, symbol, side))
+    except Exception as exc:
+        return {"outcome": "blocked", "error": f"A {side} grid is recorded on {symbol} and its orders cannot be read ({exc}); no order placed."}
+    if not working:
+        return None
+    return {"outcome": "blocked", "error": (
+        f"A {side} grid on {symbol} still has {working} working orders. To move or shift it call move_grid "
+        "(targetPrice + targetRung near/far puts a rung at an exact price). Placing orders beside a grid adds "
+        "exposure and is refused; nothing was placed. The user can place extra orders from the ticket.")}
+
+
 _CHAT_ACTION_TOOLS = {
     "place_order": "order",
     "place_ladder": "ladder",
@@ -2303,6 +2325,9 @@ def chat_tool_exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
         cache.drop("orders", "positions", "account")
         return {"armed": armed_now, **result}
     kind = _CHAT_ACTION_TOOLS.get(name)
+    blocked = _grid_entry_block(name, args)
+    if blocked:
+        return blocked
     if kind:
         a = dict(args)
         a["type"] = kind

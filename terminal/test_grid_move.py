@@ -71,6 +71,31 @@ class GridMoveTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "confirmed")
         self.assertEqual(sorted(r["limitPrice"] for r in self.rows.values()), [7, 8])
 
+    def test_target_price_puts_the_far_rung_exactly_there_and_keeps_spacing(self):
+        # "Move the sell grid up so the last order is at 0.238": far rung to 0.238, all shift alike.
+        for row in self.rows.values():
+            row["side"] = "sell"
+        self.db.log_action("grid", True, [{"type": "ladder"}], [{
+            "symbol": "PF_TESTUSD", "side": "sell", "responses": [
+                {"outcome": "confirmed", "exchangeId": oid, "order": dict(order)} for oid, order in self.rows.items()]}])
+        self.quote = {"last": 7, "bid": 6.9, "ask": 7}
+        before = sorted(r["limitPrice"] for r in self.rows.values())  # [8, 9]
+        result = move_grid(self.db, self.ctx, {**self.args, "side": "sell", "targetPrice": 12, "targetRung": "far"}, True)
+        after = sorted(r["limitPrice"] for r in self.rows.values())
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertEqual(after, [11, 12])
+        self.assertEqual(after[1] - after[0], before[1] - before[0], "spacing is unchanged")
+        self.assertEqual([r["unfilledSize"] for r in self.rows.values()], [10, 10], "sizes are unchanged")
+        self.assertTrue(all(set(c) == {"orderId", "limitPrice"} for c in self.calls), "edits only, nothing placed")
+
+    def test_target_price_for_the_near_rung_still_refuses_to_cross(self):
+        self.quote = {"last": 10, "bid": 10, "ask": 11}
+        with self.assertRaisesRegex(GridError, "cross"):
+            move_grid(self.db, self.ctx, {**self.args, "targetPrice": 11, "targetRung": "near"}, True)
+        self.assertEqual(self.calls, [])
+        with self.assertRaisesRegex(GridError, "targetRung"):
+            move_grid(self.db, self.ctx, {**self.args, "targetPrice": 9, "targetRung": "middle"}, True)
+
     def test_disarmed_is_read_only(self):
         result = move_grid(self.db, self.ctx, self.args, False)
         self.assertTrue(result["simulated"])
