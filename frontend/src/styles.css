@@ -751,6 +751,9 @@ select { color-scheme: dark; }
 .modal-help { color: var(--muted); font-size: 11px; line-height: 1.45; }
 .empty.compact { padding: 8px 12px; }
 .pro-mode-row { margin-top: 9px; }
+.pro-offset { display: inline-flex; align-items: center; gap: 3px; margin-left: auto; color: var(--muted); font: 11px var(--mono); }
+.pro-offset input { width: 78px; padding: 3px 6px; border: 1px solid var(--border2); border-radius: 5px; background: var(--panel2); color: var(--text); font: 11px var(--mono); text-align: right; }
+.pro-offset input:focus { outline: none; border-color: var(--accent); }
 
 .exchange-picker { display: grid; gap: 5px; margin: 10px 0; color: var(--muted); font-size: 11px; }
 .exchange-picker select { width: 100%; min-width: 0; padding: 7px; border: 1px solid var(--border2); border-radius: 6px; background: var(--control); color: var(--text); }

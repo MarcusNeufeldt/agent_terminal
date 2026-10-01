@@ -11,6 +11,9 @@ import { RULES, nextPeaks, peakKey, realizedEvents } from "./rules.js";
 import { valuationPrice } from "./pricing.js";
 import { closePreview, exitAfterFee, TAKER_FEE, MAKER_FEE } from "./close-preview.js";
 import { pairMaxLeverage } from "./leverage.js";
+
+// Pro-Mode display offset until the user sets one in the sidebar.
+export const DEFAULT_PRO_OFFSET = 5300;
 import { chaseOverlays, isChaseOrder } from "./chase-view.js";
 import { toVelaTimeframe } from "./vela-provider";
 import { EXCHANGE, EXCHANGE_NAME, READ_ONLY, venueKey, isVenueSymbol, reloadExchange } from "./exchange.js";
@@ -84,6 +87,8 @@ const useStore = create((set, get) => ({
   env: "live",
   hasKeys: true,
   pro: !READ_ONLY && localStorage.getItem("kt.pro") === "1",
+  // Pro-Mode display offset, set in the sidebar and kept in this browser.
+  proOffset: readProOffset(),
   lev: Number(localStorage.getItem(venueKey("kt.lev"))) || 10,
   soundOn: localStorage.getItem("kt.sound") !== "0",
   feed: "connecting",
@@ -592,7 +597,17 @@ const useStore = create((set, get) => ({
   },
 
   // ---- account / tables ----
-  proAdj(v) { return get().pro ? Number(v || 0) + 5300 : Number(v || 0); },
+  proAdj(v) { return get().pro ? Number(v || 0) + get().proOffset : Number(v || 0); },
+
+  setProOffset(value) {
+    // An emptied field while typing must not snap the offset to 0.
+    if (value === null || value === undefined || String(value).trim() === "") return;
+    const offset = Number(value);
+    if (!Number.isFinite(offset) || offset < 0 || offset > 10_000_000) return;
+    set({ proOffset: offset });
+    try { localStorage.setItem("kt.proOffset", String(offset)); } catch {}
+    get().refreshAccount();
+  },
 
   async refreshAccount() {
     try {
@@ -1841,6 +1856,16 @@ const useStore = create((set, get) => ({
 
   updatePositionCells() { /* positions render live from the store in React */ },
 }));
+
+function readProOffset() {
+  try {
+    const raw = localStorage.getItem("kt.proOffset");
+    const value = raw === null ? NaN : Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : DEFAULT_PRO_OFFSET;
+  } catch {
+    return DEFAULT_PRO_OFFSET;
+  }
+}
 
 // describeAction used by execution reports
 function fmt(x, digits) {

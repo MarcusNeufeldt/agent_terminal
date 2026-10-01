@@ -21,8 +21,12 @@ export default function Sidebar() {
   const selectSymbol = useStore(s => s.selectSymbol);
   const armToggle = useStore(s => s.armToggle);
   const togglePro = useStore(s => s.togglePro);
+  const proOffset = useStore(s => s.proOffset);
+  const setProOffset = useStore(s => s.setProOffset);
   const [query, setQuery] = useState("");
   const [filtersOpen, setFiltersOpen] = useState(false);
+  // What is typed in the Pro-Mode offset field; null shows the saved value.
+  const [offsetText, setOffsetText] = useState(null);
   const marketRows = useStore(s => s.marketRows);
   const volRank = useStore(s => s.volRank);
   const minVol = useStore(s => s.minVol);
@@ -167,6 +171,14 @@ export default function Sidebar() {
         <div className="check-row pro-mode-row">
           <input id="pro-toggle" type="checkbox" disabled={readOnly} checked={pro} onChange={togglePro} />
           <label htmlFor="pro-toggle">Pro-Mode</label>
+          {pro && (
+            <label className="pro-offset" title="Added to Balance and Avail margin while Pro-Mode is on. Display only; orders use real margin.">
+              <span>+$</span>
+              <input id="pro-offset" type="number" min="0" step="50" value={offsetText ?? String(proOffset)}
+                onChange={e => { setOffsetText(e.target.value); setProOffset(e.target.value); }}
+                onBlur={() => setOffsetText(null)} aria-label="Pro-Mode offset in dollars" />
+            </label>
+          )}
         </div>
       </div>
     </aside>

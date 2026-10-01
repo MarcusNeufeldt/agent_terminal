@@ -58,6 +58,13 @@ test("display PnL is net if closed: exit side of the book less the taker fee plu
   const proSidebar = render(Sidebar);
   assert.ok(proSidebar.includes("$6,300"), "balance uses the shared display offset");
   assert.ok(proSidebar.includes("$5,900"), "available margin uses the same offset");
+  assert.ok(proSidebar.includes('id="pro-offset"'), "the offset is editable in the sidebar while Pro-Mode is on");
+  store.setState({ refreshAccount: () => {} });
+  store.getState().setProOffset("1200");
+  assert.equal(store.getState().proAdj(1000), 2200, "the sidebar value replaces the default");
+  for (const bad of ["", "abc", "-5", "1e9"]) store.getState().setProOffset(bad);
+  assert.equal(store.getState().proOffset, 1200, "invalid values are ignored");
+  store.getState().setProOffset(5300);
   assert.equal(store.getState().account, account);
   assert.equal(position.liqPriceEstimate, 50);
   store.setState({ instruments: [{ ...instrument, contractSize: 10 }] });
